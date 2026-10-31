@@ -86,8 +86,10 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                      "inflight": sorted(orchestrator.runtime.inflight),
                      "llm": _llm_health(orchestrator),
                      "cycle": _cycle_status(store, config.tick_seconds)},
-            "total_cost_usd": sum(store.project_cost(p.id)
-                                  for p in store.visible_projects()),
+            "total_cost_usd": store.harness_cost(),
+            "project_cost_usd": sum(store.project_cost(p.id)
+                                    for p in store.visible_projects()),
+            "orchestrator_cost_usd": store.orchestrator_cost(),
             "columns": KANBAN_COLUMNS,
             "projects": projects,
             "events": [e.model_dump() for e in store.recent_events[-60:]][::-1],
@@ -162,22 +164,35 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
             raise HTTPException(409, f"Agents still running: {running}. "
                                      "Pause the project or wait for them.")
 
-        for agent in project_agents:
-            orchestrator.runtime.close(agent.id)
+        # Conversation logs are keyed by agent id, and the orchestrator's own
+        # transcript can live under this project's dir (its project_id is the
+        # last project it touched). Handle each agent's dir individually so the
+        # orchestrator's is never moved or deleted out from under a live loop.
+        doomed_agents = [a for a in store.project_agents(project_id)
+                         if a.role != "orchestrator"]
+        _, log_note = orchestrator.runtime.handle_agent_logs(
+            doomed_agents,
+            keep=mode == "hide",
+            archive_to=(_archive_root(config) if mode == "archive" else None),
+            prune_project_dirs=mode == "purge",
+        )
 
         detail = _remove_artifacts(config, store, project, mode)
+        # remove_project snapshots cost and deletes the agents in every mode;
+        # purge additionally drops the project and task records.
         store.remove_project(project_id, mode)
-
         if mode == "purge":
             store.purge_project(project_id)
 
         store.add_event(
             "project_removed",
-            f"Project '{project.name}' removed ({mode}). {detail}",
+            f"Project '{project.name}' removed ({mode}). {detail} {log_note} "
+            f"Released {len(doomed_agents)} agent(s).",
             project_id=project_id,
         )
         store.flush()
-        return {"id": project_id, "mode": mode, "detail": detail}
+        return {"id": project_id, "mode": mode, "detail": detail,
+                "agents_removed": len(doomed_agents)}
 
     @app.get("/api/config")
     def get_config() -> dict:
@@ -349,6 +364,9 @@ def _agent_json(agent, full: bool = False) -> dict:
         "task_id": agent.task_id, "tokens": agent.tokens,
         "cost_usd": agent.cost_usd,
         "children": agent.child_agent_ids,
+        # The orchestrator is shared across projects, so its spend is harness
+        # overhead, not part of any single project's cost.
+        "shared": agent.role == "orchestrator",
     }
     if full:
         data.update({
@@ -479,9 +497,18 @@ def _cycle_status(store: Store, tick_seconds: int) -> dict:
 REMOVAL_MODES = {"archive", "hide", "purge"}
 
 
+def _archive_root(config: HarnessConfig) -> Path:
+    return config.root_dir / "archived-projects"
+
+
 def _remove_artifacts(config: HarnessConfig, store: Store, project,
                       mode: str) -> str:
-    """Carry out the file side of a removal, returning a human-readable note."""
+    """Carry out the workspace side of a removal, returning a readable note.
+
+    Conversation logs are handled per agent (see handle_agent_logs), not here:
+    the project's log dir can also contain the orchestrator's live transcript,
+    so moving or deleting it wholesale would break a running loop.
+    """
     workspace = Path(project.workspace).expanduser() if project.workspace else None
 
     if mode == "hide":
@@ -490,26 +517,18 @@ def _remove_artifacts(config: HarnessConfig, store: Store, project,
     if mode == "archive":
         if not workspace or not workspace.exists():
             return "No workspace to archive."
-        archive_root = config.root_dir / "archived-projects"
+        archive_root = _archive_root(config)
         archive_root.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         target = archive_root / f"{workspace.name}-{stamp}"
         shutil.move(str(workspace), str(target))
-        conv = config.root_dir / "conversations" / project.id
-        if conv.exists():
-            shutil.move(str(conv), str(archive_root / f"{project.id}-{stamp}"))
         return f"Workspace moved to {target}."
 
     # purge
-    removed: list[str] = []
     if workspace and workspace.exists():
         shutil.rmtree(workspace, ignore_errors=True)
-        removed.append(f"workspace {workspace}")
-    conv = config.root_dir / "conversations" / project.id
-    if conv.exists():
-        shutil.rmtree(conv, ignore_errors=True)
-        removed.append(f"conversation logs {conv}")
-    return "Deleted " + (", ".join(removed) if removed else "nothing (already gone)") + "."
+        return f"Deleted workspace {workspace}."
+    return "Deleted nothing (workspace already gone)."
 
 
 

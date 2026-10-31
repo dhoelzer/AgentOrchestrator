@@ -114,6 +114,14 @@ output_cost_per_token=…)`. Override per endpoint with
 `HARNESS_LLM_INPUT_COST_PER_TOKEN` / `HARNESS_LLM_OUTPUT_COST_PER_TOKEN`, or set
 them in the Settings panel.
 
+The harness total sums **every agent in the store**, so spend can never be
+orphaned when a project is purged. Per-project totals exclude the orchestrator:
+it is shared across projects and its `project_id` drifts to whichever project
+it last touched, so charging it to one project would both double-count it
+across projects and lose it on purge. `Store.project_cost` /
+`orchestrator_cost` / `harness_cost` are the three numbers the header pill
+shows.
+
 ### Changing config while the harness runs
 
 `GET /api/config` returns the live config (API key redacted) plus runtime LLM
@@ -212,7 +220,11 @@ specialists at once.
   blocked task moves back to ready and the directive is injected into its next
   assignment prompt
 - `POST /api/projects/{id}/remove` — remove a project; body
-  `{"mode": "archive" | "hide" | "purge", "confirm": "<project name>"}`
+  `{"mode": "archive" | "hide" | "purge", "confirm": "<project name>"}`.
+  Removes the project **and every agent that worked on it**, so a removed
+  project cannot leave sub-agents occupying delegation slots. Returns
+  `agents_removed`. Refuses with `409` while any of the project's agents are
+  mid-run — the orchestrator's own conversation is never interrupted.
 - `POST /api/alerts/ack` — dismiss an alert (`{"alert_id": ...}` or `{"all": true}`);
   `DELETE /api/alerts/ack` brings current alerts back
 - `GET /api/projects/{id}/tasks/{id}`, `GET /api/projects/{id}/agents/{id}` — detail
@@ -220,9 +232,27 @@ specialists at once.
 
 Task cards show live `turns_used/turn_limit` (updated during a run, not only at
 the end) and the reason a task is blocked. Every agent node shows its total
-cost, each project header shows a project total, and the header pill shows the
-cost across all visible projects. The header also reports loop health: agents
-running, cycles completed, and when the last cycle completed versus attempted.
+cost, each project header shows that project's own spend, and the header pill
+splits the harness total into *projects + orchestrator*. The orchestrator is
+shared across projects, so its spend is reported as harness overhead rather
+than being charged to whichever project it last touched. The header also
+reports loop health: agents running, cycles completed, and when the last cycle
+completed versus attempted.
+
+## Orphaned agents
+
+The orchestrator sweeps orphans at the start of every cycle, and the sweep is
+reported in the activity feed. It removes agents that can never run again:
+
+- their project no longer exists (left behind by an older build, or by a
+  hand-edited state file),
+- their parent no longer exists, or
+- a parent still lists a child id that no longer exists — those stale ids
+  otherwise consume delegation slots and silently block new agents from being
+  created.
+
+Deleting an agent also releases its parent's slot, so a project that was
+blocked by stale children can staff itself again on the next cycle.
 
 ## Deploying with Docker
 

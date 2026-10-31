@@ -146,6 +146,9 @@ class Project(BaseModel):
     # moved them, 'purged' deleted them.
     removed_at: str | None = None
     removal_mode: str | None = None
+    # Spend is summed over the project's agents, but removal deletes those
+    # records, so the total is snapshotted here to keep cost history.
+    final_cost_usd: float | None = None
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
 
@@ -327,9 +330,34 @@ class Store:
                       key=lambda p: p.created_at)
 
     def project_cost(self, project_id: str) -> float:
-        """Total spend for a project, summed over every agent that worked on it."""
+        """Spend attributable to one project, excluding shared orchestrator spend.
+
+        The orchestrator is global but carries the project_id of the last
+        project it touched, so counting it per project would both double-count
+        across projects and orphan its spend when that project is purged.
+
+        Removal deletes the project's agents, so a removed project reports the
+        total snapshotted at removal time instead of collapsing to zero.
+        """
+        project = self.projects.get(project_id)
+        if project is not None and project.final_cost_usd is not None:
+            return project.final_cost_usd
         return sum(a.cost_usd for a in self.agents.values()
-                   if a.project_id == project_id)
+                   if a.project_id == project_id and a.role != "orchestrator")
+
+    def orchestrator_cost(self) -> float:
+        """Spend by the shared orchestrator(s) - harness overhead, not project spend."""
+        return sum(a.cost_usd for a in self.agents.values()
+                   if a.role == "orchestrator")
+
+    def harness_cost(self) -> float:
+        """Everything actually spent: every agent still in the store.
+
+        Summing agents (rather than projects) means spend can never be orphaned
+        by a project_id pointing at a removed project. The orphan sweep is what
+        keeps this equal to sum(project_cost) + orchestrator_cost.
+        """
+        return sum(a.cost_usd for a in self.agents.values())
 
     def purge_project(self, project_id: str) -> None:
         """Delete a project's records outright (the 'purge' removal mode)."""
@@ -338,11 +366,78 @@ class Store:
             for tid in [t.id for t in self.tasks.values()
                         if t.project_id == project_id]:
                 self.tasks.pop(tid, None)
-            # The orchestrator is shared across projects; never delete it.
-            for aid in [a.id for a in self.agents.values()
-                        if a.project_id == project_id
-                        and a.role != "orchestrator"]:
+            self.delete_project_agents(project_id)
+
+    def delete_project_agents(self, project_id: str) -> list[str]:
+        """Delete every agent belonging to a project. See delete_agents()."""
+        doomed = [a.id for a in self.agents.values()
+                  if a.project_id == project_id and a.role != "orchestrator"]
+        return self.delete_agents(doomed)
+
+    def delete_agents(self, agent_ids: list[str]) -> list[str]:
+        """Delete these agents and scrub all references to them.
+
+        Returns the ids removed. The orchestrator is shared across projects and
+        is never deleted.
+
+        child_agent_ids must be scrubbed as well as the records deleted: the
+        delegation limit counts that list, so leaving dead ids on a parent
+        blocks it from staffing any later project.
+        """
+        with self._lock:
+            doomed = {aid for aid in agent_ids
+                      if aid in self.agents
+                      and self.agents[aid].role != "orchestrator"}
+            if not doomed:
+                return []
+            for aid in doomed:
                 self.agents.pop(aid, None)
+            self._scrub_agent_refs(doomed)
+            return sorted(doomed)
+
+    def _scrub_agent_refs(self, doomed: set[str]) -> None:
+        """Drop references to deleted agents from parents and task cards."""
+        for agent in self.agents.values():
+            if any(c in doomed for c in agent.child_agent_ids):
+                agent.child_agent_ids = [
+                    c for c in agent.child_agent_ids if c not in doomed
+                ]
+                agent.touch()
+        for task in self.tasks.values():
+            if task.assigned_agent_id in doomed:
+                task.assigned_agent_id = None
+            if task.reviewer_agent_id in doomed:
+                task.reviewer_agent_id = None
+
+    def orphaned_agents(self) -> dict[str, list[str]]:
+        """Agents that can never run again, keyed by reason.
+
+        'missing_project' - the project record is gone or was removed.
+        'missing_parent'  - parent_agent_id points at an agent that no longer
+                            exists, so the agent is detached from the hierarchy.
+        'dangling_child'  - a surviving agent still lists a child id that no
+                            longer exists; these ids count toward
+                            max_children_per_agent, so they leak slots.
+
+        The orchestrator is excluded: it is global and its project_id is only
+        the last project it touched.
+        """
+        out: dict[str, list[str]] = {
+            "missing_project": [], "missing_parent": [], "dangling_child": [],
+        }
+        for agent in self.agents.values():
+            if agent.role == "orchestrator":
+                continue
+            project = self.projects.get(agent.project_id or "")
+            if agent.project_id is None or project is None \
+                    or project.status == "removed":
+                out["missing_project"].append(agent.id)
+            elif agent.parent_agent_id and agent.parent_agent_id not in self.agents:
+                out["missing_parent"].append(agent.id)
+        for agent in self.agents.values():
+            if any(c not in self.agents for c in agent.child_agent_ids):
+                out["dangling_child"].append(agent.id)
+        return out
 
     def remove_project(self, project_id: str, mode: str) -> Project:
         """Drop a project from the board.
@@ -351,12 +446,19 @@ class Store:
         under the archive dir; 'purged' deletes the workspace and conversation
         logs. In all three modes the project record is kept with status
         'removed' so cost history and the activity feed survive.
+
+        The project's agents are deleted in every mode: they can never be
+        dispatched again, and their ids would otherwise keep counting toward
+        max_children_per_agent on their parents.
         """
         project = self.projects[project_id]
+        # Snapshot before the status flips and the agent records go away.
+        project.final_cost_usd = self.project_cost(project_id)
         project.status = "removed"
         project.removed_at = now_iso()
         project.removal_mode = mode
         project.touch()
+        self.delete_project_agents(project_id)
         self.add_event(
             "project_removed", f"Project '{project.name}' removed ({mode}).",
             project_id=project_id,

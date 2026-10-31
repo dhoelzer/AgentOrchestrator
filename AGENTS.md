@@ -22,6 +22,8 @@ docker compose up -d --build          # containerized + Docker-in-Docker sidecar
 
 ```bash
 python tests/test_board_mechanics.py   # no LLM needed; fast, run this first
+python tests/test_runtime_and_config.py  # no LLM needed
+python tests/test_dashboard_features.py  # no LLM needed; removal, orphans, costs
 python tests/test_e2e_llm.py 3         # needs the configured LLM endpoint
 python tests/test_turn_budget.py       # needs the configured LLM endpoint
 ```
@@ -131,3 +133,28 @@ the LLM tests take minutes and are non-deterministic.
   `retire_agent` prunes the parent's child list to free a delegation slot, which
   would otherwise erase retired agents from the dashboard. The orchestrator is
   grafted in as the root because it is global and carries only one `project_id`.
+- **Removing a project must delete its agents.** `Store.remove_project` calls
+  `delete_project_agents`, which also scrubs the deleted ids out of every
+  surviving parent's `child_agent_ids`. Skipping the scrub leaves stale ids that
+  still count against `max_children_per_agent`, so the orchestrator is silently
+  blocked from creating agents forever. `Orchestrator.sweep_orphans` runs at the
+  top of every `run_cycle` to clean agents whose project or parent is gone and
+  dangling child ids left by older builds or hand-edited `state.json`.
+- `runtime.close()` on a `Conversation` is safe per-agent — `TmuxPanePool` is
+  per-conversation, not process-global — but never close the orchestrator's
+  live conversation. The orchestrator's transcript lives under
+  `conversations/<its current project_id>/<orch id>`, so removal modes must
+  exclude the orchestrator from doomed-agent cleanup. `_prune_project_log_dirs`
+  protects it by keeping any log entry whose name is still a key in
+  `store.agents`.
+- Removal refuses with `409` while any of the project's agents are in
+  `runtime.inflight`. Do not relax this: closing a conversation out from under a
+  running agent produces `TmuxPanePool is not initialized or already closed`.
+- **Cost semantics.** `harness_cost()` sums every agent in the store, so spend
+  can never be orphaned by a `project_id` pointing at a purged project.
+  `project_cost()` deliberately **excludes** the orchestrator: it is shared
+  across projects and its `project_id` drifts to whichever project it last
+  touched, so charging it per-project double-counts it and loses it on purge.
+  The UI marks the orchestrator node `shared` and the header pill shows
+  `total = projects + orchestrator`. `project.final_cost_usd` is snapshotted via
+  `project_cost()` at removal, so hidden/archived projects keep a consistent total.

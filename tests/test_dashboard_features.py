@@ -25,6 +25,7 @@ from agent_harness.tools import (
     CreateTaskExecutor,
     register_harness_tools,
 )
+from agent_harness.store import AgentSpec
 from agent_harness.web.api import build_api
 
 
@@ -102,9 +103,13 @@ def test_remove_archives_workspace_and_keeps_record():
         cfg, store, runtime, orch = seed(tmp)
         pid = list(store.projects)[0]
         workspace = Path(store.projects[pid].workspace)
+        # Real layout: conversations/<project_id>/<agent_id>/
         conv_dir = cfg.root_dir / "conversations" / pid
-        conv_dir.mkdir(parents=True, exist_ok=True)
-        (conv_dir / "log.json").write_text("{}")
+        agent = [a for a in store.agents.values() if a.role == "backend-dev"][0]
+        (conv_dir / agent.id).mkdir(parents=True, exist_ok=True)
+        (conv_dir / agent.id / "log.json").write_text("{}")
+        agent.persistence_dir = str(conv_dir / agent.id)
+        store.upsert_agent(agent)
 
         app = build_api(cfg, store, orch)
         client = TestClient(app)
@@ -117,8 +122,8 @@ def test_remove_archives_workspace_and_keeps_record():
         moved = list(archive.glob("Widget-*"))
         assert moved, f"expected an archived workspace under {archive}"
         assert (moved[0] / "artifact.py").exists()
-        assert list(archive.glob(f"{pid}-*")), "conversation logs not archived"
-        assert not conv_dir.exists()
+        assert list(archive.glob(f"{agent.id}-logs")), "agent logs not archived"
+        assert not (conv_dir / agent.id).exists()
 
         # Record survives so cost history and the feed remain queryable.
         assert store.projects[pid].status == "removed"
@@ -518,6 +523,201 @@ def test_removing_a_project_never_touches_the_shared_orchestrator():
         print("shared orchestrator survives removal ok")
 
 
+def _staffed(tmp: str, name: str = "Widget", limit: int = 2):
+    """Project with two sub-agents, a fake transcript each, and a low child cap."""
+    cfg, store, runtime, orch = seed(tmp, name)
+    cfg.max_children_per_agent = limit
+    pid = list(store.projects)[0]
+    conv = FakeConv()
+    CreateSubAgentExecutor()(CreateSubAgentAction(
+        role="backend-dev", specialty="backend", mission="build", project_id=pid), conv)
+    CreateSubAgentExecutor()(CreateSubAgentAction(
+        role="reviewer", specialty="review", mission="review", project_id=pid), conv)
+    oid = [a.id for a in store.agents.values() if a.role == "orchestrator"][0]
+    for aid in [a.id for a in store.agents.values()]:
+        d = Path(cfg.root_dir) / "conversations" / pid / aid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "log.json").write_text("{}")
+        store.agents[aid].persistence_dir = str(d)
+        store.upsert_agent(store.agents[aid])
+    return cfg, store, runtime, orch, pid, oid
+
+
+def test_removal_frees_delegation_slots_in_every_mode():
+    """Removed agents must stop counting against max_children_per_agent."""
+    for mode in ("hide", "archive", "purge"):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, store, runtime, orch, pid, oid = _staffed(tmp)
+            conv = FakeConv()
+            client = TestClient(build_api(cfg, store, orch))
+            r = client.post(f"/api/projects/{pid}/remove",
+                            json={"mode": mode, "confirm": "Widget"})
+            assert r.status_code == 200, r.text
+            assert r.json()["agents_removed"] == 2, r.json()
+
+            assert store.agents[oid].child_agent_ids == [], (mode, "ids leaked")
+            left = [a.role for a in store.agents.values()]
+            assert left == ["orchestrator"], (mode, left)
+
+            # The real symptom: a new project must be staffable afterwards.
+            CreateProjectExecutor()(CreateProjectAction(
+                name="Next", goal="g", constraints=""), conv)
+            new_pid = [p for p in store.visible_projects() if p.name == "Next"][0].id
+            res = CreateSubAgentExecutor()(CreateSubAgentAction(
+                role="dev", specialty="s", mission="m", project_id=new_pid), conv)
+            text = " ".join(c.text for c in res.content)
+            assert "created" in text, (mode, text)
+            assert store.orphaned_agents() == {
+                "missing_project": [], "missing_parent": [], "dangling_child": []
+            }, mode
+            print(f"removal frees slots ({mode}) ok")
+
+
+def test_removal_keeps_cost_history_after_agents_are_deleted():
+    """Agents are deleted, so the project total must be snapshotted."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid, oid = _staffed(tmp)
+        for a in store.agents.values():
+            if a.role != "orchestrator":
+                a.cost_usd = 1.25
+                store.upsert_agent(a)
+        assert store.project_cost(pid) == 2.5
+        TestClient(build_api(cfg, store, orch)).post(
+            f"/api/projects/{pid}/remove", json={"mode": "hide", "confirm": "Widget"})
+        assert store.project_cost(pid) == 2.5, store.project_cost(pid)
+        print("cost survives agent deletion ok")
+
+
+def test_removal_never_touches_the_orchestrator_transcript():
+    """The orchestrator's transcript lives under the project dir it last touched."""
+    for mode, logs_kept in (("hide", True), ("archive", False), ("purge", False)):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, store, runtime, orch, pid, oid = _staffed(tmp)
+            orch_dir = Path(cfg.root_dir) / "conversations" / pid / oid
+            assert orch_dir.exists()
+            TestClient(build_api(cfg, store, orch)).post(
+                f"/api/projects/{pid}/remove",
+                json={"mode": mode, "confirm": "Widget"})
+            assert (orch_dir / "log.json").exists(), (mode, "orchestrator log lost")
+
+            sub_dirs = [d for d in (Path(cfg.root_dir) / "conversations" / pid)
+                        .iterdir() if d.name != oid]
+            if logs_kept:
+                assert len(sub_dirs) == 2, (mode, sub_dirs)
+            else:
+                assert sub_dirs == [], (mode, sub_dirs)
+            print(f"orchestrator transcript preserved ({mode}) ok")
+
+
+def test_orphan_sweep_cleans_agents_left_by_an_older_build():
+    """State written before agent cleanup existed must self-heal on the next cycle."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid, oid = _staffed(tmp)
+        # Simulate the old behaviour: project removed, agents and ids left behind.
+        store.projects[pid].status = "removed"
+        store.projects[pid].removal_mode = "hide"
+        store.flush()
+        store.agents["ghost-proj"] = AgentSpec(
+            id="ghost-proj", role="zombie", specialty="s", mission="m",
+            system_prompt="p", project_id="no-such-project")
+        store.agents[oid].child_agent_ids = ["agent-vanished-1", "agent-vanished-2"]
+        store.upsert_agent(store.agents[oid])
+
+        found = store.orphaned_agents()
+        assert "ghost-proj" in found["missing_project"], found
+        assert oid in found["dangling_child"], found
+
+        lines = orch.sweep_orphans()
+        assert lines, "sweep reported nothing"
+        assert "ghost-proj" not in store.agents
+        assert store.agents[oid].child_agent_ids == []
+        assert store.orphaned_agents() == {
+            "missing_project": [], "missing_parent": [], "dangling_child": []
+        }
+        assert orch.sweep_orphans() == [], "sweep not idempotent"
+        print("orphan sweep cleans legacy state ok")
+
+
+def test_orphan_sweep_deletes_agents_detached_from_a_deleted_parent():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid, oid = _staffed(tmp)
+        worker = [a for a in store.agents.values() if a.role == "backend-dev"][0]
+        reviewer = [a for a in store.agents.values() if a.role == "reviewer"][0]
+        reviewer.parent_agent_id = "agent-deleted-long-ago"
+        store.upsert_agent(reviewer)
+
+        assert reviewer.id in store.orphaned_agents()["missing_parent"]
+        orch.sweep_orphans()
+        assert reviewer.id not in store.agents, "detached agent survived"
+        assert worker.id in store.agents, "healthy agent was deleted"
+        print("orphan sweep deletes detached agents ok")
+
+
+def test_sweep_runs_every_cycle_and_frees_slots_without_llm_help():
+    """The sweep is deterministic: it must run even if the orchestrator never acts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid, oid = _staffed(tmp)
+        store.projects[pid].status = "removed"
+        store.flush()
+        assert store.agents[oid].child_agent_ids, "precondition: stale ids present"
+
+        orch.run_cycle()
+        assert store.agents[oid].child_agent_ids == []
+        assert [a.role for a in store.agents.values()] == ["orchestrator"]
+        print("sweep runs from the cycle loop ok")
+
+
+def test_purging_a_project_never_orchestrates_away_spend():
+    """The orchestrator's project_id drifts; purging that project must not
+    make its spend disappear from the harness total."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = seed(tmp)
+        pid = list(store.projects)[0]
+        oid = [a.id for a in store.agents.values() if a.role == "orchestrator"][0]
+        store.agents[oid].cost_usd = 4.0
+        # The orchestrator last worked on a project that is about to vanish.
+        store.agents[oid].project_id = pid
+        store.upsert_agent(store.agents[oid])
+
+        client = TestClient(build_api(cfg, store, orch))
+        before = client.get("/api/state").json()
+        assert before["total_cost_usd"] == 6.5, before["total_cost_usd"]
+        assert before["orchestrator_cost_usd"] == 4.0
+        assert before["project_cost_usd"] == 2.5
+
+        client.post(f"/api/projects/{pid}/remove",
+                    json={"mode": "purge", "confirm": "Widget"})
+        after = client.get("/api/state").json()
+        # Purge deletes the project record, so its spend is no longer
+        # attributable to a project - but the orchestrator's $4 must survive.
+        assert after["orchestrator_cost_usd"] == 4.0, after["orchestrator_cost_usd"]
+        assert after["total_cost_usd"] == 4.0, after["total_cost_usd"]
+        print("purge does not orphan orchestrator spend ok")
+
+
+def test_harness_total_reconciles_with_project_plus_orchestrator():
+    """total == sum(project costs) + orchestrator overhead, while nothing is orphaned."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid, oid = _staffed(tmp)
+        for a in store.agents.values():
+            a.cost_usd = 1.0
+            store.upsert_agent(a)
+        d = TestClient(build_api(cfg, store, orch)).get("/api/state").json()
+        assert abs(d["total_cost_usd"]
+                   - (d["project_cost_usd"] + d["orchestrator_cost_usd"])) < 1e-9, d
+        # The project card total must equal the sum of its non-shared tree nodes.
+        proj = [p for p in d["projects"] if p["id"] == pid][0]
+        tree_cost = 0.0
+        def walk(n):
+            nonlocal tree_cost
+            if not n.get("shared"):
+                tree_cost += n["cost_usd"]
+            [walk(c) for c in n.get("children", [])]
+        [walk(n) for n in proj["tree"]]
+        assert abs(proj["cost_usd"] - tree_cost) < 1e-9, (proj["cost_usd"], tree_cost)
+        print("cost reconciliation ok")
+
+
 def test_removed_projects_raise_no_alerts():
     with tempfile.TemporaryDirectory() as tmp:
         cfg, store, runtime, orch = seed(tmp)
@@ -557,6 +757,14 @@ def main() -> None:
     test_delivery_alert_does_not_resurface_on_unrelated_touches()
     test_tree_keeps_retired_subagents_under_their_parent()
     test_removing_a_project_never_touches_the_shared_orchestrator()
+    test_removal_frees_delegation_slots_in_every_mode()
+    test_removal_keeps_cost_history_after_agents_are_deleted()
+    test_removal_never_touches_the_orchestrator_transcript()
+    test_orphan_sweep_cleans_agents_left_by_an_older_build()
+    test_orphan_sweep_deletes_agents_detached_from_a_deleted_parent()
+    test_sweep_runs_every_cycle_and_frees_slots_without_llm_help()
+    test_purging_a_project_never_orchestrates_away_spend()
+    test_harness_total_reconciles_with_project_plus_orchestrator()
     test_removed_projects_raise_no_alerts()
     print("\nALL DASHBOARD FEATURE TESTS PASSED")
 

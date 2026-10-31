@@ -53,7 +53,15 @@ function renderHeader(d) {
     `Loop started ${agoLabel(cyc.loop_started_at)} · tick ${cyc.tick_seconds}s\n` +
     `Last attempt ${agoLabel(cyc.last_attempt_at)} · last success ${agoLabel(cyc.last_completed_at)}` +
     (cyc.stale ? "\nWARNING: the loop has not completed a cycle recently." : "");
-  $("#costPill").innerHTML = `cost: <b>${money(d.total_cost_usd)}</b>`;
+  $("#costPill").innerHTML =
+    `cost: <b>${money(d.total_cost_usd)}</b>` +
+    ` <span class="muted">(${money(d.project_cost_usd)} projects` +
+    ` + ${money(d.orchestrator_cost_usd)} orchestrator)</span>`;
+  $("#costPill").title =
+    `Harness total = every agent still in the store.\n` +
+    `Projects: ${money(d.project_cost_usd)}\n` +
+    `Shared orchestrator overhead: ${money(d.orchestrator_cost_usd)}\n` +
+    `Removed projects keep their spend in the activity feed.`;
   const llm = d.meta.llm || {};
   const unhealthy = (llm.empty_responses || 0) + (llm.transient_errors || 0) > 0;
   $("#llmPill").innerHTML =
@@ -103,7 +111,7 @@ function renderTree(nodes) {
         <span class="kv">${n.turns_used}/${n.turn_limit} turns · ${esc(n.status)}</span>
         ${n.task_id ? `<span class="tag">task ${esc(n.task_id)}</span>` : ""}
         ${n.tokens ? `<span class="kv">${(n.tokens / 1000).toFixed(1)}k tok</span>` : ""}
-        <span class="kv cost">${money(n.cost_usd)}</span>
+        <span class="kv cost" title="${n.shared ? "Shared orchestrator spend — counted as harness overhead, not in this project's total" : ""}">${money(n.cost_usd)}${n.shared ? " (shared)" : ""}</span>
       </div>
       ${kids}
     </div>`;
@@ -131,7 +139,7 @@ function renderProjects(d) {
           <span class="badge ${esc(p.status)}">${esc(p.status)}</span>
           <span class="goal">${esc(p.goal)}</span>
           <span class="spacer"></span>
-          <span class="kv cost">total ${money(p.cost_usd)}</span>
+          <span class="kv cost" title="This project's own agents, excluding shared orchestrator overhead">project ${money(p.cost_usd)}</span>
           <span class="kv">${esc(p.id)}</span>
           <button data-pause="${p.id}">${p.status === "paused" ? "Resume" : "Pause"}</button>
           ${p.status === "ready_for_delivery" ? `<button data-deliver="${p.id}">Mark delivered</button>` : ""}

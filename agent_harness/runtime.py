@@ -13,11 +13,13 @@ retrying runs that make no progress.
 from __future__ import annotations
 
 import contextlib
+import shutil
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import openai
 from openhands.sdk import Agent, Conversation, LLMSummarizingCondenser
@@ -594,6 +596,98 @@ class AgentRuntime:
                     conv.close()
                 except Exception:  # noqa: BLE001
                     logger.debug("Failed to close conversation for %s", agent_id)
+
+    def handle_agent_logs(self, agents: list[AgentSpec], *, keep: bool,
+                          archive_to: Path | None = None,
+                          prune_project_dirs: bool = False) -> tuple[list[str], str]:
+        """Close conversations, then keep / move / delete each agent's log dir.
+
+        Conversation state is keyed by agent id under the project's dir, which
+        is also where the orchestrator's own transcript can live. Only the
+        listed agents' dirs are touched, so a live orchestrator never loses its
+        history. Returns (paths moved or deleted, human-readable note).
+
+        prune_project_dirs additionally clears leftovers in those dirs (state
+        from agents that no longer exist), but never a dir belonging to an agent
+        still in the store.
+        """
+        paths: list[str] = []
+        for spec in agents:
+            target = Path(spec.persistence_dir) if spec.persistence_dir \
+                else Path(self._persistence_dir(spec))
+            self.close(spec.id)
+            if not target.exists():
+                continue
+            if keep:
+                continue
+            if archive_to is not None:
+                archive_to.mkdir(parents=True, exist_ok=True)
+                dest = archive_to / f"{spec.id}-logs"
+                shutil.move(str(target), str(dest))
+                paths.append(str(dest))
+            else:
+                shutil.rmtree(target, ignore_errors=True)
+                paths.append(str(target))
+
+        if prune_project_dirs:
+            paths.extend(self._prune_project_log_dirs(agents))
+
+        if keep:
+            note = "Conversation logs kept."
+        elif archive_to is not None:
+            note = (f"Moved {len(paths)} conversation log dir(s) to {archive_to}."
+                    if paths else "No conversation logs to move.")
+        else:
+            note = (f"Deleted {len(paths)} conversation log dir(s)."
+                    if paths else "No conversation logs to delete.")
+        return paths, note
+
+    def _prune_project_log_dirs(self, agents: list[AgentSpec]) -> list[str]:
+        """Delete leftovers in the affected projects' log dirs.
+
+        A dir is kept if its name is still an agent in the store - notably the
+        orchestrator, whose transcript lives under whichever project it last
+        touched and must survive that project's removal.
+        """
+        removed: list[str] = []
+        project_dirs = {
+            (Path(spec.persistence_dir) if spec.persistence_dir
+             else Path(self._persistence_dir(spec))).parent
+            for spec in agents
+        }
+        for parent in project_dirs:
+            if not parent.is_dir():
+                continue
+            for entry in parent.iterdir():
+                if entry.name in self.store.agents:
+                    continue
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    with contextlib.suppress(OSError):
+                        entry.unlink()
+                removed.append(str(entry))
+            with contextlib.suppress(OSError):
+                parent.rmdir()  # only succeeds once genuinely empty
+        return removed
+
+    def delete_agent_artifacts(self, agent_ids: list[str]) -> list[str]:
+        """Close conversations and delete persisted state for these agents.
+
+        Used by the orphan sweep, where the agent record may already be gone.
+        """
+        removed: list[str] = []
+        for agent_id in agent_ids:
+            spec = self.store.agents.get(agent_id)
+            target = None
+            if spec is not None:
+                target = Path(spec.persistence_dir) if spec.persistence_dir \
+                    else Path(self._persistence_dir(spec))
+            self.close(agent_id)
+            if target is not None and target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+                removed.append(str(target))
+        return removed
 
     def close_all(self) -> None:
         for agent_id in list(self._conversations):

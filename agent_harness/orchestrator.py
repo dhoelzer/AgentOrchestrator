@@ -243,8 +243,59 @@ class Orchestrator:
         self.reconcile()
         return self.detect(), []
 
+    def sweep_orphans(self) -> list[str]:
+        """Forget agents that can never run again.
+
+        Removing a project deletes its agents, but a removal that happened in
+        an earlier process - or a hand-edited state file - can leave agents
+        whose project is gone, agents detached from a deleted parent, and
+        parents still holding dead child ids. Those dead ids count toward
+        max_children_per_agent, so they permanently steal delegation slots.
+
+        Returns a human-readable line per thing cleaned up.
+        """
+        orphans = self.store.orphaned_agents()
+        lines: list[str] = []
+
+        doomed = sorted(set(orphans["missing_project"]) | set(orphans["missing_parent"]))
+        if doomed:
+            roles = {a: self.store.agents[a].role for a in doomed
+                     if a in self.store.agents}
+            logs = self.runtime.delete_agent_artifacts(doomed)
+            self.store.delete_agents(doomed)
+            for aid in doomed:
+                lines.append(
+                    f"Deleted orphaned agent {aid} ({roles.get(aid, '?')})."
+                )
+            if logs:
+                lines.append(f"Deleted {len(logs)} orphaned conversation log dir(s).")
+
+        # Dead ids left on surviving agents leak delegation slots even when the
+        # agent record itself is fine.
+        for aid in orphans["dangling_child"]:
+            parent = self.store.agents.get(aid)
+            if parent is None:
+                continue
+            dead = [c for c in parent.child_agent_ids if c not in self.store.agents]
+            parent.child_agent_ids = [c for c in parent.child_agent_ids
+                                      if c in self.store.agents]
+            self.store.upsert_agent(parent)
+            lines.append(
+                f"Released {len(dead)} stale child id(s) on {aid} "
+                f"({parent.role}): {', '.join(dead)}."
+            )
+
+        if lines:
+            self.store.add_event(
+                "orphans_cleaned",
+                f"Orphan sweep: {'; '.join(lines)}",
+            )
+            self.store.flush()
+        return lines
+
     def run_cycle(self) -> list[CycleReport]:
-        """One scheduler tick: reconcile, detect, then let the orchestrator act."""
+        """One scheduler tick: sweep, reconcile, detect, then let the orchestrator act."""
+        self.sweep_orphans()
         self.reconcile()
         attention_map = self.detect()
         reports: list[CycleReport] = []
