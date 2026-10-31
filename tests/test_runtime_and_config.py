@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 import tempfile
@@ -9,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, ".")
 
-from agent_harness.config import HarnessConfig
+from agent_harness.config import HarnessConfig, resolve_config_path
 from agent_harness.orchestrator import Orchestrator
 from agent_harness.runtime import AgentRuntime, ConcurrencyGate, TurnCounter
 from agent_harness.store import Store
@@ -26,7 +27,9 @@ from agent_harness.tools import (
     UpdateTaskExecutor,
     register_harness_tools,
 )
-from agent_harness.web.api import _apply_config_patch
+from fastapi.testclient import TestClient
+
+from agent_harness.web.api import _apply_config_patch, build_api
 
 
 class FakeConv:
@@ -586,6 +589,37 @@ def test_dispatch_without_assign_task_still_links_counters():
         print("dispatch-time linking + reviewer isolation ok")
 
 
+def test_config_edits_persist_to_the_loaded_file():
+    """UI config edits must write back to the file the process loaded from."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_file = Path(tmp) / "config.json"
+        cfg_file.write_text(json.dumps({
+            "llm": {"base_url": "http://x/v1/", "model": "openai/m",
+                    "api_key": "sekret", "request_timeout": 300},
+            "data_dir": tmp, "projects_dir": str(Path(tmp) / "projects"),
+            "tick_seconds": 60,
+        }))
+        assert resolve_config_path(cfg_file) == cfg_file
+        cfg = HarnessConfig.load(cfg_file)
+        assert cfg.llm.request_timeout == 300
+
+        store = Store(tmp)
+        runtime = AgentRuntime(cfg, store)
+        orch = Orchestrator(cfg, store, runtime)
+        app = build_api(cfg, store, orch, config_path=str(cfg_file))
+        client = TestClient(app)
+
+        r = client.post("/api/config", json={"llm.request_timeout": 777})
+        assert r.status_code == 200, r.text
+        on_disk = json.loads(cfg_file.read_text())
+        assert on_disk["llm"]["request_timeout"] == 777, on_disk["llm"]
+        # The key must never be echoed to the browser.
+        got = client.get("/api/config").json()["config"]
+        assert got["llm"]["api_key"] != "sekret"
+        assert "sekret" not in r.text
+        print("config persistence + redaction ok")
+
+
 def test_qwen_cost_defaults():
     cfg = HarnessConfig()
     assert cfg.llm.input_cost_per_token == 0.000002
@@ -609,5 +643,6 @@ if __name__ == "__main__":
     test_auth_errors_are_not_retried()
     test_reviewer_does_not_steal_the_worker_link()
     test_dispatch_without_assign_task_still_links_counters()
+    test_config_edits_persist_to_the_loaded_file()
     test_qwen_cost_defaults()
     print("\nALL RUNTIME/CONFIG TESTS PASSED")

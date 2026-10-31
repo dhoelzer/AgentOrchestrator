@@ -104,6 +104,11 @@ class LLMConfig(BaseModel):
         return LLM(**kwargs)
 
 
+def resolve_config_path(path: str | os.PathLike[str] | None = None) -> Path:
+    """Where config.json lives, so UI edits can be written back to the same file."""
+    return Path(path or os.environ.get("HARNESS_CONFIG") or REPO_ROOT / "config.json")
+
+
 class HarnessConfig(BaseModel):
     """Top-level configuration loaded from config.json / environment."""
 
@@ -135,7 +140,7 @@ class HarnessConfig(BaseModel):
     @classmethod
     def load(cls, path: str | os.PathLike[str] | None = None) -> "HarnessConfig":
         """Load config.json, then apply environment overrides."""
-        cfg_path = Path(path or os.environ.get("HARNESS_CONFIG") or REPO_ROOT / "config.json")
+        cfg_path = resolve_config_path(path)
         if cfg_path.exists():
             raw = json.loads(cfg_path.read_text())
             cfg = cls.model_validate(raw)

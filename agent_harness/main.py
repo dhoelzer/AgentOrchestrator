@@ -16,7 +16,7 @@ os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 
 import uvicorn
 
-from .config import HarnessConfig
+from .config import HarnessConfig, resolve_config_path
 from .orchestrator import Orchestrator
 from .runtime import AgentRuntime
 from .store import Store
@@ -85,7 +85,8 @@ def main(argv: list[str] | None = None) -> int:
         store.flush()
         return 0
 
-    app = build_api(config, store, orchestrator, config_path=args.config)
+    app = build_api(config, store, orchestrator,
+                    config_path=str(resolve_config_path(args.config)))
 
     loop_thread = threading.Thread(
         target=orchestrator.run_forever, name="orchestrator", daemon=True
