@@ -205,8 +205,10 @@ class AgentRuntime:
                 error = f"{type(exc).__name__}: {exc}"
                 logger.exception("Agent %s run failed", spec.id)
 
-            turns_now = TurnCounter.count(conv)
-            turns_this_run = max(0, turns_now - before_turns)
+            # max(): a condenser that prunes events can make the count regress,
+            # which would silently hand the agent turns back. Never regress.
+            turns_now = max(before_turns, TurnCounter.count(conv))
+            turns_this_run = turns_now - before_turns
             spec.turns_used = turns_now
 
             metrics = conv.state.stats.get_combined_metrics()
