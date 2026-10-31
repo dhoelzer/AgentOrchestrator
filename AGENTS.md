@@ -2,11 +2,20 @@
 
 Agent harness built on the OpenHands Software Agent SDK (`openhands-sdk` / `openhands-tools`).
 
+## Naming: package vs data dir
+
+The Python package is **`agent_harness`**. The top-level `harness/` directory is
+reserved for the bind-mounted runtime data (config, state, conversations, project
+workspaces) and is gitignored. Do not rename the package back to `harness` — it
+would collide with that mount both on the host and inside the image.
+
 ## Run
 
 ```bash
 pip install -r requirements.txt
-python -m harness.main          # web UI on :8090 + forever orchestrator loop
+python -m agent_harness.main          # web UI on :8090 + forever orchestrator loop
+
+docker compose up -d --build          # containerized + Docker-in-Docker sidecar
 ```
 
 ## Tests
@@ -40,6 +49,28 @@ the LLM tests take minutes and are non-deterministic.
   supplying an explicit tool list.
 - Unmapped local model names (e.g. `openai/qwen`) emit harmless litellm
   "Cost calculation failed" warnings; cost metrics stay 0.
+- The SDK strips only a fixed set of sensitive vars (`SESSION_API_KEY`,
+  `OH_SECRET_KEY`, `OH_SESSION_API_KEYS_*`, OTEL headers) from the agent shell
+  environment. `DOCKER_HOST` and `HARNESS_LLM_API_KEY` do reach agent commands —
+  which is what makes DinD work, and also means agents can read the LLM key.
+- In the `docker:cli` image the CLI plugins live in
+  `/usr/local/libexec/docker/cli-plugins`, **not** `/usr/local/lib/docker/...`.
+
+## Container
+
+- `compose.yaml` runs the app privileged with a `docker:29-dind` sidecar and
+  binds `./harness` -> `/data`. `privileged` is required for the inner daemon to
+  mount overlayfs; it is also root-equivalent on the host.
+- The entrypoint seeds `/data/config.json` from the image default on first run
+  and `chmod 666`s it, since the repo's `config.json` is mode 600 and the
+  container writes as root.
+- `HARNESS_HOST` is read by `config.py`; `HARNESS_PORT`, `HARNESS_DATA_DIR`,
+  `HARNESS_TICK_SECONDS`, `HARNESS_SUB_AGENT_TURN_LIMIT`,
+  `HARNESS_MAX_PARALLEL_WORKERS` and the three `HARNESS_LLM_*` vars also
+  override `config.json`.
+- This sandbox cannot build or run containers (nested overlayfs mounts fail with
+  `invalid argument`), so image builds cannot be verified here. Validate with
+  `docker compose config` and `docker buildx build --check` instead.
 
 ## Harness invariants
 

@@ -1,0 +1,114 @@
+# Deploy the orchestrator harness with Docker-in-Docker.
+#
+#   docker compose up -d --build
+#   open http://localhost:8090
+#
+# Layout of the bind mount (created automatically on first up):
+#   ./harness/config.json      LLM + runtime config (edit, then `compose restart`)
+#   ./harness/state.json       board: projects, tasks, agent hierarchy
+#   ./harness/events.jsonl     activity feed
+#   ./harness/conversations/   SDK-persisted conversation state per agent
+#   ./harness/projects/<name>/  each project workspace = agent output
+#
+# IMPORTANT: run exactly one stack per ./harness directory. The store is
+# in-memory with a JSON flush; two containers sharing the mount clobber each
+# other.
+
+services:
+  # ---------------------------------------------------------------------
+  # Orchestrator + web UI. Runs forever.
+  # ---------------------------------------------------------------------
+  harness:
+    build:
+      context: .
+    image: orchestrator-harness:latest
+    container_name: orchestrator-harness
+
+    # Agents are general-purpose software workers: they install packages,
+    # compile, bind ports, use containers, and touch arbitrary paths. There is
+    # no meaningful sandbox to keep them out of, so the container is granted
+    # full privileges. privileged: true implies all capabilities, all host
+    # devices, unconfined seccomp/apparmor, and writable /proc + /sys.
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+    # Not implied by privileged:
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+      core:
+        soft: -1
+        hard: -1
+    # Browsers / test runners / build tooling want more than the 64 MiB default.
+    shm_size: 1gb
+
+    # All configuration and every workspace output live in the local ./harness
+    # directory rather than in the container.
+    volumes:
+      - ./harness:/data
+
+    environment:
+      HARNESS_CONFIG: /data/config.json
+      HARNESS_DATA_DIR: /data
+      HARNESS_HOST: 0.0.0.0
+      HARNESS_PORT: 8090
+      # Agents' `docker` commands go to the DinD daemon below.
+      DOCKER_HOST: tcp://docker:2375
+      DOCKER_DRIVER: overlay2
+      DOCKER_TLS_VERIFY: "0"
+      # Optional runtime overrides for the LLM endpoint; empty means "use
+      # whatever /data/config.json says". Point base_url at
+      # http://host.docker.internal:PORT to reach an endpoint on the host.
+      HARNESS_LLM_BASE_URL: ${HARNESS_LLM_BASE_URL:-}
+      HARNESS_LLM_MODEL: ${HARNESS_LLM_MODEL:-}
+      HARNESS_LLM_API_KEY: ${HARNESS_LLM_API_KEY:-}
+
+    ports:
+      - "8090:8090"
+
+    # The orchestrator is a long-running service; keep it up across restarts.
+    restart: unless-stopped
+    # Let in-flight agent runs finish and the store flush on SIGTERM.
+    stop_grace_period: 60s
+
+    depends_on:
+      docker:
+        condition: service_healthy
+
+    # Reach a host-native daemon or service if needed (Linux-only helper).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ---------------------------------------------------------------------
+  # Docker-in-Docker daemon. Agents get a real daemon: they can build images,
+  # run containers, and use compose. Privileged is required for the inner
+  # daemon to mount overlayfs.
+  # ---------------------------------------------------------------------
+  docker:
+    image: docker:29-dind
+    container_name: orchestrator-harness-dind
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      DOCKER_TLS_CERTDIR: ""          # plaintext on the private compose network
+    volumes:
+      - dind-data:/var/lib/docker     # image/build cache survives restarts
+      # Mirrors the app's mount at the same path. The daemon resolves bind
+      # sources against its own filesystem, so an agent that runs
+      # `docker run -v /data/projects/foo:/app` gets the same host directory.
+      # Keep this path in sync with the app service.
+      - ./harness:/data
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+    networks:
+      - default
+    restart: unless-stopped
+
+volumes:
+  dind-data:

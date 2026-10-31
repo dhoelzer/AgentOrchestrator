@@ -1,0 +1,22 @@
+# Keep the build context small and out of the image. Runtime state is expected
+# to arrive via the ./harness bind mount, never baked in.
+.git
+.gitignore
+.agent_tmp/
+data/
+harness/
+logs/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+compose.yaml
+Dockerfile
+.dockerignore
+README.md
+AGENTS.md
+*.log

@@ -4,3 +4,4 @@ data/
 logs/
 .venv/
 .agent_tmp/
+harness/
