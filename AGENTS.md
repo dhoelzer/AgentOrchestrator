@@ -94,3 +94,8 @@ the LLM tests take minutes and are non-deterministic.
   review run write `assigned_agent_id` or `task.turns_used` — the card would show the
   reviewer's budget instead of the worker's. `Store._sync_task_budget` is gated on
   both, so a reviewer cannot overwrite the worker's count.
+- `is_reviewer` is only known once something marks it: `assign_task` infers it from
+  `task.column == "review"` (a task already in review has finished its worker
+  stretch), and `_dispatch(review=True)` sets it. Three paths had to be gated this
+  way — `_dispatch`, `assign_task`, and `reconfigure_agent` — because the
+  orchestrator reaches all of them with a reviewer attached to a task.

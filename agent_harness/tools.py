@@ -429,6 +429,21 @@ class AssignTaskExecutor(ToolExecutor):
             return _err(f"Unknown task_id {action.task_id}.")
         if agent is None:
             return _err(f"Unknown agent_id {action.agent_id}.")
+        # A task already in 'review' has finished its worker stretch, so an
+        # agent attached to it now is a reviewer; it must not take the worker
+        # link, which is what drives the card's turn counters.
+        if agent.is_reviewer or task.column == "review":
+            agent.is_reviewer = True
+            task.reviewer_agent_id = agent.id
+            agent.task_id = task.id
+            agent.touch()
+            task.touch()
+            c.store.flush()
+            return _ok(
+                f"{agent.role} ({agent.id}) attached as reviewer of {task.id}. "
+                "Run it with run_agent(agent_id='" + agent.id + "', task_id='"
+                + task.id + "', review=true)."
+            )
         task.assigned_agent_id = agent.id
         task.touch()
         agent.task_id = task.id
@@ -533,6 +548,17 @@ def _dispatch(agent: AgentSpec, task: TaskSpec | None, message: str,
             if not agent.is_reviewer:
                 agent.is_reviewer = True
                 c.store.upsert_agent(agent)
+            if task.assigned_agent_id == agent.id:
+                # The orchestrator assigned this reviewer as the worker before
+                # dispatching it as a reviewer; hand the card back to the real
+                # worker so its counters stay attributable.
+                worker = next(
+                    (a for a in c.store.project_agents(agent.project_id or "")
+                     if a.id != agent.id and a.task_id == task.id
+                     and not a.is_reviewer),
+                    None,
+                )
+                task.assigned_agent_id = worker.id if worker else None
         else:
             task.assigned_agent_id = agent.id
             # The orchestrator can dispatch with an explicit task_id without
@@ -681,8 +707,11 @@ class ReconfigureAgentExecutor(ToolExecutor):
             agent.touch()
         if agent.task_id and agent.task_id in c.store.tasks:
             task = c.store.tasks[agent.task_id]
-            task.turns_used = agent.turns_used
-            task.turn_limit = agent.turn_limit
+            # Only the worker drives the card's counters; reconfiguring a
+            # reviewer would otherwise reset the card to 0/new-limit.
+            if not agent.is_reviewer and task.assigned_agent_id == agent.id:
+                task.turns_used = agent.turns_used
+                task.turn_limit = agent.turn_limit
             if task.column == "blocked":
                 task.column = "ready"
             task.touch()

@@ -589,6 +589,71 @@ def test_dispatch_without_assign_task_still_links_counters():
         print("dispatch-time linking + reviewer isolation ok")
 
 
+def test_reconfigure_and_assign_keep_card_counters_on_the_worker():
+    """Reconfiguring/assigning a reviewer must not reset or steal the card."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = make(tmp)
+        conv = FakeConv("orch-conv")
+        CreateProjectExecutor()(CreateProjectAction(
+            name="Reconf", goal="reviewer must not reset the card",
+            constraints=""), conv)
+        pid = list(store.projects)[0]
+        CreateTaskExecutor()(CreateTaskAction(
+            project_id=pid, title="Build", objective="x", expertise="backend",
+            acceptance_criteria=["works"], deliverables=["out"]), conv)
+        task_id = [t.id for t in store.project_tasks(pid)][0]
+
+        CreateSubAgentExecutor()(CreateSubAgentAction(
+            role="backend-dev", specialty="backend", mission="build",
+            project_id=pid), conv)
+        worker_id = [a.id for a in store.project_agents(pid)
+                     if a.role == "backend-dev"][0]
+        AssignTaskExecutor()(AssignTaskAction(task_id=task_id, agent_id=worker_id), conv)
+
+        from agent_harness.tools import (RunAgentExecutor, RunAgentAction,
+                                         ReconfigureAgentAction, ReconfigureAgentExecutor)
+        runtime.open_conversation = lambda *a, **k: FlakyConv([6])
+        RunAgentExecutor()(RunAgentAction(
+            agent_id=worker_id, task_id=task_id, background=False), conv)
+        assert store.tasks[task_id].turns_used == 6
+
+        # Reviewer is assigned first (as the orchestrator sometimes does), then
+        # dispatched with review=true.
+        CreateSubAgentExecutor()(CreateSubAgentAction(
+            role="reviewer", specialty="backend", mission="review",
+            project_id=pid), conv)
+        reviewer_id = [a.id for a in store.project_agents(pid)
+                       if a.role == "reviewer"][0]
+        AssignTaskExecutor()(AssignTaskAction(task_id=task_id, agent_id=reviewer_id), conv)
+        assert store.tasks[task_id].assigned_agent_id == worker_id, (
+            "assign_task handed the worker link to a reviewer")
+
+        runtime.open_conversation = lambda *a, **k: FlakyConv([4])
+        ReconfigureAgentExecutor()(ReconfigureAgentAction(
+            agent_id=reviewer_id, decision="reviewer prompt was too loose",
+            mission="review harder", turn_limit=12,
+            fresh_conversation=False), conv)
+        task = store.tasks[task_id]
+        assert task.turns_used == 6, (
+            f"reconfiguring the reviewer reset the card to {task.turns_used}")
+        assert task.turn_limit == 100, task.turn_limit
+
+        _dispatch_review(store, runtime, reviewer_id, task_id)
+        task = store.tasks[task_id]
+        assert task.assigned_agent_id == worker_id, "worker link lost after review"
+        assert task.reviewer_agent_id == reviewer_id
+        assert task.turns_used == 6, task.turns_used
+        print("reconfigure/assign reviewer isolation ok")
+
+
+def _dispatch_review(store, runtime, reviewer_id, task_id):
+    conv = FakeConv("orch-conv")
+    from agent_harness.tools import RunAgentExecutor, RunAgentAction
+    runtime.open_conversation = lambda *a, **k: FlakyConv([4])
+    RunAgentExecutor()(RunAgentAction(
+        agent_id=reviewer_id, task_id=task_id, review=True, background=False), conv)
+
+
 def test_config_edits_persist_to_the_loaded_file():
     """UI config edits must write back to the file the process loaded from."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -643,6 +708,7 @@ if __name__ == "__main__":
     test_auth_errors_are_not_retried()
     test_reviewer_does_not_steal_the_worker_link()
     test_dispatch_without_assign_task_still_links_counters()
+    test_reconfigure_and_assign_keep_card_counters_on_the_worker()
     test_config_edits_persist_to_the_loaded_file()
     test_qwen_cost_defaults()
     print("\nALL RUNTIME/CONFIG TESTS PASSED")
