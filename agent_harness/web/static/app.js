@@ -9,7 +9,10 @@ const money = (v) => "$" + (Number(v || 0)).toFixed(4).replace(/0+$/, "").replac
 
 function agoLabel(ts) {
   if (!ts) return "never";
-  const secs = Math.max(0, Math.floor(Date.now() / 1000) - Number(ts));
+  // Cycle timestamps are epoch seconds; store records (revisions, events) are ISO.
+  const then = typeof ts === "number" ? ts : Math.floor(new Date(ts).getTime() / 1000);
+  if (!Number.isFinite(then)) return "unknown";
+  const secs = Math.max(0, Math.floor(Date.now() / 1000) - then);
   if (secs < 60) return `${secs}s ago`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
   if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
@@ -129,6 +132,22 @@ function renderBoard(p) {
     .join("")}</div>`;
 }
 
+function renderRevisions(p) {
+  const revs = p.revisions || [];
+  const items = revs.length
+    ? `<ol>${revs.slice(0, 12).map((r) =>
+        `<li><b>${esc(r.version)}</b> · ${esc(r.reason)} <span class="kv">${esc(agoLabel(r.at))}</span></li>`).join("")}</ol>`
+    : '<div class="muted">No revisions recorded yet.</div>';
+  return `<div class="revisions">
+    <h5 style="margin:12px 0 6px;font-size:12px;text-transform:uppercase;color:var(--dim)">
+      Version history — current ${esc(p.version)}</h5>
+    ${items}
+    <div style="margin-top:8px">
+      <button data-edit="${p.id}">Edit scope (bumps version)</button>
+    </div>
+  </div>`;
+}
+
 function renderProjects(d) {
   const html = d.projects
     .map((p) => {
@@ -136,6 +155,7 @@ function renderProjects(d) {
       return `<details class="card" ${open} data-project="${p.id}">
         <summary>
           <span class="pname">${esc(p.name)}</span>
+          <span class="ver" title="Project version — starts at 0.1, increments on every revision, major bumps on delivery">v${esc(p.version)}</span>
           <span class="badge ${esc(p.status)}">${esc(p.status)}</span>
           <span class="goal">${esc(p.goal)}</span>
           <span class="spacer"></span>
@@ -160,6 +180,7 @@ function renderProjects(d) {
               ${state.tab === "board" ? renderTree(p.tree) : renderBoard(p)}
             </div>
           </div>
+          ${renderRevisions(p)}
         </div>
       </details>`;
     })
@@ -322,6 +343,24 @@ document.addEventListener("click", async (e) => {
   }
   if (t.dataset.deliver) {
     await fetch(`/api/projects/${t.dataset.deliver}/mark-delivered`, { method: "POST" });
+    refresh();
+    return;
+  }
+  if (t.dataset.edit) {
+    const p = (state.data?.projects || []).find((x) => x.id === t.dataset.edit);
+    if (!p) return;
+    const goal = window.prompt("Goal (leaving it unchanged records no revision):", p.goal);
+    if (goal === null) return;
+    const constraints = window.prompt("Constraints:", p.constraints || "");
+    if (constraints === null) return;
+    const res = await fetch(`/api/projects/${p.id}/revise`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ goal, constraints }),
+    });
+    if (!res.ok) {
+      alert("Could not update scope: " + (await res.text()));
+    }
     refresh();
     return;
   }

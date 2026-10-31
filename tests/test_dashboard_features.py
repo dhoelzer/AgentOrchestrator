@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import threading
@@ -15,7 +16,7 @@ from fastapi.testclient import TestClient
 from agent_harness.config import HarnessConfig
 from agent_harness.orchestrator import Orchestrator
 from agent_harness.runtime import AgentRuntime
-from agent_harness.store import Store
+from agent_harness.store import Store, REVISION_LOG_LIMIT
 from agent_harness.tools import (
     CreateProjectAction,
     CreateProjectExecutor,
@@ -23,6 +24,12 @@ from agent_harness.tools import (
     CreateSubAgentExecutor,
     CreateTaskAction,
     CreateTaskExecutor,
+    RecordReviewAction,
+    RecordReviewExecutor,
+    SignalDeliveryAction,
+    SignalDeliveryExecutor,
+    UpdateTaskAction,
+    UpdateTaskExecutor,
     register_harness_tools,
 )
 from agent_harness.store import AgentSpec
@@ -739,6 +746,186 @@ def test_removed_projects_raise_no_alerts():
         print("removed projects silent ok")
 
 
+def _one_project(tmp: str, name: str = "Widget", goal: str = "ship a widget"):
+    """A store with exactly one project and no tasks (version 0.1)."""
+    cfg, store, runtime, orch = make(tmp)
+    CreateProjectExecutor()(CreateProjectAction(
+        name=name, goal=goal, constraints=""), FakeConv())
+    return cfg, store, runtime, orch, list(store.projects)[0]
+
+
+def test_projects_start_at_version_0_1():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid = _one_project(tmp, name="Fresh")
+        assert store.projects[pid].version == "0.1", store.projects[pid].version
+        d = TestClient(build_api(cfg, store, orch)).get("/api/state").json()
+        proj = [p for p in d["projects"] if p["id"] == pid][0]
+        assert proj["version"] == "0.1", proj["version"]
+        # Decomposing the project into tasks is itself the first revision.
+        CreateTaskExecutor()(CreateTaskAction(
+            project_id=pid, title="A", objective="x", expertise="backend",
+            acceptance_criteria=["works"], deliverables=["a.py"]), FakeConv())
+        assert store.projects[pid].version == "0.2", store.projects[pid].version
+        print("projects start at 0.1")
+
+
+def test_material_revisions_bump_the_minor_version():
+    """Adding a task and recording a review are revisions; the minor climbs."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid = _one_project(tmp, name="Versioned", goal="ship it")
+        conv = FakeConv()
+        assert store.projects[pid].version == "0.1"
+
+        CreateTaskExecutor()(CreateTaskAction(
+            project_id=pid, title="A", objective="x", expertise="backend",
+            acceptance_criteria=["works"], deliverables=["a.py"]), conv)
+        assert store.projects[pid].version == "0.2", store.projects[pid].version
+
+        tid = list(store.tasks)[0]
+        RecordReviewExecutor()(RecordReviewAction(
+            task_id=tid, verdict="changes_requested", feedback="fix it"), conv)
+        assert store.projects[pid].version == "0.3", store.projects[pid].version
+        RecordReviewExecutor()(RecordReviewAction(
+            task_id=tid, verdict="approved", feedback="good"), conv)
+        assert store.projects[pid].version == "0.4", store.projects[pid].version
+
+        # Each version records why it changed.
+        reasons = [r["reason"] for r in store.projects[pid].revision_log]
+        assert any("plan:" in r for r in reasons), reasons
+        assert any("review:" in r for r in reasons), reasons
+        print("minor version climbs on material revisions")
+
+
+def test_routine_board_moves_are_not_revisions():
+    """Moving a card between columns is not a project revision."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid = _one_project(tmp, name="Moves", goal="ship it")
+        conv = FakeConv()
+        CreateTaskExecutor()(CreateTaskAction(
+            project_id=pid, title="A", objective="x", expertise="backend",
+            acceptance_criteria=["works"], deliverables=["a.py"]), conv)
+        tid = list(store.tasks)[0]
+        before = store.projects[pid].version
+
+        for col in ("ready", "in_progress", "review", "rework", "blocked"):
+            args = dict(task_id=tid, column=col)
+            if col == "blocked":
+                args["blocked_reason"] = "waiting on a dependency"
+            UpdateTaskExecutor()(UpdateTaskAction(**args), conv)
+        assert store.projects[pid].version == before, (before, store.projects[pid].version)
+
+        # Redefining the task's acceptance criteria IS a revision.
+        UpdateTaskExecutor()(UpdateTaskAction(
+            task_id=tid, acceptance_criteria=["works", "is fast"]), conv)
+        assert store.projects[pid].version != before, store.projects[pid].version
+        print("board moves do not bump the version; scope edits do")
+
+
+def test_delivery_is_a_major_release():
+    """Delivery bumps the major and resets the minor."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid = _one_project(tmp, name="Releaser", goal="ship it")
+        conv = FakeConv()
+        CreateTaskExecutor()(CreateTaskAction(
+            project_id=pid, title="A", objective="x", expertise="backend",
+            acceptance_criteria=["works"], deliverables=["a.py"]), conv)
+        tid = list(store.tasks)[0]
+        RecordReviewExecutor()(RecordReviewAction(
+            task_id=tid, verdict="approved", feedback="good"), conv)
+        minor_before = store.projects[pid].version_minor
+        assert minor_before >= 2
+
+        SignalDeliveryExecutor()(SignalDeliveryAction(
+            project_id=pid, summary="all done"), conv)
+        api = TestClient(build_api(cfg, store, orch))
+        out = api.post(f"/api/projects/{pid}/mark-delivered").json()
+        proj = store.projects[pid]
+        assert proj.version_major == 1, proj.version
+        assert proj.version_minor == 0, proj.version
+        assert out["version"] == "1.0", out
+
+        # Post-release work keeps climbing from the reset minor.
+        api.post(f"/api/projects/{pid}/revise", json={"goal": "a second version"})
+        assert store.projects[pid].version == "1.1", store.projects[pid].version
+        print("delivery is a major release")
+
+
+def test_editing_scope_bumps_the_version_and_is_reported():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid = _one_project(tmp)
+        api = TestClient(build_api(cfg, store, orch))
+
+        # No change -> no revision.
+        out = api.post(f"/api/projects/{pid}/revise",
+                       json={"goal": "ship a widget"}).json()
+        assert out["changed"] == [], out
+        assert store.projects[pid].version == "0.1", store.projects[pid].version
+
+        out = api.post(f"/api/projects/{pid}/revise",
+                       json={"goal": "ship a bigger widget"}).json()
+        assert out["changed"] == ["goal"], out
+        assert out["previous_version"] == "0.1", out
+        assert out["version"] == "0.2", out
+        assert store.projects[pid].goal == "ship a bigger widget"
+
+        # Constraints can be set and cleared; a blank goal or name cannot.
+        assert api.post(f"/api/projects/{pid}/revise",
+                        json={"constraints": "under 20 lines"}).json()["changed"] == ["constraints"]
+        assert store.projects[pid].constraints == "under 20 lines"
+        assert api.post(f"/api/projects/{pid}/revise",
+                        json={"constraints": ""}).json()["changed"] == ["constraints"]
+        assert store.projects[pid].constraints == ""
+        assert api.post(f"/api/projects/{pid}/revise",
+                        json={"goal": "  "}).json()["changed"] == [], "blank goal ignored"
+        assert api.post(f"/api/projects/{pid}/revise",
+                        json={"name": ""}).json()["changed"] == [], "blank name ignored"
+        assert store.projects[pid].goal == "ship a bigger widget"
+        print("scope edits bump the version")
+
+
+def test_version_survives_a_restart_and_old_state_gets_a_default():
+    """Pre-versioning state files load with 0.1 rather than crashing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid = _one_project(tmp)
+        store.revise_project(pid, "work landed")
+        store.revise_project(pid, "review closed")
+        assert store.projects[pid].version == "0.3"
+        store.flush()
+
+        # Strip version fields from the on-disk state to simulate an upgrade
+        # from a build that had no versioning at all.
+        state_path = Path(cfg.data_dir) / "state.json"
+        data = json.loads(state_path.read_text())
+        for proj in data["projects"]:
+            for key in ("version_major", "version_minor", "revision_log"):
+                proj.pop(key, None)
+        state_path.write_text(json.dumps(data))
+
+        reloaded = Store(cfg.data_dir)
+        assert reloaded.projects[pid].version == "0.1", reloaded.projects[pid].version
+        assert reloaded.projects[pid].revision_log == []
+
+        # And a normal restart keeps the real version.
+        store.flush()
+        again = Store(cfg.data_dir)
+        assert again.projects[pid].version == "0.3", again.projects[pid].version
+        assert len(again.projects[pid].revision_log) == 2
+        print("version persists; legacy state defaults to 0.1")
+
+
+def test_revision_log_is_capped():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch, pid = _one_project(tmp)
+        for i in range(REVISION_LOG_LIMIT + 25):
+            store.revise_project(pid, f"revision {i}")
+        proj = store.projects[pid]
+        assert len(proj.revision_log) == REVISION_LOG_LIMIT, len(proj.revision_log)
+        # Oldest entries drop off; the newest is retained.
+        assert proj.revision_log[-1]["reason"] == f"revision {REVISION_LOG_LIMIT + 24}"
+        assert proj.version_minor == REVISION_LOG_LIMIT + 26, proj.version
+        print("revision log capped")
+
+
 def main() -> None:
     test_remove_hide_keeps_files_and_stops_work()
     test_remove_archives_workspace_and_keeps_record()
@@ -766,6 +953,13 @@ def main() -> None:
     test_purging_a_project_never_orchestrates_away_spend()
     test_harness_total_reconciles_with_project_plus_orchestrator()
     test_removed_projects_raise_no_alerts()
+    test_projects_start_at_version_0_1()
+    test_material_revisions_bump_the_minor_version()
+    test_routine_board_moves_are_not_revisions()
+    test_delivery_is_a_major_release()
+    test_editing_scope_bumps_the_version_and_is_reported()
+    test_version_survives_a_restart_and_old_state_gets_a_default()
+    test_revision_log_is_capped()
     print("\nALL DASHBOARD FEATURE TESTS PASSED")
 
 

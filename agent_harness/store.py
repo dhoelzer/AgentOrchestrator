@@ -26,6 +26,10 @@ KANBAN_COLUMNS = [
     "blocked",
 ]
 
+# How many revision entries to keep per project. Long-running projects revise
+# often; the log is for recent history, not a full audit trail.
+REVISION_LOG_LIMIT = 50
+
 Column = Literal[
     "backlog", "ready", "in_progress", "review", "rework", "done", "blocked"
 ]
@@ -149,8 +153,21 @@ class Project(BaseModel):
     # Spend is summed over the project's agents, but removal deletes those
     # records, so the total is snapshotted here to keep cost history.
     final_cost_usd: float | None = None
+    # Project version, starting at 0.1. Minor increments on every revision
+    # (work landed, review reopened a task, scope changed); major increments
+    # when the project is delivered, which is a release.
+    version_major: int = 0
+    version_minor: int = 1
+    # Short audit trail of what each version changed. Kept on the project (not
+    # derived from the event log, which rotates) so the dashboard can show a
+    # version history even long after the events scrolled off.
+    revision_log: list[dict] = Field(default_factory=list)
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
+
+    @property
+    def version(self) -> str:
+        return f"{self.version_major}.{self.version_minor}"
 
     def touch(self) -> None:
         self.updated_at = now_iso()
@@ -234,9 +251,42 @@ class Store:
         Path(workspace).mkdir(parents=True, exist_ok=True)
         with self._lock:
             self.projects[proj.id] = proj
-        self.add_event("project_created", f"Project '{name}' created.", project_id=proj.id)
+        self.add_event("project_created",
+                       f"Project '{name}' created at version {proj.version}.",
+                       project_id=proj.id)
         self.flush()
         return proj
+
+    def revise_project(self, project_id: str, reason: str,
+                       release: bool = False) -> Project | None:
+        """Bump the project version after a material revision.
+
+        Minor for every revision (work landed, review reopened a task, the plan
+        changed); major for a delivery, which is a release. Returns None when
+        the project is unknown, so callers can treat it as best-effort.
+        """
+        with self._lock:
+            project = self.projects.get(project_id)
+            if project is None:
+                return None
+            before = project.version
+            if release:
+                project.version_major += 1
+                project.version_minor = 0
+            else:
+                project.version_minor += 1
+            project.touch()
+            project.revision_log.append({
+                "version": project.version, "reason": reason, "at": project.updated_at,
+            })
+            del project.revision_log[:-REVISION_LOG_LIMIT]
+        self.add_event(
+            "project_revised",
+            f"Project '{project.name}' {before} -> {project.version}: {reason}",
+            project_id=project_id,
+        )
+        self.flush()
+        return project
 
     def upsert_task(self, task: TaskSpec) -> TaskSpec:
         with self._lock:

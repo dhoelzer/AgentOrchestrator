@@ -93,6 +93,8 @@ class Orchestrator:
                 project.ready_at = now_iso()
                 project.ready_generation += 1
                 project.touch()
+                self.store.revise_project(
+                    project.id, "all tasks done - ready for delivery")
                 self.store.add_event(
                     "delivery_candidate",
                     f"Project '{project.name}' looks ready to deliver.",

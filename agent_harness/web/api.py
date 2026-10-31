@@ -38,8 +38,13 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
     # ---------------- views ----------------
 
     @app.get("/", response_class=HTMLResponse)
-    def index() -> str:
-        return (TEMPLATES / "index.html").read_text()
+    def index() -> HTMLResponse:
+        # Cache-bust the bundle by mtime so a harness upgrade is picked up by
+        # dashboards that are already open.
+        app_js = Path(__file__).parent / "static" / "app.js"
+        html = (TEMPLATES / "index.html").read_text().replace(
+            "/static/app.js", f"/static/app.js?v={int(app_js.stat().st_mtime)}")
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     @app.get("/health")
     def health() -> dict:
@@ -59,6 +64,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         for project in store.visible_projects():
             board = {col: [_task_json(t) for t in items]
                      for col, items in store.board(project.id).items()}
+            revisions = list(reversed(project.revision_log))
             projects.append({
                 "id": project.id,
                 "name": project.name,
@@ -69,6 +75,10 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                 "created_at": project.created_at,
                 "updated_at": project.updated_at,
                 "delivery_signaled": project.delivery_signaled,
+                "version": project.version,
+                "version_major": project.version_major,
+                "version_minor": project.version_minor,
+                "revisions": revisions,
                 "cost_usd": store.project_cost(project.id),
                 "board": board,
                 "counts": store.column_counts(project.id),
@@ -135,8 +145,35 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         project.touch()
         store.add_event("delivered", f"User marked '{project.name}' as delivered.",
                         project_id=project.id)
-        store.flush()
-        return {"id": project.id, "status": project.status}
+        # A delivery is a release: bump the major and reset the minor.
+        revised = store.revise_project(project_id, "delivered", release=True)
+        return {"id": project.id, "status": project.status,
+                "version": revised.version if revised else project.version}
+
+    @app.post("/api/projects/{project_id}/revise")
+    def revise_project(project_id: str, body: dict) -> dict:
+        """Edit a project's goal/constraints; a scope change is a new revision."""
+        project = _get_project(project_id)
+        before = project.version
+        changed: list[str] = []
+        for field in ("goal", "constraints", "name"):
+            if field not in body or body[field] is None:
+                continue
+            value = str(body[field]).strip()
+            # Empty is only a valid value for constraints (clearing them);
+            # a blank name or goal would make the project unusable.
+            if not value and field != "constraints":
+                continue
+            if value != getattr(project, field):
+                setattr(project, field, value)
+                changed.append(field)
+        if not changed:
+            return {"id": project.id, "version": project.version, "changed": []}
+        project.touch()
+        revised = store.revise_project(
+            project_id, "scope: updated " + ", ".join(changed))
+        return {"id": project.id, "version": revised.version if revised else project.version,
+                "previous_version": before, "changed": changed}
 
     @app.post("/api/projects/{project_id}/remove")
     def remove_project(project_id: str, body: dict) -> dict:

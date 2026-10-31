@@ -122,6 +122,38 @@ across projects and lose it on purge. `Store.project_cost` /
 `orchestrator_cost` / `harness_cost` are the three numbers the header pill
 shows.
 
+### Project versions and revisions
+
+Every project carries a `major.minor` version, starting at **0.1**. The minor
+number climbs on each *material* revision and the reason is kept in a capped
+revision log (`REVISION_LOG_LIMIT` entries, oldest dropped) that the dashboard
+renders as version history:
+
+| Event | Effect |
+|---|---|
+| Decomposing a project into tasks (`create_task`) | minor +1 (`plan: …`) |
+| Redefining a task's objective, criteria, deliverables, expertise or dependencies (`update_task`) | minor +1 (`plan: …`) |
+| A review verdict, approved **or** changes-requested (`record_review`) | minor +1 (`review: …`) |
+| Work becoming complete — `signal_delivery`, or the loop auto-detecting that every task is done | minor +1 (`delivery signaled: …` / `all tasks done …`) |
+| Editing a project's goal / constraints (`POST …/revise`) | minor +1 (`scope: …`) |
+| Accepting the delivery (*Mark delivered*) | **major +1, minor reset to 0** (`release: …`) |
+| Moving a card between kanban columns | **no revision** |
+
+A project therefore reaches `1.0` the first time its work is accepted, and
+`1.1`, `1.2`, … as it is revised after release. Signalling readiness is not
+itself a release, so it only bumps the minor; if the loop already flagged the
+project as ready this cycle, `signal_delivery` records no extra revision.
+
+Column moves are deliberately excluded: they are routine board mechanics, so
+counting them would bury the changes that actually altered what is being built.
+A revision is recorded only when content genuinely changes — a `revise` call
+that repeats the current goal returns `{"changed": []}` and leaves the version
+alone. Constraints may be cleared with an empty string; a blank goal or name is
+ignored rather than blanking the project.
+
+Projects created before versioning existed load at `0.1` with an empty log, so
+upgrading does not require a state migration.
+
 ### Changing config while the harness runs
 
 `GET /api/config` returns the live config (API key redacted) plus runtime LLM
@@ -225,6 +257,11 @@ specialists at once.
   project cannot leave sub-agents occupying delegation slots. Returns
   `agents_removed`. Refuses with `409` while any of the project's agents are
   mid-run — the orchestrator's own conversation is never interrupted.
+- `POST /api/projects/{id}/mark-delivered` — accept the delivery; records a
+  release revision (major +1, minor reset)
+- `POST /api/projects/{id}/revise` — edit `goal` / `constraints` / `name`;
+  returns `changed`, `previous_version` and the new `version`. Only real
+  changes bump the version.
 - `POST /api/alerts/ack` — dismiss an alert (`{"alert_id": ...}` or `{"all": true}`);
   `DELETE /api/alerts/ack` brings current alerts back
 - `GET /api/projects/{id}/tasks/{id}`, `GET /api/projects/{id}/agents/{id}` — detail

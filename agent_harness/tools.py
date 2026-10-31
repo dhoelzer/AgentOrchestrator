@@ -201,7 +201,8 @@ class CreateProjectExecutor(ToolExecutor):
         )
         c.store.flush()
         return _ok(
-            f"Project {project.id} '{project.name}' created at {workspace}. "
+            f"Project {project.id} '{project.name}' created at {workspace} "
+            f"(version {project.version}). "
             "Now decompose it into tasks with create_task."
         )
 
@@ -216,7 +217,8 @@ class ListProjectsExecutor(ToolExecutor):
         rows = [
             {
                 "id": p.id, "name": p.name, "goal": p.goal, "status": p.status,
-                "workspace": p.workspace, "columns": c.store.column_counts(p.id),
+                "version": p.version, "workspace": p.workspace,
+                "columns": c.store.column_counts(p.id),
             }
             for p in c.store.projects.values()
         ]
@@ -256,7 +258,7 @@ class CreateTaskExecutor(ToolExecutor):
         c.store.upsert_task(task)
         c.store.add_event("task_created", f"Task '{task.title}' created in {task.column}.",
                           project_id=task.project_id, task_id=task.id)
-        c.store.flush()
+        c.store.revise_project(task.project_id, f"plan: task '{task.title}' added")
         return _ok(f"Task {task.id} created in column '{task.column}'.")
 
 
@@ -308,10 +310,18 @@ class UpdateTaskExecutor(ToolExecutor):
                 setattr(task, attr, value)
         if action.note:
             task.orchestrator_note = action.note
+        content_changed = any(
+            getattr(action, attr) is not None
+            for attr in ("title", "objective", "expertise",
+                         "acceptance_criteria", "deliverables", "depends_on")
+        )
         task.touch()
         c.store.add_event("task_updated", f"Task '{task.title}' -> {task.column}.",
                           project_id=task.project_id, task_id=task.id)
-        c.store.flush()
+        if content_changed:
+            c.store.revise_project(task.project_id, f"plan: task '{task.title}' redefined")
+        else:
+            c.store.flush()
         return _ok(f"Task {task.id} updated; now in '{task.column}'.")
 
 
@@ -833,7 +843,10 @@ class RecordReviewExecutor(ToolExecutor):
             project_id=task.project_id, task_id=task.id,
             agent_id=reviewer.id if reviewer else None,
         )
-        c.store.flush()
+        c.store.revise_project(
+            task.project_id,
+            f"review: '{task.title}' {action.verdict} (round {task.review_rounds})",
+        )
         return _ok(
             f"Review recorded. Task {task.id} is now '{task.column}'. "
             + ("Nothing further needed for this task."
@@ -864,11 +877,18 @@ class SignalDeliveryExecutor(ToolExecutor):
             return _err(
                 "Cannot deliver: " + ", ".join(f"{t.id}({t.column})" for t in open_tasks)
             )
+        was_ready = (project.status == "ready_for_delivery"
+                     and project.delivery_signaled)
         project.status = "ready_for_delivery"
         project.delivery_signaled = True
         project.ready_at = now_iso()
         project.ready_generation += 1
         project.touch()
+        # The orchestrator may already have auto-detected readiness this cycle;
+        # only count a revision when the signal itself is new information.
+        if not was_ready:
+            c.store.revise_project(project.id,
+                                   f"delivery signaled: {action.summary[:120]}")
         c.store.add_event("delivery_signaled",
                           f"PROJECT READY FOR DELIVERY: {project.name} - {action.summary}",
                           project_id=project.id)

@@ -158,3 +158,26 @@ the LLM tests take minutes and are non-deterministic.
   The UI marks the orchestrator node `shared` and the header pill shows
   `total = projects + orchestrator`. `project.final_cost_usd` is snapshotted via
   `project_cost()` at removal, so hidden/archived projects keep a consistent total.
+
+## Project versions and revisions
+
+- `Project.version_major`/`version_minor` render as `major.minor` through the
+  `Project.version` property. New projects start `0.1`; `revise_project()` is the
+  **only** mutator — minor +1 normally, major +1 with minor reset when
+  `release=True`. Never write the version fields directly.
+- A revision is recorded only for *material* change: task creation, a task's
+  content fields (title/objective/expertise/criteria/deliverables/depends_on),
+  a review verdict, readiness transitions, and scope edits. **Kanban column
+  moves are not revisions** — `update_task` distinguishes content change from a
+  bare move via a content-diff check, so keep that split if you touch the tool.
+- `signal_delivery` bumps the minor only; the *release* is the user accepting it
+  (`mark-delivered`, `release=True`). It also skips the revision when the loop
+  already flagged readiness this cycle (`was_ready`), otherwise every cycle
+  would inflate the version.
+- `revision_log` is trimmed to `REVISION_LOG_LIMIT` (50) on append. Entries are
+  `{"version", "reason", "at"}` where `at` is the project's ISO `updated_at` —
+  note `agoLabel()` in the UI must accept both ISO strings (store records) and
+  epoch ints (cycle metadata); they are not the same format.
+- Old state files have no version fields; `Store` loads them at `0.1`/empty log.
+  Keep the `Project` field defaults rather than making them required, or
+  upgrading breaks state loading.
