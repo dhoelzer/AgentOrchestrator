@@ -31,6 +31,28 @@
   .alert.success { border-color:var(--ok); background:rgba(63,178,127,.12); }
   .alert.warn { border-color:var(--warn); background:rgba(224,163,74,.10); }
   .alert.info { border-color:var(--accent); background:rgba(91,157,255,.08); }
+  .alert .row { display:flex; align-items:center; gap:10px; }
+  .alert .msg { flex:1; }
+  .alert button { padding:3px 10px; font-size:12px; }
+  .alerts-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .alerts-head h4 { margin:0; font-size:12px; text-transform:uppercase;
+    letter-spacing:.05em; color:var(--dim); }
+  .cost { color:var(--ok); }
+  .pill.cost b { color:var(--ok); }
+  .pill.stale { border-color:var(--err); color:var(--err); }
+  .pill.stale b { color:var(--err); }
+  .pill.running b { color:var(--accent); }
+  button.danger { border-color:var(--err); color:var(--err); }
+  button.danger:hover { border-color:var(--err); background:rgba(224,108,108,.12); }
+  .remove-opts { display:grid; gap:10px; margin:14px 0; }
+  .remove-opt { display:flex; gap:10px; align-items:flex-start; padding:11px 13px;
+    border:1px solid var(--line); border-radius:var(--radius); cursor:pointer;
+    background:var(--panel2); }
+  .remove-opt:hover { border-color:var(--accent); }
+  .remove-opt input { margin-top:3px; }
+  .remove-opt .lbl { font-weight:600; font-size:13px; }
+  .remove-opt .sub { color:var(--dim); font-size:12px; }
+  .remove-opt.destructive { border-color:var(--err); }
   details.card { background:var(--panel); border:1px solid var(--line);
     border-radius:var(--radius); margin-bottom:22px; }
   details.card > summary { cursor:pointer; padding:14px 16px; display:flex;
@@ -120,6 +142,7 @@
   <span class="pill" id="budgetPill">sub-agent budget: <b>…</b></span>
   <span class="pill" id="runPill">running: <b>0</b></span>
   <span class="pill" id="llmPill">llm: <b>—</b></span>
+  <span class="pill cost" id="costPill">cost: <b>$0.00</b></span>
   <span class="spacer"></span>
   <button id="tickBtn">Run cycle now</button>
   <button id="settingsBtn">Settings</button>
@@ -133,6 +156,10 @@
     <button class="primary" type="submit">Create project</button>
   </form>
 
+  <div class="alerts-head" id="alertsHead" hidden>
+    <h4>Alerts</h4>
+    <button id="ackAllBtn" type="button">Acknowledge all</button>
+  </div>
   <div class="alerts" id="alerts"></div>
   <div id="projects"></div>
 
@@ -143,6 +170,40 @@
 </main>
 
 <dialog id="detail"><div class="inner" id="detailBody"></div></dialog>
+
+<dialog id="remove"><div class="inner">
+  <h3>Remove project</h3>
+  <p class="muted" id="removeSub"></p>
+  <p>Choose what happens to the project's files and artifacts:</p>
+  <div class="remove-opts">
+    <label class="remove-opt">
+      <input type="radio" name="removalMode" value="archive" checked>
+      <span><span class="lbl">Archive the project and move its files</span><br>
+      <span class="sub">Keeps the harness record and cost history; moves the workspace
+      and conversation logs into the archive directory.</span></span>
+    </label>
+    <label class="remove-opt">
+      <input type="radio" name="removalMode" value="hide">
+      <span><span class="lbl">Just remove it from the interface</span><br>
+      <span class="sub">Every generated file stays exactly where it is. The project
+      disappears from the dashboard and the orchestrator stops working on it.</span></span>
+    </label>
+    <label class="remove-opt destructive">
+      <input type="radio" name="removalMode" value="purge">
+      <span><span class="lbl">Remove all traces, including generated artifacts</span><br>
+      <span class="sub">Deletes the workspace, the conversation logs, and the project
+      record. This cannot be undone.</span></span>
+    </label>
+  </div>
+  <div class="sec"><label class="muted" style="font-size:12px">Type the project name to
+  confirm<br>
+  <input id="removeConfirm" style="margin-top:6px;background:var(--bg);color:var(--text);
+    border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;width:100%">
+  </label></div>
+  <div class="sec"><button class="danger" id="removeGo" type="button">Remove</button>
+  <button id="removeCancel" type="button">Cancel</button>
+  <span class="muted" id="removeMsg"></span></div>
+</div></dialog>
 
 <dialog id="settings"><div class="inner">
   <h3>Runtime settings</h3>

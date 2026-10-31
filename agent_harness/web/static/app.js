@@ -5,6 +5,17 @@ const esc = (s) =>
 
 const state = { data: null, openProjects: new Set(), tab: "board" };
 
+const money = (v) => "$" + (Number(v || 0)).toFixed(4).replace(/0+$/, "").replace(/\.$/, ".00");
+
+function agoLabel(ts) {
+  if (!ts) return "never";
+  const secs = Math.max(0, Math.floor(Date.now() / 1000) - Number(ts));
+  if (secs < 60) return `${secs}s ago`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+  return `${Math.floor(secs / 86400)}d ago`;
+}
+
 function turnsClass(used, limit) {
   if (used >= limit) return "turns full";
   if (used >= limit * 0.8) return "turns hot";
@@ -16,8 +27,33 @@ function renderHeader(d) {
   $("#tickPill").innerHTML = `tick: <b>${d.config.tick_seconds}s</b>`;
   $("#budgetPill").innerHTML = `sub-agent budget: <b>${d.config.sub_agent_turn_limit} turns</b>`;
   const inflight = d.meta.inflight || [];
-  const last = d.meta.last_tick ? new Date(d.meta.last_tick * 1000).toLocaleTimeString() : "never";
-  $("#runPill").innerHTML = `running: <b>${inflight.length}</b> · last cycle ${last}`;
+  const cyc = d.meta.cycle || {};
+  let cycleTxt;
+  if (cyc.running) {
+    cycleTxt = `cycle <b>running</b> (${agoLabel(cyc.started_at)} in)`;
+  } else if (cyc.last_completed_at) {
+    cycleTxt = `last cycle <b>${agoLabel(cyc.last_completed_at)}</b>`;
+  } else {
+    cycleTxt = "last cycle <b>never</b>";
+  }
+  if (cyc.count) cycleTxt += ` · #${cyc.count}`;
+  // Only call out the attempt when it diverges from the last success: that gap
+  // is the signature of a loop that is running but failing.
+  const diverged = cyc.last_attempt_at && cyc.last_completed_at
+    ? cyc.last_attempt_at - cyc.last_completed_at > 2
+    : !!cyc.last_attempt_at;
+  if (diverged) {
+    cycleTxt += ` · last attempt ${agoLabel(cyc.last_attempt_at)}`;
+  }
+  const pill = $("#runPill");
+  pill.innerHTML = `running: <b>${inflight.length}</b> · ${cycleTxt}`;
+  pill.classList.toggle("running", !!cyc.running);
+  pill.classList.toggle("stale", !!cyc.stale);
+  pill.title =
+    `Loop started ${agoLabel(cyc.loop_started_at)} · tick ${cyc.tick_seconds}s\n` +
+    `Last attempt ${agoLabel(cyc.last_attempt_at)} · last success ${agoLabel(cyc.last_completed_at)}` +
+    (cyc.stale ? "\nWARNING: the loop has not completed a cycle recently." : "");
+  $("#costPill").innerHTML = `cost: <b>${money(d.total_cost_usd)}</b>`;
   const llm = d.meta.llm || {};
   const unhealthy = (llm.empty_responses || 0) + (llm.transient_errors || 0) > 0;
   $("#llmPill").innerHTML =
@@ -29,8 +65,15 @@ function renderHeader(d) {
 }
 
 function renderAlerts(d) {
-  $("#alerts").innerHTML = d.alerts
-    .map((a) => `<div class="alert ${a.level}">${esc(a.message)}</div>`)
+  const alerts = d.alerts || [];
+  $("#alertsHead").hidden = alerts.length === 0;
+  $("#alerts").innerHTML = alerts
+    .map(
+      (a) => `<div class="alert ${a.level}"><div class="row">
+        <span class="msg">${esc(a.message)}</span>
+        <button data-ack="${esc(a.id)}" title="Dismiss this alert">Acknowledge</button>
+      </div></div>`
+    )
     .join("");
 }
 
@@ -60,7 +103,7 @@ function renderTree(nodes) {
         <span class="kv">${n.turns_used}/${n.turn_limit} turns · ${esc(n.status)}</span>
         ${n.task_id ? `<span class="tag">task ${esc(n.task_id)}</span>` : ""}
         ${n.tokens ? `<span class="kv">${(n.tokens / 1000).toFixed(1)}k tok</span>` : ""}
-        ${n.cost_usd ? `<span class="kv">$${n.cost_usd.toFixed(4)}</span>` : ""}
+        <span class="kv cost">${money(n.cost_usd)}</span>
       </div>
       ${kids}
     </div>`;
@@ -88,9 +131,11 @@ function renderProjects(d) {
           <span class="badge ${esc(p.status)}">${esc(p.status)}</span>
           <span class="goal">${esc(p.goal)}</span>
           <span class="spacer"></span>
+          <span class="kv cost">total ${money(p.cost_usd)}</span>
           <span class="kv">${esc(p.id)}</span>
           <button data-pause="${p.id}">${p.status === "paused" ? "Resume" : "Pause"}</button>
           ${p.status === "ready_for_delivery" ? `<button data-deliver="${p.id}">Mark delivered</button>` : ""}
+          <button class="danger" data-remove="${p.id}">Remove…</button>
         </summary>
         <div class="body">
           <div class="tabs">
@@ -168,7 +213,8 @@ async function showAgent(projectId, agentId) {
   $("#detailBody").innerHTML = `
     <h3>${esc(a.role)}</h3>
     <div class="muted">${esc(a.id)} · ${esc(a.specialty)} · depth ${a.depth} · ${esc(a.status)}</div>
-    <div class="sec"><h5>Turn budget</h5><pre>${a.turns_used}/${a.turn_limit} turns · ${a.runs} runs · ${a.tokens} tokens · $${(a.cost_usd ?? 0).toFixed(4)}</pre></div>
+    <div class="sec"><h5>Turn budget</h5><pre>${a.turns_used}/${a.turn_limit} turns · ${a.runs} runs · ${a.tokens} tokens</pre></div>
+    <div class="sec"><h5>Total cost</h5><pre class="cost">${money(a.cost_usd)}</pre></div>
     <div class="sec"><h5>Mission</h5><pre>${esc(a.mission)}</pre></div>
     <div class="sec"><h5>Last report</h5><pre>${esc(a.last_report || "—")}</pre></div>
     <div class="sec"><h5>Last error</h5><pre>${esc(a.last_error || "none")}</pre></div>
@@ -210,6 +256,36 @@ document.addEventListener("click", async (e) => {
   }
   if (t.id === "settingsSave") {
     await saveSettings();
+    return;
+  }
+  if (t.id === "ackAllBtn") {
+    await fetch("/api/alerts/ack", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ all: true }),
+    });
+    await refresh();
+    return;
+  }
+  if (t.dataset.ack) {
+    await fetch("/api/alerts/ack", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alert_id: t.dataset.ack }),
+    });
+    await refresh();
+    return;
+  }
+  if (t.dataset.remove) {
+    openRemove(t.dataset.remove);
+    return;
+  }
+  if (t.id === "removeGo") {
+    await doRemove();
+    return;
+  }
+  if (t.id === "removeCancel") {
+    $("#remove").close();
     return;
   }
   if (t.id === "directiveSend") {
@@ -264,6 +340,37 @@ document.addEventListener("click", async (e) => {
     else state.openProjects.add(det.dataset.project);
   }
 });
+
+let removeTarget = null;
+
+function openRemove(projectId) {
+  const p = (state.data?.projects || []).find((x) => x.id === projectId);
+  if (!p) return;
+  removeTarget = { id: projectId, name: p.name };
+  $("#removeSub").textContent =
+    `Project "${p.name}" (${projectId}) · ${p.status} · ${money(p.cost_usd)} spent`;
+  $("#removeConfirm").value = "";
+  $("#removeMsg").textContent = "";
+  $("#remove").showModal();
+}
+
+async function doRemove() {
+  if (!removeTarget) return;
+  const mode = document.querySelector('input[name="removalMode"]:checked')?.value;
+  const res = await fetch(`/api/projects/${removeTarget.id}/remove`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode, confirm: $("#removeConfirm").value.trim() }),
+  });
+  if (res.ok) {
+    $("#remove").close();
+    state.openProjects.delete(removeTarget.id);
+    await refresh();
+  } else {
+    const body = await res.text();
+    $("#removeMsg").textContent = "Rejected: " + body.slice(0, 200);
+  }
+}
 
 const SETTING_KEYS = [
   "llm.model", "llm.base_url", "llm.api_key", "llm.request_timeout",

@@ -133,9 +133,19 @@ class Project(BaseModel):
     goal: str
     constraints: str = ""
     workspace: str
-    status: Literal["active", "ready_for_delivery", "delivered", "paused"] = "active"
+    status: Literal["active", "ready_for_delivery", "delivered", "paused",
+                    "removed"] = "active"
     delivery_signaled: bool = False
     delivered_at: str | None = None
+    # When the project became ready_for_delivery. ready_generation increments on
+    # each transition so the delivery alert re-fires for a genuinely new
+    # delivery, but not for unrelated touches.
+    ready_at: str | None = None
+    ready_generation: int = 0
+    # Set when the user removes the project. 'hidden' kept its files, 'archived'
+    # moved them, 'purged' deleted them.
+    removed_at: str | None = None
+    removal_mode: str | None = None
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
 
@@ -287,8 +297,20 @@ class Store:
             key=lambda t: t.created_at,
         )
 
-    def agents_in_status(self, statuses: tuple[str, ...]) -> list[AgentSpec]:
-        return [a for a in self.agents.values() if a.status in statuses]
+    def agents_in_status(self, statuses: tuple[str, ...],
+                         exclude_removed: bool = True) -> list[AgentSpec]:
+        out = []
+        for a in self.agents.values():
+            if a.status not in statuses:
+                continue
+            if exclude_removed and a.role != "orchestrator":
+                # The orchestrator is global; its project_id is just the last
+                # project it touched, so removing that one must not hide it.
+                proj = self.projects.get(a.project_id or "")
+                if proj is not None and proj.status == "removed":
+                    continue
+            out.append(a)
+        return out
 
     def agent_children(self, agent_id: str) -> list[AgentSpec]:
         agent = self.agents.get(agent_id)
@@ -298,3 +320,46 @@ class Store:
 
     def active_project_ids(self) -> list[str]:
         return [p.id for p in self.projects.values() if p.status == "active"]
+
+    def visible_projects(self) -> list[Project]:
+        """Projects the dashboard and orchestrator should still act on."""
+        return sorted((p for p in self.projects.values() if p.status != "removed"),
+                      key=lambda p: p.created_at)
+
+    def project_cost(self, project_id: str) -> float:
+        """Total spend for a project, summed over every agent that worked on it."""
+        return sum(a.cost_usd for a in self.agents.values()
+                   if a.project_id == project_id)
+
+    def purge_project(self, project_id: str) -> None:
+        """Delete a project's records outright (the 'purge' removal mode)."""
+        with self._lock:
+            self.projects.pop(project_id, None)
+            for tid in [t.id for t in self.tasks.values()
+                        if t.project_id == project_id]:
+                self.tasks.pop(tid, None)
+            # The orchestrator is shared across projects; never delete it.
+            for aid in [a.id for a in self.agents.values()
+                        if a.project_id == project_id
+                        and a.role != "orchestrator"]:
+                self.agents.pop(aid, None)
+
+    def remove_project(self, project_id: str, mode: str) -> Project:
+        """Drop a project from the board.
+
+        'hidden' leaves every artifact in place; 'archived' moves the workspace
+        under the archive dir; 'purged' deletes the workspace and conversation
+        logs. In all three modes the project record is kept with status
+        'removed' so cost history and the activity feed survive.
+        """
+        project = self.projects[project_id]
+        project.status = "removed"
+        project.removed_at = now_iso()
+        project.removal_mode = mode
+        project.touch()
+        self.add_event(
+            "project_removed", f"Project '{project.name}' removed ({mode}).",
+            project_id=project_id,
+        )
+        self.flush()
+        return project

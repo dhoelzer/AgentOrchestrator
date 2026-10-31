@@ -685,6 +685,45 @@ def test_config_edits_persist_to_the_loaded_file():
         print("config persistence + redaction ok")
 
 
+def test_env_overrides_are_not_baked_into_the_config_file():
+    """Patching one setting must not rewrite values that came from the environment.
+
+    A harness started with HARNESS_DATA_DIR/HARNESS_PORT must not persist those
+    overrides into config.json, or the next plain start inherits them.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_file = Path(tmp) / "config.json"
+        cfg_file.write_text(json.dumps({
+            "llm": {"base_url": "http://x/v1/", "model": "openai/m"},
+            "data_dir": str(Path(tmp) / "disk-data"),
+            "projects_dir": str(Path(tmp) / "disk-data" / "projects"),
+            "tick_seconds": 60,
+            "port": 8090,
+        }))
+        cfg = HarnessConfig.load(cfg_file)
+        # Simulate an environment override on top of the file.
+        cfg.data_dir = str(Path(tmp) / "env-data")
+        cfg.port = 8099
+        cfg.host = "0.0.0.0"
+
+        store = Store(cfg.data_dir)
+        runtime = AgentRuntime(cfg, store)
+        orch = Orchestrator(cfg, store, runtime)
+        app = build_api(cfg, store, orch, config_path=str(cfg_file))
+        client = TestClient(app)
+
+        r = client.post("/api/config", json={"tick_seconds": 90})
+        assert r.status_code == 200, r.text
+
+        on_disk = json.loads(cfg_file.read_text())
+        assert on_disk["tick_seconds"] == 90, on_disk
+        assert on_disk["data_dir"] == str(Path(tmp) / "disk-data"), on_disk
+        assert on_disk["port"] == 8090, on_disk
+        assert on_disk["llm"]["base_url"] == "http://x/v1/", on_disk
+        assert "env-data" not in cfg_file.read_text(), cfg_file.read_text()
+        print("env overrides kept out of config file ok")
+
+
 def test_qwen_cost_defaults():
     cfg = HarnessConfig()
     assert cfg.llm.input_cost_per_token == 0.000002
@@ -710,5 +749,6 @@ if __name__ == "__main__":
     test_dispatch_without_assign_task_still_links_counters()
     test_reconfigure_and_assign_keep_card_counters_on_the_worker()
     test_config_edits_persist_to_the_loaded_file()
+    test_env_overrides_are_not_baked_into_the_config_file()
     test_qwen_cost_defaults()
     print("\nALL RUNTIME/CONFIG TESTS PASSED")

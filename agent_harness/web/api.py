@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,7 +56,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
     @app.get("/api/state")
     def state() -> dict:
         projects = []
-        for project in sorted(store.projects.values(), key=lambda p: p.created_at):
+        for project in store.visible_projects():
             board = {col: [_task_json(t) for t in items]
                      for col, items in store.board(project.id).items()}
             projects.append({
@@ -66,6 +69,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                 "created_at": project.created_at,
                 "updated_at": project.updated_at,
                 "delivery_signaled": project.delivery_signaled,
+                "cost_usd": store.project_cost(project.id),
                 "board": board,
                 "counts": store.column_counts(project.id),
                 "tree": _agent_tree(store, project.id),
@@ -80,11 +84,14 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
             },
             "meta": {"last_tick": store.meta.get("last_tick"),
                      "inflight": sorted(orchestrator.runtime.inflight),
-                     "llm": _llm_health(orchestrator)},
+                     "llm": _llm_health(orchestrator),
+                     "cycle": _cycle_status(store, config.tick_seconds)},
+            "total_cost_usd": sum(store.project_cost(p.id)
+                                  for p in store.visible_projects()),
             "columns": KANBAN_COLUMNS,
             "projects": projects,
             "events": [e.model_dump() for e in store.recent_events[-60:]][::-1],
-            "alerts": _alerts(store),
+            "alerts": [a for a in _alerts(store) if not a["acknowledged"]],
         }
 
     # ---------------- mutations ----------------
@@ -129,6 +136,49 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         store.flush()
         return {"id": project.id, "status": project.status}
 
+    @app.post("/api/projects/{project_id}/remove")
+    def remove_project(project_id: str, body: dict) -> dict:
+        """Remove a project. mode: archive | hide | purge.
+
+        archive - move the workspace to the archive dir, keep harness state.
+        hide    - drop it from the interface, leave every file untouched.
+        purge   - delete workspace + conversation logs + harness state.
+        """
+        project = _get_project(project_id)
+        mode = (body.get("mode") or "").strip().lower()
+        if mode not in REMOVAL_MODES:
+            raise HTTPException(400, f"mode must be one of {sorted(REMOVAL_MODES)}")
+        if body.get("confirm") != project.name:
+            raise HTTPException(400,
+                                "Confirmation failed: send the project name as 'confirm'.")
+
+        # The orchestrator is shared across projects: never close or block on it.
+        project_agents = [a for a in store.project_agents(project_id)
+                          if a.role != "orchestrator"]
+
+        running = sorted(a.id for a in project_agents
+                         if a.id in orchestrator.runtime.inflight)
+        if running:
+            raise HTTPException(409, f"Agents still running: {running}. "
+                                     "Pause the project or wait for them.")
+
+        for agent in project_agents:
+            orchestrator.runtime.close(agent.id)
+
+        detail = _remove_artifacts(config, store, project, mode)
+        store.remove_project(project_id, mode)
+
+        if mode == "purge":
+            store.purge_project(project_id)
+
+        store.add_event(
+            "project_removed",
+            f"Project '{project.name}' removed ({mode}). {detail}",
+            project_id=project_id,
+        )
+        store.flush()
+        return {"id": project_id, "mode": mode, "detail": detail}
+
     @app.get("/api/config")
     def get_config() -> dict:
         # The API key is never echoed to the UI; it is only ever written to.
@@ -159,7 +209,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
             raise HTTPException(400, "Patch contained no changes.")
         if persist := (patch.get("persist") or config_path):
             try:
-                _write_config(config, persist)
+                _write_config(config, persist, changed)
             except OSError as exc:
                 raise HTTPException(500, f"Could not write config: {exc}") from exc
         store.add_event(
@@ -172,6 +222,32 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                     "llm_timeout": orchestrator.runtime.llm_timeout,
                     "max_parallel_workers": orchestrator.runtime.gate.limit,
                 }}
+
+    @app.post("/api/alerts/ack")
+    def ack_alert(body: dict) -> dict:
+        """Dismiss an alert. Pass alert_id to dismiss one, all=true for all."""
+        alert_id = (body.get("alert_id") or "").strip()
+        acked = store.meta.setdefault("alert_acks", {})
+        if body.get("all"):
+            for a in _alerts(store):
+                acked[a["id"]] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        elif alert_id:
+            acked[alert_id] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        else:
+            raise HTTPException(400, "Provide alert_id or all=true.")
+
+        # Ack ids are per-occurrence, so entries for alerts that have since
+        # resolved are dead weight; keep only what is still on screen.
+        live = {a["id"] for a in _alerts(store)}
+        store.meta["alert_acks"] = {k: v for k, v in acked.items() if k in live}
+        store.flush()
+        return {"acknowledged": len(store.meta["alert_acks"])}
+
+    @app.delete("/api/alerts/ack")
+    def clear_alert_acks() -> dict:
+        store.meta.pop("alert_acks", None)
+        store.flush()
+        return {"acknowledged": 0}
 
     @app.post("/api/projects/{project_id}/tasks/{task_id}/directives")
     def add_directive(project_id: str, task_id: str, body: dict) -> dict:
@@ -286,38 +362,76 @@ def _agent_json(agent, full: bool = False) -> dict:
 
 
 def _agent_tree(store: Store, project_id: str) -> list[dict]:
-    """Nested agent hierarchy for the project, orchestrator first."""
+    """Nested agent hierarchy for the project, orchestrator first.
+
+    Children come from parent_agent_id, not child_agent_ids: retiring an agent
+    prunes the parent's child list to free a delegation slot, but the retired
+    agent still belongs in the tree with a status of its own.
+    """
     agents = store.project_agents(project_id)
+    # The orchestrator is global but carries a single project_id, so it is not
+    # always in the project's own agent list; graft it in as the root.
+    orchestrator = next((a for a in store.agents.values()
+                         if a.role == "orchestrator"), None)
+    if orchestrator is not None:
+        agents = [orchestrator] + agents
+
     by_id = {a.id: a for a in agents}
-    roots = [a for a in agents if a.parent_agent_id is None or a.parent_agent_id not in by_id]
+    kids: dict[str, list[AgentSpec]] = {}
+    roots: list[AgentSpec] = []
+    for a in agents:
+        if a is orchestrator:
+            continue
+        if a.parent_agent_id and a.parent_agent_id in by_id:
+            kids.setdefault(a.parent_agent_id, []).append(a)
+        elif orchestrator is not None:
+            kids.setdefault(orchestrator.id, []).append(a)
+        else:
+            roots.append(a)
+    if orchestrator is not None:
+        roots = [orchestrator]
 
     def node(agent: AgentSpec, seen: set[str]) -> dict:
         children = []
-        for child_id in agent.child_agent_ids:
-            child = by_id.get(child_id)
-            if child and child_id not in seen:
-                seen.add(child_id)
+        for child in kids.get(agent.id, []):
+            if child.id not in seen:
+                seen.add(child.id)
                 children.append(node(child, seen))
         return {**_agent_json(agent), "children": children}
 
     return [node(a, {a.id}) for a in roots]
 
 
+def _alert_id(key: str) -> str:
+    return hashlib.sha1(key.encode()).hexdigest()[:16]
+
+
 def _alerts(store: Store) -> list[dict]:
+    """Dashboard alerts, each with a stable id the user can acknowledge.
+
+    The id embeds a generation counter (review round, blocked reason, turn
+    count) so acknowledging a problem does not silence the *next* occurrence of
+    it - only this one.
+    """
     alerts: list[dict] = []
-    for project in store.projects.values():
+    for project in store.visible_projects():
         if project.status == "ready_for_delivery":
             alerts.append({
                 "level": "success", "project_id": project.id,
+                "key": f"delivery:{project.id}:{project.ready_generation}",
                 "message": f"'{project.name}' is ready to deliver.",
             })
         for task in store.project_tasks(project.id):
             if task.column == "review":
-                alerts.append({"level": "info", "project_id": project.id,
-                               "message": f"'{task.title}' is waiting for review."})
+                alerts.append({
+                    "level": "info", "project_id": project.id,
+                    "key": f"review:{task.id}:{task.review_rounds}",
+                    "message": f"'{task.title}' is waiting for review.",
+                })
             elif task.column == "blocked":
                 alerts.append({
                     "level": "warn", "project_id": project.id,
+                    "key": f"blocked:{task.id}:{task.blocked_reason or ''}",
                     "message": f"'{task.title}' is blocked"
                                + (f": {task.blocked_reason}" if task.blocked_reason
                                   else "."),
@@ -327,10 +441,76 @@ def _alerts(store: Store) -> list[dict]:
     ):
         alerts.append({
             "level": "warn", "project_id": agent.project_id,
+            "key": f"agent:{agent.id}:{agent.status}:{agent.turns_used}",
             "message": f"{agent.role} is {agent.status} "
                        f"({agent.turns_used}/{agent.turn_limit} turns).",
         })
+
+    acked = store.meta.get("alert_acks", {})
+    for a in alerts:
+        a["id"] = _alert_id(a.pop("key"))
+        a["acknowledged"] = a["id"] in acked
     return alerts
+
+
+def _cycle_status(store: Store, tick_seconds: int) -> dict:
+    """How fresh the orchestrator loop is, for the header pill."""
+    meta = store.meta
+    now = int(time.time())
+    attempt = meta.get("last_cycle_attempt_at")
+    completed = meta.get("last_cycle_completed_at") or meta.get("last_tick")
+    status = meta.get("cycle_status", "idle")
+    return {
+        "status": status,
+        "count": int(meta.get("cycle_count", 0)),
+        "running": status == "running",
+        "started_at": meta.get("cycle_started_at"),
+        "last_attempt_at": attempt,
+        "last_completed_at": completed,
+        "last_tick": meta.get("last_tick"),
+        "duration": meta.get("cycle_duration", 0),
+        "loop_started_at": meta.get("loop_started_at"),
+        "tick_seconds": tick_seconds,
+        "stale": bool(attempt and status != "running"
+                      and now - int(attempt) > max(120, tick_seconds * 3)),
+    }
+
+
+REMOVAL_MODES = {"archive", "hide", "purge"}
+
+
+def _remove_artifacts(config: HarnessConfig, store: Store, project,
+                      mode: str) -> str:
+    """Carry out the file side of a removal, returning a human-readable note."""
+    workspace = Path(project.workspace).expanduser() if project.workspace else None
+
+    if mode == "hide":
+        return "Files left untouched in " + str(workspace or "(no workspace)") + "."
+
+    if mode == "archive":
+        if not workspace or not workspace.exists():
+            return "No workspace to archive."
+        archive_root = config.root_dir / "archived-projects"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target = archive_root / f"{workspace.name}-{stamp}"
+        shutil.move(str(workspace), str(target))
+        conv = config.root_dir / "conversations" / project.id
+        if conv.exists():
+            shutil.move(str(conv), str(archive_root / f"{project.id}-{stamp}"))
+        return f"Workspace moved to {target}."
+
+    # purge
+    removed: list[str] = []
+    if workspace and workspace.exists():
+        shutil.rmtree(workspace, ignore_errors=True)
+        removed.append(f"workspace {workspace}")
+    conv = config.root_dir / "conversations" / project.id
+    if conv.exists():
+        shutil.rmtree(conv, ignore_errors=True)
+        removed.append(f"conversation logs {conv}")
+    return "Deleted " + (", ".join(removed) if removed else "nothing (already gone)") + "."
+
 
 
 # Settings that can be changed while the harness runs. Each value is coerced to
@@ -395,10 +575,28 @@ def _apply_config_patch(config: HarnessConfig, orchestrator: Orchestrator,
     return changed
 
 
-def _write_config(config: HarnessConfig, path: str) -> None:
-    """Persist the live config so a restart keeps the change."""
+def _write_config(config: HarnessConfig, path: str, changed: list) -> None:
+    """Persist the live config so a restart keeps the change.
+
+    Only the patched keys are written. Dumping config.model_dump() would also
+    bake in values that came from HARNESS_* environment variables, so a run
+    started with e.g. HARNESS_DATA_DIR would silently rewrite the file's
+    data_dir for everyone who starts it without that variable.
+    """
     target = Path(path).expanduser()
-    payload = json.dumps(config.model_dump(), indent=2, sort_keys=True)
+    try:
+        on_disk = json.loads(target.read_text()) if target.exists() else {}
+    except json.JSONDecodeError:
+        on_disk = config.model_dump()
+
+    for key, value in changed:
+        parts = key.split(".")
+        node = on_disk
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+
+    payload = json.dumps(on_disk, indent=2, sort_keys=True)
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_text(payload)
     os.replace(tmp, target)

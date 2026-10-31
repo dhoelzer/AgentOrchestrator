@@ -19,7 +19,7 @@ from openhands.sdk.logger import get_logger
 from . import prompts, tools as harness_tools
 from .config import HarnessConfig
 from .runtime import AgentRuntime
-from .store import AgentSpec, Store, new_id
+from .store import AgentSpec, Store, new_id, now_iso
 
 logger = get_logger(__name__)
 
@@ -71,7 +71,7 @@ class Orchestrator:
 
     def reconcile(self) -> None:
         """Deterministic board transitions that need no judgement."""
-        for project in self.store.projects.values():
+        for project in self.store.visible_projects():
             for task in self.store.project_tasks(project.id):
                 # A backlog task with satisfied dependencies is ready to staff.
                 if task.column == "backlog" and all(
@@ -90,6 +90,8 @@ class Orchestrator:
             if tasks and all(t.column == "done" for t in tasks) \
                     and project.status == "active":
                 project.status = "ready_for_delivery"
+                project.ready_at = now_iso()
+                project.ready_generation += 1
                 project.touch()
                 self.store.add_event(
                     "delivery_candidate",
@@ -106,7 +108,7 @@ class Orchestrator:
         def note(project_id: str | None, message: str) -> None:
             attention.setdefault(project_id, []).append(message)
 
-        for project in self.store.projects.values():
+        for project in self.store.visible_projects():
             board = self.store.board(project.id)
 
             for task in board["review"]:
@@ -247,7 +249,7 @@ class Orchestrator:
         attention_map = self.detect()
         reports: list[CycleReport] = []
 
-        for project in sorted(self.store.projects.values(), key=lambda p: p.created_at):
+        for project in self.store.visible_projects():
             if project.status in ("paused", "delivered"):
                 continue
             attention = attention_map.get(project.id, [])
@@ -256,9 +258,28 @@ class Orchestrator:
 
             reports.append(self._run_project_cycle(project, attention))
 
-        self.store.meta["last_tick"] = int(time.time())
-        self.store.flush()
+        self._record_cycle_end("ok")
         return reports
+
+    def _record_cycle_end(self, status: str) -> None:
+        """Stamp cycle metadata.
+
+        last_tick alone is written only on success, so a harness whose cycles
+        keep failing shows a timestamp frozen at the first completed cycle -
+        which reads like 'last cycle never updates'. The status and failure
+        fields make the stall visible instead.
+        """
+        now = int(time.time())
+        meta = self.store.meta
+        started = meta.get("cycle_started_at")
+        meta["cycle_count"] = int(meta.get("cycle_count", 0)) + 1
+        meta["cycle_status"] = status
+        meta["cycle_duration"] = (now - int(started)) if started else 0
+        if status == "ok":
+            meta["last_tick"] = now
+            meta["last_cycle_completed_at"] = now
+        meta["last_cycle_attempt_at"] = now
+        meta["loop_started_at"] = meta.get("loop_started_at") or now
 
     def _run_project_cycle(self, project, attention: list[str]) -> CycleReport:
         board = {col: [self._task_to_dict(t) for t in items]
@@ -324,9 +345,13 @@ class Orchestrator:
         logger.info("Orchestrator loop starting (tick=%ss)", self.config.tick_seconds)
         self.store.add_event("loop_started",
                              f"Orchestrator loop started (tick {self.config.tick_seconds}s).")
+        self.store.meta["loop_started_at"] = int(time.time())
         self.store.flush()
         while not self._stop.is_set():
             started = time.time()
+            self.store.meta["cycle_started_at"] = int(started)
+            self.store.meta["cycle_status"] = "running"
+            self.store.flush()
             try:
                 reports = self.run_cycle()
                 for r in reports:
@@ -335,7 +360,7 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001 - the loop must survive
                 logger.exception("Orchestrator cycle failed")
                 self.store.add_event("loop_error", f"Cycle failed: {type(exc).__name__}: {exc}")
-                self.store.flush()
+                self._record_cycle_end("failed")
             elapsed = time.time() - started
             wait = max(1.0, self.config.tick_seconds - elapsed)
             self._stop.wait(wait)

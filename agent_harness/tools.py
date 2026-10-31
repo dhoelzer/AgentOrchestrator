@@ -24,7 +24,7 @@ from openhands.tools.task_tracker import TaskTrackerTool
 from . import prompts
 from .config import HarnessConfig
 from .runtime import AgentRuntime
-from .store import AgentSpec, KANBAN_COLUMNS, Store, TaskSpec, new_id
+from .store import AgentSpec, KANBAN_COLUMNS, Store, TaskSpec, new_id, now_iso
 
 # Canonical SDK tool names (registered by importing openhands.tools.*).
 EXEC_TOOLS = ["terminal", "file_editor", "task_tracker"]
@@ -866,6 +866,8 @@ class SignalDeliveryExecutor(ToolExecutor):
             )
         project.status = "ready_for_delivery"
         project.delivery_signaled = True
+        project.ready_at = now_iso()
+        project.ready_generation += 1
         project.touch()
         c.store.add_event("delivery_signaled",
                           f"PROJECT READY FOR DELIVERY: {project.name} - {action.summary}",

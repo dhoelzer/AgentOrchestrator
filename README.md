@@ -18,6 +18,32 @@ docker compose up -d --build            # containerized, with Docker-in-Docker
 
 ---
 
+## Managing projects from the dashboard
+
+Each project card shows its **total cost** and a **Remove…** button. Removal asks
+how much to clean up:
+
+| Choice | Files on disk | Harness record | Use it when |
+|---|---|---|---|
+| **Archive the project and move its files** | moved to `archived-projects/` | kept, with cost history | you want the artifacts out of the way but recoverable |
+| **Just remove it from the interface** | untouched | kept | the work is done elsewhere and you only want the board clean |
+| **Remove all traces, including generated artifacts** | deleted (workspace + conversation logs) | deleted | you want it gone completely |
+
+Removal asks you to type the project name, and refuses to run while any of the
+project's agents are still working.
+
+Alerts (blocked tasks, reviews waiting, exhausted budgets, ready-to-deliver)
+each have an **Acknowledge** button. Acknowledging dismisses that occurrence; if
+the same problem happens again later it alerts again.
+
+The header pill shows loop health: how many agents are running, when the last
+cycle **completed**, how many cycles have run, and — if they diverge — when the
+last cycle was **attempted**. A pill that turns red means the loop has not
+finished a cycle recently even though it keeps trying.
+
+Every agent card and the project header show spend; the header pill shows the
+cost across all visible projects.
+
 ## Requirements → how they are met
 
 | Requirement | Where |
@@ -185,12 +211,18 @@ specialists at once.
 - `POST /api/projects/{id}/tasks/{id}/directives` — send the worker direction; a
   blocked task moves back to ready and the directive is injected into its next
   assignment prompt
+- `POST /api/projects/{id}/remove` — remove a project; body
+  `{"mode": "archive" | "hide" | "purge", "confirm": "<project name>"}`
+- `POST /api/alerts/ack` — dismiss an alert (`{"alert_id": ...}` or `{"all": true}`);
+  `DELETE /api/alerts/ack` brings current alerts back
 - `GET /api/projects/{id}/tasks/{id}`, `GET /api/projects/{id}/agents/{id}` — detail
 - `GET /health` — model, base URL, tick, in-flight agents
 
 Task cards show live `turns_used/turn_limit` (updated during a run, not only at
-the end) and the reason a task is blocked. The header shows the current LLM
-request timeout and how many replies had to be retried.
+the end) and the reason a task is blocked. Every agent node shows its total
+cost, each project header shows a project total, and the header pill shows the
+cost across all visible projects. The header also reports loop health: agents
+running, cycles completed, and when the last cycle completed versus attempted.
 
 ## Deploying with Docker
 

@@ -99,3 +99,35 @@ the LLM tests take minutes and are non-deterministic.
   stretch), and `_dispatch(review=True)` sets it. Three paths had to be gated this
   way — `_dispatch`, `assign_task`, and `reconfigure_agent` — because the
   orchestrator reaches all of them with a reviewer attached to a task.
+
+## Dashboard: removal, cost, cycle freshness
+
+- Removing a project has three modes, all of which set `Project.status = "removed"`:
+  `hide` (files untouched), `archive` (workspace + conversation logs moved to
+  `data_dir/archived-projects/`), `purge` (workspace, conversation logs and the
+  store records all deleted). Only purge drops the record, so hide/archive keep
+  cost history queryable. Removal is refused with 409 while any of the project's
+  agents are in `runtime.inflight`, and requires `confirm == project.name`.
+- `Store.visible_projects()` is the only correct way to iterate projects for the
+  board, alerts, reconcile and detect; `store.projects` still contains removed
+  ones. `agents_in_status()` filters removed projects by default.
+- Cost is stored per agent (`AgentSpec.cost_usd`) and summed on demand by
+  `Store.project_cost()`. There is no cached project total, so the per-agent
+  figures always reconcile to the project total and the harness total.
+- Cycle metadata lives in `store.meta`: `cycle_started_at`/`cycle_status` are
+  written *before* a cycle runs, `_record_cycle_end()` writes `last_tick`,
+  `last_cycle_completed_at`, `last_cycle_attempt_at`, `cycle_count` and
+  `cycle_duration` after it, on success **and** failure. `last_tick` alone only
+  advances on success, which is why it used to look frozen when every cycle
+  raised; the header pill now reports attempt vs. completion separately and
+  flags `stale`.
+- Alert ids are `sha1(key)` where the key embeds a generation counter
+  (`task.review_rounds`, `blocked_reason`, `agent.turns_used`,
+  `project.ready_generation`). Acknowledging dismisses that occurrence only; a
+  new occurrence gets a new id. `ready_generation` increments on every
+  transition into `ready_for_delivery` — do not key the delivery alert on
+  `updated_at`, which changes on unrelated touches.
+- The agent tree is built from `parent_agent_id`, never `child_agent_ids`:
+  `retire_agent` prunes the parent's child list to free a delegation slot, which
+  would otherwise erase retired agents from the dashboard. The orchestrator is
+  grafted in as the root because it is global and carries only one `project_id`.
