@@ -1,6 +1,6 @@
 """Entry point: start the web UI and the forever-running orchestrator loop.
 
-    python -m harness.main
+    python -m agent_harness.main
 """
 
 from __future__ import annotations

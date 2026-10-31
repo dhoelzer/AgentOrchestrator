@@ -7,11 +7,11 @@ import sys
 
 sys.path.insert(0, ".")
 
-from harness.config import HarnessConfig
-from harness.orchestrator import Orchestrator
-from harness.runtime import AgentRuntime
-from harness.store import Store
-from harness.tools import (
+from agent_harness.config import HarnessConfig
+from agent_harness.orchestrator import Orchestrator
+from agent_harness.runtime import AgentRuntime
+from agent_harness.store import Store
+from agent_harness.tools import (
     AssignTaskAction,
     AssignTaskExecutor,
     CreateProjectAction,
@@ -202,7 +202,7 @@ def main() -> int:
 
     # 10. read_file sandbox
     runtime.conversation_index["w-conv"] = worker.id
-    from harness.tools import ReadFileAction, ReadFileExecutor
+    from agent_harness.tools import ReadFileAction, ReadFileExecutor
     obs = call(ReadFileExecutor(), ReadFileAction(path="/etc/passwd"), FakeConv("w-conv"))
     assert obs.is_error and "outside your workspace" in obs.text
     print("read_file sandbox enforced")

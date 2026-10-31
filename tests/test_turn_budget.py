@@ -11,12 +11,12 @@ from pathlib import Path
 
 sys.path.insert(0, ".")
 
-from harness import prompts
-from harness.config import HarnessConfig
-from harness.orchestrator import Orchestrator
-from harness.runtime import AgentRuntime
-from harness.store import AgentSpec, Store, TaskSpec, new_id
-from harness.tools import (
+from agent_harness import prompts
+from agent_harness.config import HarnessConfig
+from agent_harness.orchestrator import Orchestrator
+from agent_harness.runtime import AgentRuntime
+from agent_harness.store import AgentSpec, Store, TaskSpec, new_id
+from agent_harness.tools import (
     ExtendAgentAction, ExtendAgentExecutor, ReconfigureAgentAction,
     ReconfigureAgentExecutor, _dispatch, _task_dict, register_harness_tools,
 )

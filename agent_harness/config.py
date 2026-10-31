@@ -132,6 +132,8 @@ class HarnessConfig(BaseModel):
         ):
             if env.get(key):
                 setattr(cfg, attr, int(env[key]))
+        if env.get("HARNESS_HOST"):
+            cfg.host = env["HARNESS_HOST"]
 
         cfg.ensure_dirs()
         return cfg

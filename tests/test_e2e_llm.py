@@ -12,11 +12,11 @@ import sys
 
 sys.path.insert(0, ".")
 
-from harness.config import HarnessConfig
-from harness.orchestrator import Orchestrator
-from harness.runtime import AgentRuntime
-from harness.store import Store
-from harness.tools import register_harness_tools
+from agent_harness.config import HarnessConfig
+from agent_harness.orchestrator import Orchestrator
+from agent_harness.runtime import AgentRuntime
+from agent_harness.store import Store
+from agent_harness.tools import register_harness_tools
 
 CYCLES = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 
