@@ -70,6 +70,59 @@ CLI overrides: `--base-url`, `--model`, `--api-key`, `--tick`, `--port`, `--conf
 | `max_children_per_agent` | 6 | Fan-out limit per agent |
 | `review_attempts_before_escalation` | 3 | Failed reviews before escalation |
 | `sandbox_workspaces` | true | Confine sub-agent file access to its project workspace |
+| `llm.request_timeout` | 300 | Starting per-request timeout (seconds) |
+| `llm.adaptive_timeout` | true | Grow the timeout after slow/empty replies |
+| `llm.min_request_timeout` | 60 | Floor for the adaptive timeout |
+| `llm.max_request_timeout` | 3600 | Ceiling for the adaptive timeout |
+| `llm.timeout_growth` | 2.0 | Geometric growth factor per widening |
+| `llm.empty_response_retries` | 2 | Retries when the endpoint returns nothing |
+| `llm.input_cost_per_token` | 0.000002 | USD/token billed for prompts |
+| `llm.output_cost_per_token` | 0.000015 | USD/token billed for completions |
+
+### Cost accounting
+
+litellm cannot price an unknown custom model, so without explicit rates every
+agent reports `$0.00`. The defaults price the preconfigured Qwen endpoint at
+$2/M input and $15/M output and are passed straight to `LLM(input_cost_per_token=…,
+output_cost_per_token=…)`. Override per endpoint with
+`HARNESS_LLM_INPUT_COST_PER_TOKEN` / `HARNESS_LLM_OUTPUT_COST_PER_TOKEN`, or set
+them in the Settings panel.
+
+### Changing config while the harness runs
+
+`GET /api/config` returns the live config (API key redacted) plus runtime LLM
+health. `POST /api/config` patches an allowlisted subset and applies it
+immediately — turn limits and LLM settings for new runs, timeout and
+parallelism also for conversations already open:
+
+```bash
+curl -X POST localhost:8090/api/config \
+  -H 'content-type: application/json' \
+  -d '{"llm.base_url":"http://other:8080/v1","llm.request_timeout":900,"max_parallel_workers":5}'
+```
+
+Unknown keys and wrong types are rejected with `400`. Changes are written back
+to the config file, so they survive a restart. The same controls are in the
+web UI under **Settings**.
+
+### Slow or flaky local endpoints
+
+Local/self-hosted servers are slow and sometimes answer with an empty
+completion. Rather than reporting that as an agent failure, the runtime:
+
+1. retries the run (a retry nudges the agent to continue; it does not resend
+   the assignment),
+2. geometrically widens the shared request timeout, up to
+   `llm.max_request_timeout`, and
+3. if the endpoint still produces nothing, marks the agent `llm_unavailable`
+   and blocks its task with a reason, so the next cycle re-dispatches instead
+   of treating the work as failed.
+
+Only genuinely transient faults (timeouts, rate limits, connection errors, 5xx)
+are retried — an auth or bad-request error fails fast rather than burning the
+agent's turn budget. The widened timeout is persisted, so a restart does not go
+back to a value the endpoint already proved too small. `GET /api/state` exposes
+the current timeout and retry counters under `meta.llm`.
 
 ---
 
@@ -125,11 +178,19 @@ specialists at once.
 ## Web UI
 
 - `GET /` — project creation form, alerts, kanban board, agent hierarchy tree, activity feed
-- `GET /api/state` — full board + agent tree + events (polled every 5 s)
+- `GET /api/state` — full board + agent tree + events + LLM health (polled every 5 s)
 - `POST /api/projects` — create a project
 - `POST /api/tick` — run a cycle immediately
+- `GET /api/config`, `POST /api/config` — read / live-patch runtime settings
+- `POST /api/projects/{id}/tasks/{id}/directives` — send the worker direction; a
+  blocked task moves back to ready and the directive is injected into its next
+  assignment prompt
 - `GET /api/projects/{id}/tasks/{id}`, `GET /api/projects/{id}/agents/{id}` — detail
 - `GET /health` — model, base URL, tick, in-flight agents
+
+Task cards show live `turns_used/turn_limit` (updated during a run, not only at
+the end) and the reason a task is blocked. The header shows the current LLM
+request timeout and how many replies had to be retried.
 
 ## Deploying with Docker
 
@@ -257,6 +318,10 @@ pip install -r requirements.txt
 
 # No LLM needed — board mechanics, delegation, review, delivery, persistence:
 python tests/test_board_mechanics.py
+
+# No LLM needed — turn-count sync, retry/adaptive-timeout, blocked-task resume,
+# live config patching, token costs:
+python tests/test_runtime_and_config.py
 
 # Needs the configured LLM endpoint:
 python tests/test_e2e_llm.py 3

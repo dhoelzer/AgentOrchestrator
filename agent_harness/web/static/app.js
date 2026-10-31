@@ -18,6 +18,14 @@ function renderHeader(d) {
   const inflight = d.meta.inflight || [];
   const last = d.meta.last_tick ? new Date(d.meta.last_tick * 1000).toLocaleTimeString() : "never";
   $("#runPill").innerHTML = `running: <b>${inflight.length}</b> · last cycle ${last}`;
+  const llm = d.meta.llm || {};
+  const unhealthy = (llm.empty_responses || 0) + (llm.transient_errors || 0) > 0;
+  $("#llmPill").innerHTML =
+    `llm: <b>${llm.timeout ?? "?"}s timeout</b>` +
+    (unhealthy
+      ? ` · <b>${(llm.empty_responses || 0) + (llm.transient_errors || 0)}</b> retried`
+      : "");
+  $("#llmPill").classList.toggle("warn", unhealthy);
 }
 
 function renderAlerts(d) {
@@ -36,6 +44,7 @@ function taskCard(t) {
       ${t.review_verdict ? `<span class="tag">${esc(t.review_verdict)}</span>` : ""}
       ${t.assigned_agent_id ? `<span class="tag">🤖 ${esc(t.assigned_agent_id)}</span>` : ""}
     </div>
+    ${t.blocked_reason ? `<div class="blocked-reason">⚠ ${esc(t.blocked_reason)}</div>` : ""}
   </div>`;
 }
 
@@ -51,6 +60,7 @@ function renderTree(nodes) {
         <span class="kv">${n.turns_used}/${n.turn_limit} turns · ${esc(n.status)}</span>
         ${n.task_id ? `<span class="tag">task ${esc(n.task_id)}</span>` : ""}
         ${n.tokens ? `<span class="kv">${(n.tokens / 1000).toFixed(1)}k tok</span>` : ""}
+        ${n.cost_usd ? `<span class="kv">$${n.cost_usd.toFixed(4)}</span>` : ""}
       </div>
       ${kids}
     </div>`;
@@ -140,7 +150,15 @@ async function showTask(projectId, taskId) {
     <div class="sec"><h5>Worker report</h5><pre>${esc(t.result_summary || "—")}</pre></div>
     <div class="sec"><h5>Review (${esc(t.review_verdict || "pending")}, round ${t.review_rounds})</h5>
       <pre>${esc(t.review_feedback || "—")}</pre></div>
-    <div class="sec"><h5>Orchestrator note</h5><pre>${esc(t.orchestrator_note || "—")}</pre></div>`;
+    <div class="sec"><h5>Orchestrator note</h5><pre>${esc(t.orchestrator_note || "—")}</pre></div>
+    <div class="sec"><h5>Blocked</h5><pre>${esc(t.blocked_reason || "not blocked")}</pre></div>
+    <div class="sec"><h5>Direction for the next run</h5>
+      <pre>${esc((t.user_directives || []).map((x) => `[${x.at}] ${x.text}`).join("\n") || "—")}</pre>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <input id="directiveText" placeholder="Tell the worker what to change…"
+               style="flex:1;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 10px">
+        <button id="directiveSend" data-project="${esc(projectId)}" data-task="${esc(taskId)}">Send</button>
+      </div></div>`;
   $("#detail").showModal();
 }
 
@@ -150,7 +168,7 @@ async function showAgent(projectId, agentId) {
   $("#detailBody").innerHTML = `
     <h3>${esc(a.role)}</h3>
     <div class="muted">${esc(a.id)} · ${esc(a.specialty)} · depth ${a.depth} · ${esc(a.status)}</div>
-    <div class="sec"><h5>Turn budget</h5><pre>${a.turns_used}/${a.turn_limit} turns · ${a.runs} runs · ${a.tokens} tokens</pre></div>
+    <div class="sec"><h5>Turn budget</h5><pre>${a.turns_used}/${a.turn_limit} turns · ${a.runs} runs · ${a.tokens} tokens · $${(a.cost_usd ?? 0).toFixed(4)}</pre></div>
     <div class="sec"><h5>Mission</h5><pre>${esc(a.mission)}</pre></div>
     <div class="sec"><h5>Last report</h5><pre>${esc(a.last_report || "—")}</pre></div>
     <div class="sec"><h5>Last error</h5><pre>${esc(a.last_error || "none")}</pre></div>
@@ -186,6 +204,33 @@ document.addEventListener("click", async (e) => {
     setTimeout(refresh, 1500);
     return;
   }
+  if (t.id === "settingsBtn") {
+    await openSettings();
+    return;
+  }
+  if (t.id === "settingsSave") {
+    await saveSettings();
+    return;
+  }
+  if (t.id === "directiveSend") {
+    const input = $("#directiveText");
+    const text = (input?.value || "").trim();
+    if (!text) return;
+    const res = await fetch(
+      `/api/projects/${t.dataset.project}/tasks/${t.dataset.task}/directives`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+    if (res.ok) {
+      $("#detail").close();
+      await refresh();
+    } else {
+      alert("Could not send direction: " + (await res.text()));
+    }
+    return;
+  }
   if (t.dataset.pause) {
     await fetch(`/api/projects/${t.dataset.pause}/pause`, { method: "POST" });
     refresh();
@@ -219,6 +264,58 @@ document.addEventListener("click", async (e) => {
     else state.openProjects.add(det.dataset.project);
   }
 });
+
+const SETTING_KEYS = [
+  "llm.model", "llm.base_url", "llm.api_key", "llm.request_timeout",
+  "llm.max_request_timeout", "llm.empty_response_retries", "tick_seconds",
+  "sub_agent_turn_limit", "max_parallel_workers", "max_sub_agent_depth",
+  "llm.input_cost_per_token", "llm.output_cost_per_token",
+];
+
+async function openSettings() {
+  const res = await fetch("/api/config");
+  const d = await res.json();
+  const flat = { ...d.config };
+  for (const [k, v] of Object.entries(d.config.llm || {})) flat[`llm.${k}`] = v;
+  // The live timeout is the adaptive one, not the configured starting value.
+  flat["llm.request_timeout"] = d.runtime.llm_timeout;
+  const form = $("#settingsForm");
+  for (const key of SETTING_KEYS) {
+    const input = form.elements[key];
+    if (!input) continue;
+    input.value = key === "llm.api_key" ? "" : (flat[key] ?? "");
+  }
+  $("#settingsMsg").textContent = "";
+  $("#settings").showModal();
+}
+
+async function saveSettings() {
+  const form = $("#settingsForm");
+  const patch = {};
+  for (const key of SETTING_KEYS) {
+    const input = form.elements[key];
+    if (!input || input.value === "") continue;
+    patch[key] = input.value;
+  }
+  if (!Object.keys(patch).length) {
+    $("#settingsMsg").textContent = "Nothing to change.";
+    return;
+  }
+  const res = await fetch("/api/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (res.ok) {
+    const out = await res.json();
+    $("#settingsMsg").textContent =
+      `Applied ${Object.keys(out.changed).length} setting(s).`;
+    await refresh();
+    setTimeout(() => $("#settings").close(), 900);
+  } else {
+    $("#settingsMsg").textContent = "Rejected: " + (await res.text());
+  }
+}
 
 refresh();
 setInterval(refresh, 5000);

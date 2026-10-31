@@ -64,6 +64,12 @@ class TaskSpec(BaseModel):
     runs: int = 0
     review_rounds: int = 0
 
+    # Why the task sits in 'blocked', and any direction the user has supplied
+    # since. Directives are queued so the orchestrator cannot miss one that
+    # arrives mid-cycle.
+    blocked_reason: str | None = None
+    user_directives: list[dict] = Field(default_factory=list)
+
     result_summary: str | None = None
     review_verdict: str | None = None
     review_feedback: str | None = None
@@ -100,6 +106,9 @@ class AgentSpec(BaseModel):
 
     task_id: str | None = None
     created_by: str = "orchestrator"
+    # Set when the agent was dispatched with review=true. Reviewers never drive
+    # a task card's turn counters, even if they also carry task_id.
+    is_reviewer: bool = False
 
     turns_used: int = 0
     turn_limit: int = 100
@@ -226,7 +235,23 @@ class Store:
         with self._lock:
             self.agents[agent.id] = agent
         agent.touch()
+        self._sync_task_budget(agent)
         return agent
+
+    def _sync_task_budget(self, agent: AgentSpec) -> None:
+        """Mirror an agent's turn counters onto the task it is working.
+
+        The card shows the task's counters but the agent owns them, so syncing
+        here (rather than at each call site) is what keeps the two from
+        drifting. Gated on the worker link: a reviewer also carries task_id,
+        and its turns must not overwrite the worker's.
+        """
+        task = self.tasks.get(agent.task_id or "")
+        if task is None or agent.is_reviewer or task.assigned_agent_id != agent.id:
+            return
+        task.turns_used = agent.turns_used
+        task.turn_limit = agent.turn_limit
+        task.touch()
 
     # ---------- queries ----------
 

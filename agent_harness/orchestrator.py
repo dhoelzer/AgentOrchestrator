@@ -117,7 +117,15 @@ class Orchestrator:
 
             for task in board["blocked"]:
                 agent = self.store.agents.get(task.assigned_agent_id or "")
-                if agent and agent.status == "budget_exhausted":
+                if task.user_directives:
+                    queued = "; ".join(
+                        f"[{d.get('at', '')}] {d.get('text', '')}"
+                        for d in task.user_directives
+                    )
+                    note(project.id,
+                         f"Task {task.id} '{task.title}' is BLOCKED and the user has "
+                         f"supplied direction - apply it and re-dispatch: {queued}")
+                elif agent and agent.status == "budget_exhausted":
                     note(project.id, prompts.budget_exhausted_briefing(
                         {"id": agent.id, "role": agent.role,
                          "turns_used": agent.turns_used,
@@ -126,6 +134,23 @@ class Orchestrator:
                         {"id": task.id, "title": task.title,
                          "objective": task.objective},
                     ))
+                elif agent and agent.status == "llm_unavailable":
+                    note(project.id,
+                         f"Task {task.id} '{task.title}' is blocked because the LLM "
+                         f"endpoint returned nothing for {agent.id} ({agent.role}). "
+                         f"Timeout is now {self.runtime.llm_timeout}s - re-dispatch "
+                         "the same agent, or pause the project if the endpoint is down.")
+                elif agent and agent.status == "failed":
+                    note(project.id,
+                         f"Task {task.id} '{task.title}' is blocked after agent "
+                         f"{agent.id} FAILED: {agent.last_error} - reconfigure or "
+                         "replace the agent, then re-dispatch.")
+                else:
+                    note(project.id,
+                         f"Task {task.id} '{task.title}' is BLOCKED"
+                         + (f": {task.blocked_reason}" if task.blocked_reason else "")
+                         + " - decide whether to re-dispatch, reconfigure, split it, "
+                         "or ask the user for direction.")
 
             for task in board["rework"]:
                 note(project.id,
@@ -184,6 +209,30 @@ class Orchestrator:
             note(agent.project_id,
                  f"Agent {agent.id} ({agent.role}) FAILED: {agent.last_error} - "
                  "reconfigure or replace it.")
+
+        for agent in self.store.agents_in_status(("llm_unavailable",)):
+            task = self.store.tasks.get(agent.task_id or "")
+            if task is not None and task.column == "blocked" \
+                    and task.assigned_agent_id == agent.id:
+                continue  # already surfaced via the blocked-task briefing above
+            note(agent.project_id,
+                 f"Agent {agent.id} ({agent.role}) made no progress: the LLM endpoint "
+                 f"returned nothing. Request timeout is now {self.runtime.llm_timeout}s "
+                 f"({self.runtime.llm_empty_responses} empty responses seen) - retry it "
+                 "with resume_agent rather than treating the task as failed.")
+
+        if self.runtime.llm_empty_responses or self.runtime.llm_transient_errors:
+            # Global endpoint health: attached to every project, since run_cycle
+            # only forwards attention keyed by a real project id.
+            health = (
+                f"LLM endpoint health: {self.runtime.llm_empty_responses} empty "
+                f"responses, {self.runtime.llm_transient_errors} transient errors, "
+                f"timeout widened {self.runtime.llm_timeouts_widened}x to "
+                f"{self.runtime.llm_timeout}s. If this keeps growing the endpoint is "
+                "overloaded - reduce parallelism or wait before dispatching more agents."
+            )
+            for project_id in attention:
+                attention[project_id].append(health)
 
         return attention
 

@@ -133,6 +133,9 @@ def _task_dict(task: TaskSpec) -> dict:
         "result_summary": task.result_summary,
         "review_verdict": task.review_verdict,
         "review_feedback": task.review_feedback,
+        "blocked_reason": task.blocked_reason,
+        "orchestrator_note": task.orchestrator_note,
+        "user_directives": task.user_directives,
     }
 
 
@@ -267,6 +270,11 @@ class UpdateTaskAction(Action):
     deliverables: list[str] | None = None
     depends_on: list[str] | None = None
     note: str | None = Field(default=None, description="Your reasoning for this change.")
+    blocked_reason: str | None = Field(
+        default=None,
+        description="When moving to 'blocked', what is stopping the task. Required "
+                    "for a manual block so the next cycle knows what to resolve.",
+    )
 
 
 class UpdateTaskExecutor(ToolExecutor):
@@ -278,7 +286,18 @@ class UpdateTaskExecutor(ToolExecutor):
         if action.column is not None:
             if action.column not in KANBAN_COLUMNS:
                 return _err(f"Invalid column {action.column}.")
+            if action.column == "blocked" and not (
+                action.blocked_reason or task.blocked_reason
+            ):
+                return _err(
+                    "Blocking a task requires blocked_reason so the next cycle can "
+                    "act on it. Say what is stopping the task."
+                )
             task.column = action.column
+            if action.column != "blocked":
+                task.blocked_reason = None
+        if action.blocked_reason:
+            task.blocked_reason = action.blocked_reason
         for attr in ("title", "objective", "expertise"):
             value = getattr(action, attr)
             if value is not None:
@@ -467,7 +486,9 @@ class RunAgentExecutor(ToolExecutor):
         if action.background:
             try:
                 c.runtime.submit(
-                    agent.id, lambda: _dispatch(agent, task, message, remaining))
+                    agent.id,
+                    lambda: _dispatch(agent, task, message, remaining,
+                                      review=action.review))
             except RuntimeError as exc:
                 return _err(str(exc))
             return _ok(
@@ -475,7 +496,7 @@ class RunAgentExecutor(ToolExecutor):
                 f"{task.id} with {remaining} turns. It moves to 'review' when done; "
                 "dispatch other ready work now."
             )
-        return _dispatch(agent, task, message, remaining)
+        return _dispatch(agent, task, message, remaining, review=action.review)
 
 
 class ResumeAgentAction(Action):
@@ -500,12 +521,30 @@ class ResumeAgentExecutor(ToolExecutor):
 
 
 def _dispatch(agent: AgentSpec, task: TaskSpec | None, message: str,
-              remaining: int) -> Observation:
+              remaining: int, review: bool = False) -> Observation:
     """Run an agent synchronously and reflect the outcome on the board."""
     c = ctx()
     if task is not None:
-        # Keep the task<->agent link so budget exhaustion is always attributable.
-        task.assigned_agent_id = agent.id
+        # Keep the task<->agent links so budget exhaustion is always attributable.
+        # A reviewer must not take over the worker link: the card's turn counters
+        # follow the worker, and the store syncs from the assigned agent only.
+        if review:
+            task.reviewer_agent_id = agent.id
+            if not agent.is_reviewer:
+                agent.is_reviewer = True
+                c.store.upsert_agent(agent)
+        else:
+            task.assigned_agent_id = agent.id
+            # The orchestrator can dispatch with an explicit task_id without
+            # ever calling assign_task; without the reverse link the live turn
+            # visualizer and the store sync have nothing to write through.
+            if agent.task_id != task.id:
+                agent.task_id = task.id
+                c.store.upsert_agent(agent)
+    # Directives are injected into this dispatch's prompt, so they are consumed
+    # here; leaving them queued would replay stale instructions forever.
+    if task is not None and task.user_directives:
+        task.user_directives = []
     if task is not None and task.column in ("backlog", "ready"):
         task.column = "in_progress"
         task.started_at = task.started_at or datetime.now(timezone.utc).isoformat(
@@ -517,13 +556,24 @@ def _dispatch(agent: AgentSpec, task: TaskSpec | None, message: str,
                             turn_limit=agent.turn_limit)
 
     if task is not None:
-        task.turns_used = agent.turns_used
+        if not review:
+            task.turns_used = agent.turns_used
         task.runs += 1
         task.result_summary = outcome.final_report or task.result_summary
         if outcome.budget_exhausted:
             task.column = "blocked"
+            task.blocked_reason = (
+                f"agent {agent.id} used all {agent.turn_limit} turns"
+            )
+        elif outcome.status == "llm_unavailable":
+            task.column = "blocked"
+            task.blocked_reason = (
+                "LLM endpoint returned no output; request timeout is now "
+                f"{c.runtime.llm_timeout}s"
+            )
         elif task.column == "in_progress":
             task.column = "review"
+            task.blocked_reason = None
         task.touch()
 
     c.store.add_event(

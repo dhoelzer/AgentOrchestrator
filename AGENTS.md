@@ -48,7 +48,13 @@ the LLM tests take minutes and are non-deterministic.
 - `include_default_tools=["FinishTool", "ThinkTool"]` keeps `finish`/`think` while
   supplying an explicit tool list.
 - Unmapped local model names (e.g. `openai/qwen`) emit harmless litellm
-  "Cost calculation failed" warnings; cost metrics stay 0.
+  "Cost calculation failed" warnings and report $0 cost. Pass
+  `input_cost_per_token` / `output_cost_per_token` explicitly to price them;
+  `LLMConfig` defaults them to the Qwen rates (2e-06 / 1.5e-05).
+- `state.events` contains agent-sourced events that are **not** LLM turns
+  (`SystemPromptEvent`, condenser events) and they have no `llm_response_id`
+  attribute at all — read it with `getattr`, never as a plain attribute.
+- `metrics.accumulated_token_usage` is `None` until the first billed response.
 - The SDK strips only a fixed set of sensitive vars (`SESSION_API_KEY`,
   `OH_SECRET_KEY`, `OH_SESSION_API_KEYS_*`, OTEL headers) from the agent shell
   environment. `DOCKER_HOST` and `HARNESS_LLM_API_KEY` do reach agent commands —
@@ -81,3 +87,10 @@ the LLM tests take minutes and are non-deterministic.
 - `reconfigure_agent` must be rejected while the agent is in `runtime.inflight`.
 - A dispatched task always keeps `assigned_agent_id` set, otherwise budget exhaustion
   on a `blocked` task becomes unattributable and the orchestrator is never briefed.
+  `_dispatch` creates that link (and the reverse `agent.task_id`) itself, because the
+  orchestrator can call `run_agent(task_id=...)` without ever calling `assign_task`.
+- `assigned_agent_id` is the **worker** link and drives the card's turn counters;
+  reviewers go on `reviewer_agent_id` and set `AgentSpec.is_reviewer`. Never let a
+  review run write `assigned_agent_id` or `task.turns_used` — the card would show the
+  reviewer's budget instead of the worker's. `Store._sync_task_budget` is gated on
+  both, so a reviewer cannot overwrite the worker's count.

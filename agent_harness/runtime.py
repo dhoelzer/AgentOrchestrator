@@ -4,17 +4,26 @@ A budget is enforced by capping ``max_iteration_per_run`` for a single run and
 counting cumulative agent turns across runs. Because conversations persist, a
 sub-agent that runs out of budget can be resumed later with a new budget, which
 is exactly what the orchestrator decides on when it is told the budget ran out.
+
+Slow local endpoints are handled by widening the request timeout on each
+timeout (shared per endpoint, so one slow reply helps every agent) and by
+retrying runs that make no progress.
 """
 
 from __future__ import annotations
 
+import contextlib
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
+import openai
 from openhands.sdk import Agent, Conversation, LLMSummarizingCondenser
 from openhands.sdk.conversation.state import ConversationExecutionStatus
+from openhands.sdk.conversation.visualizer import ConversationVisualizerBase
+from openhands.sdk.event.base import Event
 from openhands.sdk.event.llm_convertible import ActionEvent, MessageEvent
 from openhands.sdk.logger import get_logger
 from openhands.sdk.security.confirmation_policy import AlwaysConfirm, NeverConfirm
@@ -23,6 +32,81 @@ from .config import HarnessConfig
 from .store import AgentSpec, Store
 
 logger = get_logger(__name__)
+
+# Errors that mean "the endpoint was too slow / unreachable / overloaded", not
+# "the agent did something wrong". These trigger a retry. Deliberately excludes
+# BadRequestError / AuthenticationError (both APIStatusError subclasses):
+# retrying those just burns time on a permanent failure. APITimeoutError
+# subclasses APIConnectionError, so it is covered.
+TRANSIENT_LLM_ERRORS = (
+    openai.APIConnectionError,
+    openai.RateLimitError,
+    openai.InternalServerError,
+)
+
+# Only these justify concluding "the endpoint needs a longer timeout". A rate
+# limit needs a backoff, not a bigger deadline.
+TIMEOUT_LIKE_ERRORS = (openai.APIConnectionError,)
+
+
+class ConcurrencyGate:
+    """Bounds how many threads may hold the LLM at once; limit is adjustable.
+
+    Slots are held per thread, and a thread that already holds one never takes
+    a second. A sub-agent dispatched synchronously from inside its parent's
+    tool call runs on the parent's thread, so re-entrant acquisition is what
+    prevents a limit of 1 from deadlocking a nested dispatch.
+    """
+
+    def __init__(self, limit: int):
+        self._limit = max(1, limit)
+        self._holders: dict[int, int] = {}
+        self._cond = threading.Condition()
+
+    @property
+    def limit(self) -> int:
+        with self._cond:
+            return self._limit
+
+    @property
+    def active(self) -> int:
+        with self._cond:
+            return len(self._holders)
+
+    def set_limit(self, limit: int) -> None:
+        with self._cond:
+            self._limit = max(1, limit)
+            self._cond.notify_all()
+
+    def acquire(self) -> None:
+        ident = threading.get_ident()
+        with self._cond:
+            if ident in self._holders:
+                self._holders[ident] += 1
+                return
+            while len(self._holders) >= self._limit:
+                self._cond.wait()
+            self._holders[ident] = 1
+
+    def release(self) -> None:
+        ident = threading.get_ident()
+        with self._cond:
+            count = self._holders.get(ident)
+            if count is None:
+                return
+            if count <= 1:
+                del self._holders[ident]
+            else:
+                self._holders[ident] = count - 1
+            self._cond.notify()
+
+    @contextlib.contextmanager
+    def slot(self):
+        self.acquire()
+        try:
+            yield
+        finally:
+            self.release()
 
 
 @dataclass
@@ -39,19 +123,70 @@ class TurnCounter:
         ``llm_response_id`` of the response that produced it; a plain-text
         ``MessageEvent`` may not, so it is counted on its own.
         """
-        response_ids: set[str] = set()
-        message_events = 0
-        for event in conversation.state.events:
-            if event.source != "agent":
-                continue
-            if isinstance(event, ActionEvent):
-                response_ids.add(str(event.llm_response_id))
-            elif isinstance(event, MessageEvent):
-                if event.llm_response_id:
-                    response_ids.add(str(event.llm_response_id))
-                else:
-                    message_events += 1
-        return len(response_ids) + message_events
+        return len(_response_ids(conversation.state.events)) + _standalone_messages(
+            conversation.state.events
+        )
+
+
+def _response_ids(events) -> set[str]:
+    ids: set[str] = set()
+    for event in events:
+        if event.source != "agent":
+            continue
+        # Not every agent-sourced event is an LLM turn: SystemPromptEvent and
+        # condenser events carry no llm_response_id at all.
+        rid = getattr(event, "llm_response_id", None)
+        if rid or isinstance(event, ActionEvent):
+            ids.add(str(rid or event.id))
+    return ids
+
+
+def _standalone_messages(events) -> int:
+    return sum(
+        1
+        for event in events
+        if event.source == "agent"
+        and isinstance(event, MessageEvent)
+        and not getattr(event, "llm_response_id", None)
+    )
+
+
+class LiveTurnVisualizer(ConversationVisualizerBase):
+    """Publishes turn usage to the store while a run is still in progress.
+
+    Without this, a long sub-agent run shows a stale count until it finishes.
+    The count is recomputed from the live event store on each event, which
+    stays correct across resume and condensation without needing to seed or
+    deduplicate ids.
+    """
+
+    def __init__(self, spec: AgentSpec, store: Store):
+        super().__init__()
+        self.spec = spec
+        self.store = store
+        self._updated_at = 0.0
+        self._flushed_at = 0.0
+
+    def on_event(self, event: Event) -> None:
+        if self._state is None or event.source != "agent":
+            return
+
+        now = time.time()
+        # Recomputing walks the whole event store, so throttle it; the final
+        # count is reconciled by run() regardless.
+        if now - self._updated_at < 1.0:
+            return
+        self._updated_at = now
+
+        events = list(self._state.events)
+        total = len(_response_ids(events)) + _standalone_messages(events)
+        # Never regress: a condenser can prune events out of the store.
+        if total > self.spec.turns_used:
+            self.spec.turns_used = total
+            self.store.upsert_agent(self.spec)
+            if now - self._flushed_at >= 5.0:
+                self._flushed_at = now
+                self.store.flush()
 
 
 @dataclass
@@ -64,6 +199,11 @@ class RunOutcome:
     tokens: int
     cost_usd: float
     error: str | None = None
+    # Set when the run was retried because the endpoint timed out or returned
+    # nothing, so the orchestrator can see the endpoint was unhealthy rather
+    # than treating it as an agent failure.
+    llm_retries: int = 0
+    llm_health: str | None = None
 
 
 class AgentRuntime:
@@ -84,6 +224,18 @@ class AgentRuntime:
             thread_name_prefix="worker",
         )
         self._inflight: set[str] = set()
+        # Live LLM tuning, shared by every agent: one slow reply widens the
+        # timeout for all of them.
+        self._llm_lock = threading.RLock()
+        self._llms: dict[str, list] = {}
+        # A widened timeout is kept in the store so a restart does not go back
+        # to a value the endpoint already proved too small.
+        self.llm_timeout = int(store.meta.get(
+            "llm_timeout", config.llm.request_timeout) or config.llm.request_timeout)
+        self.llm_timeouts_widened = int(store.meta.get("llm_timeouts_widened", 0))
+        self.llm_empty_responses = int(store.meta.get("llm_empty_responses", 0))
+        self.llm_transient_errors = int(store.meta.get("llm_transient_errors", 0))
+        self.gate = ConcurrencyGate(config.max_parallel_workers)
 
     @property
     def inflight(self) -> set[str]:
@@ -116,12 +268,20 @@ class AgentRuntime:
 
     def build_agent(self, spec: AgentSpec, tools: list) -> Agent:
         """Build the SDK Agent for a stored spec."""
-        llm = self.config.llm.build_llm(usage_id=spec.id)
+        llm = self.config.llm.build_llm(usage_id=spec.id, timeout=self.llm_timeout)
+        condenser_llm = self.config.llm.build_llm(
+            usage_id=f"{spec.id}-condenser", timeout=self.llm_timeout
+        )
         condenser = LLMSummarizingCondenser(
-            llm=self.config.llm.build_llm(usage_id=f"{spec.id}-condenser"),
+            llm=condenser_llm,
             max_size=120,
             keep_first=2,
         )
+        # The SDK keeps our LLM objects by reference, so mutating their timeout
+        # later retunes a live conversation without rebuilding or resetting it.
+        # Keyed by agent so closing a conversation drops its LLMs again.
+        with self._llm_lock:
+            self._llms[spec.id] = [llm, condenser_llm]
         return Agent(
             llm=llm,
             tools=list(tools),
@@ -130,6 +290,46 @@ class AgentRuntime:
             condenser=condenser,
             include_default_tools=["FinishTool", "ThinkTool"],
         )
+
+    # ---------- live LLM tuning ----------
+
+    def set_llm_timeout(self, seconds: int) -> int:
+        """Apply a new request timeout to every live agent LLM."""
+        cfg = self.config.llm
+        bounded = int(max(cfg.min_request_timeout,
+                          min(seconds, cfg.max_request_timeout)))
+        with self._llm_lock:
+            self.llm_timeout = bounded
+            for agent_id, llms in list(self._llms.items()):
+                for llm in llms:
+                    try:
+                        llm.timeout = bounded
+                        llm.stream_idle_timeout = float(bounded)
+                    except Exception:  # noqa: BLE001 - LLM torn down under us
+                        logger.debug("Dropping stale LLM for %s", agent_id)
+        self.llm_timeouts_widened += 1
+        self._persist_llm_health()
+        logger.warning("LLM request timeout adjusted to %ss", bounded)
+        return bounded
+
+    def widen_llm_timeout(self, reason: str) -> int:
+        """Grow the timeout geometrically after a slow/unreachable endpoint."""
+        cfg = self.config.llm
+        with self._llm_lock:
+            current = self.llm_timeout
+        if not cfg.adaptive_timeout or current >= cfg.max_request_timeout:
+            return current
+        grown = max(int(current * cfg.timeout_growth),
+                    current + cfg.min_request_timeout)
+        return self.set_llm_timeout(grown)
+
+    def _persist_llm_health(self) -> None:
+        self.store.meta.update({
+            "llm_timeout": self.llm_timeout,
+            "llm_timeouts_widened": self.llm_timeouts_widened,
+            "llm_empty_responses": self.llm_empty_responses,
+            "llm_transient_errors": self.llm_transient_errors,
+        })
 
     def _agent_lock(self, agent_id: str) -> threading.Lock:
         with self._lock:
@@ -156,7 +356,7 @@ class AgentRuntime:
                 workspace=spec.workspace or str(self.config.root_dir),
                 persistence_dir=persistence_dir,
                 conversation_id=conv_id,
-                visualizer=None,
+                visualizer=LiveTurnVisualizer(spec, self.store),
                 stuck_detection=True,
                 delete_on_close=False,
                 max_iteration_per_run=self._budget_for(spec),
@@ -176,87 +376,163 @@ class AgentRuntime:
 
     def run(self, spec: AgentSpec, tools: list, message: str,
             turn_limit: int | None = None) -> RunOutcome:
-        """Run one budgeted stretch of an agent's conversation."""
+        """Run one budgeted stretch of an agent's conversation.
+
+        A run that produces no agent turn at all — an empty completion, or an
+        endpoint that timed out before answering — is retried with a widened
+        timeout instead of being reported as an agent failure.
+        """
         with self._agent_lock(spec.id):
-            if turn_limit is not None:
-                spec.turn_limit = turn_limit
+            with self.gate.slot():
+                return self._run_guarded(spec, tools, message, turn_limit)
 
-            before_turns = spec.turns_used
-            conv = self.open_conversation(spec, tools)
-            events_before = len(list(conv.state.events))
-            conv.max_iteration_per_run = self._budget_for(spec)
+    def _run_guarded(self, spec: AgentSpec, tools: list, message: str,
+                     turn_limit: int | None) -> RunOutcome:
+        cfg = self.config.llm
+        if turn_limit is not None:
+            spec.turn_limit = turn_limit
 
-            spec.status = "running"
-            spec.runs += 1
-            spec.touch()
-            self.store.upsert_agent(spec)
-            self.store.add_event(
-                "agent_run_started",
-                f"{spec.role} started run {spec.runs} "
-                f"(budget {spec.turn_limit - before_turns} turns).",
-                project_id=spec.project_id, agent_id=spec.id, task_id=spec.task_id,
-            )
+        before_turns = spec.turns_used
+        conv = self.open_conversation(spec, tools)
+        events_before = len(list(conv.state.events))
+        conv.max_iteration_per_run = self._budget_for(spec)
 
-            error: str | None = None
+        spec.status = "running"
+        spec.runs += 1
+        spec.touch()
+        self.store.upsert_agent(spec)
+        self.store.add_event(
+            "agent_run_started",
+            f"{spec.role} started run {spec.runs} "
+            f"(budget {spec.turn_limit - before_turns} turns).",
+            project_id=spec.project_id, agent_id=spec.id, task_id=spec.task_id,
+        )
+
+        attempts = 1 + max(0, cfg.empty_response_retries)
+        error: str | None = None
+        retries = 0
+        health: list[str] = []
+        retryable = True
+
+        for attempt in range(attempts):
+            error = None
             try:
-                conv.send_message(message)
+                # Only the first attempt sends the assignment; a retry nudges
+                # the agent to continue so instructions are not duplicated.
+                conv.send_message(
+                    message if attempt == 0
+                    else "Your previous attempt produced no usable output "
+                         "(the model returned nothing or the request timed out). "
+                         "Continue the task from where you left off now."
+                )
                 conv.run()
+            except TRANSIENT_LLM_ERRORS as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                self.llm_transient_errors += 1
+                self._persist_llm_health()
+                health.append(f"transient:{type(exc).__name__}")
+                logger.warning("Agent %s hit a transient LLM error: %s",
+                               spec.id, error)
+                if isinstance(exc, TIMEOUT_LIKE_ERRORS):
+                    timeout = self.widen_llm_timeout(type(exc).__name__)
+                    health.append(f"timeout->{timeout}s")
             except Exception as exc:  # noqa: BLE001 - keep the loop alive
                 error = f"{type(exc).__name__}: {exc}"
+                retryable = False  # auth/bad-request/tool faults: retrying wastes budget
                 logger.exception("Agent %s run failed", spec.id)
 
             # max(): a condenser that prunes events can make the count regress,
             # which would silently hand the agent turns back. Never regress.
             turns_now = max(before_turns, TurnCounter.count(conv))
-            turns_this_run = turns_now - before_turns
             spec.turns_used = turns_now
 
-            metrics = conv.state.stats.get_combined_metrics()
-            usage = metrics.accumulated_token_usage
-            spec.tokens = (
-                usage.prompt_tokens + usage.completion_tokens
-                + usage.cache_read_tokens + usage.cache_write_tokens
-            )
-            spec.cost_usd = float(metrics.accumulated_cost or 0.0)
+            if error is None and turns_now > before_turns:
+                break  # the endpoint answered and the agent made progress
+            if not retryable or attempt + 1 >= attempts:
+                break
 
-            status = str(conv.state.execution_status.value
-                         if hasattr(conv.state.execution_status, "value")
-                         else conv.state.execution_status)
-            limit_code = self._run_limit_code(conv, events_before)
-            budget_exhausted = limit_code in ("MaxIterationsReached", "MaxBudgetReached")
-
-            final_report = self._final_report(conv)
-            spec.last_report = final_report or spec.last_report
-            spec.last_error = error
-            spec.status = self._map_status(status, budget_exhausted, error)
-            spec.touch()
-            self.store.upsert_agent(spec)
-
+            if error is None:
+                # Ran clean but produced zero agent turns: an empty completion.
+                self.llm_empty_responses += 1
+                self._persist_llm_health()
+                health.append("empty_response")
+                logger.warning(
+                    "Agent %s produced no turns on run %s (attempt %d/%d); "
+                    "endpoint likely unhealthy", spec.id, spec.runs,
+                    attempt + 1, attempts,
+                )
+            retries += 1
+            if cfg.adaptive_timeout:
+                self.widen_llm_timeout("no_progress")
             self.store.add_event(
-                "agent_run_finished",
-                f"{spec.role} finished run {spec.runs}: status={spec.status}, "
-                f"turns={spec.turns_used}/{spec.turn_limit}.",
+                "llm_retry",
+                f"Retrying {spec.role} (attempt {attempt + 2}/{attempts}) after "
+                f"{'no output' if error is None else error}; "
+                f"timeout now {self.llm_timeout}s.",
                 project_id=spec.project_id, agent_id=spec.id, task_id=spec.task_id,
             )
             self.store.flush()
 
-            return RunOutcome(
-                turns_used=spec.turns_used,
-                turns_this_run=turns_this_run,
-                status=spec.status,
-                final_report=final_report,
-                budget_exhausted=budget_exhausted,
-                tokens=spec.tokens,
-                cost_usd=spec.cost_usd,
-                error=error,
-            )
+        turns_now = max(before_turns, spec.turns_used)
+        turns_this_run = turns_now - before_turns
+        spec.turns_used = turns_now
+
+        metrics = conv.state.stats.get_combined_metrics()
+        usage = metrics.accumulated_token_usage
+        spec.tokens = (
+            (usage.prompt_tokens + usage.completion_tokens
+             + usage.cache_read_tokens + usage.cache_write_tokens)
+            if usage else 0
+        )
+        spec.cost_usd = float(metrics.accumulated_cost or 0.0)
+
+        status = str(conv.state.execution_status.value
+                     if hasattr(conv.state.execution_status, "value")
+                     else conv.state.execution_status)
+        limit_code = self._run_limit_code(conv, events_before)
+        budget_exhausted = limit_code in ("MaxIterationsReached", "MaxBudgetReached")
+        no_progress = turns_this_run == 0 and not budget_exhausted
+
+        final_report = self._final_report(conv)
+        spec.last_report = final_report or spec.last_report
+        spec.last_error = error
+        spec.status = self._map_status(status, budget_exhausted, error, no_progress)
+        spec.touch()
+        self.store.upsert_agent(spec)
+
+        self.store.add_event(
+            "agent_run_finished",
+            f"{spec.role} finished run {spec.runs}: status={spec.status}, "
+            f"turns={spec.turns_used}/{spec.turn_limit}"
+            + (f", llm_retries={retries}" if retries else "") + ".",
+            project_id=spec.project_id, agent_id=spec.id, task_id=spec.task_id,
+        )
+        self.store.flush()
+
+        return RunOutcome(
+            turns_used=spec.turns_used,
+            turns_this_run=turns_this_run,
+            status=spec.status,
+            final_report=final_report,
+            budget_exhausted=budget_exhausted,
+            tokens=spec.tokens,
+            cost_usd=spec.cost_usd,
+            error=error,
+            llm_retries=retries,
+            llm_health=",".join(health) if health else None,
+        )
 
     @staticmethod
-    def _map_status(status: str, budget_exhausted: bool, error: str | None) -> str:
+    def _map_status(status: str, budget_exhausted: bool, error: str | None,
+                    no_progress: bool = False) -> str:
         if budget_exhausted:
             return "budget_exhausted"
         if error:
             return "failed"
+        if no_progress:
+            # The endpoint answered with nothing; this is an infrastructure
+            # problem, not an agent that ran out of ideas.
+            return "llm_unavailable"
         if status in ("finished", "idle"):
             return "idle"
         if status in ("error", "stuck"):
@@ -309,6 +585,8 @@ class AgentRuntime:
             self.store.upsert_agent(spec)
 
     def close(self, agent_id: str) -> None:
+        with self._llm_lock:
+            self._llms.pop(agent_id, None)
         with self._lock:
             conv = self._conversations.pop(agent_id, None)
             if conv is not None:

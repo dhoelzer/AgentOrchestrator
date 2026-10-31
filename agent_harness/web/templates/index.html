@@ -76,6 +76,15 @@
   .dot.failed { background:var(--err); }
   .dot.paused { background:var(--warn); }
   .dot.waiting_budget { background:var(--warn); }
+  .dot.llm_unavailable { background:var(--err); box-shadow:0 0 6px var(--err); }
+  .pill.warn { border-color:var(--warn); color:var(--warn); }
+  .pill.warn b { color:var(--warn); }
+  form.settings { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+  form.settings label { display:flex; flex-direction:column; gap:4px; font-size:12px;
+    color:var(--dim); }
+  form.settings input { background:var(--bg); color:var(--text); border:1px solid var(--line);
+    border-radius:8px; padding:8px 10px; font:inherit; }
+  .blocked-reason { color:var(--warn); font-size:11px; margin-top:4px; }
   .kv { color:var(--dim); font-size:11px; font-variant-numeric:tabular-nums; }
   .grid2 { display:grid; grid-template-columns:1.4fr 1fr; gap:20px; }
   .feed { max-height:420px; overflow:auto; }
@@ -110,8 +119,10 @@
   <span class="pill" id="tickPill">tick: <b>…</b></span>
   <span class="pill" id="budgetPill">sub-agent budget: <b>…</b></span>
   <span class="pill" id="runPill">running: <b>0</b></span>
+  <span class="pill" id="llmPill">llm: <b>—</b></span>
   <span class="spacer"></span>
   <button id="tickBtn">Run cycle now</button>
+  <button id="settingsBtn">Settings</button>
 </header>
 
 <main>
@@ -132,6 +143,28 @@
 </main>
 
 <dialog id="detail"><div class="inner" id="detailBody"></div></dialog>
+
+<dialog id="settings"><div class="inner">
+  <h3>Runtime settings</h3>
+  <p class="muted">Applies immediately. Turn limits and LLM settings take effect for new
+  agent runs; timeout and parallelism also apply to conversations already open.</p>
+  <form class="settings" id="settingsForm">
+    <label>Model<input name="llm.model"></label>
+    <label>Base URL<input name="llm.base_url"></label>
+    <label>API key<input name="llm.api_key" type="password" placeholder="(unchanged)"></label>
+    <label>LLM timeout (s)<input name="llm.request_timeout" type="number" min="1"></label>
+    <label>Max timeout (s)<input name="llm.max_request_timeout" type="number" min="1"></label>
+    <label>Empty-response retries<input name="llm.empty_response_retries" type="number" min="0"></label>
+    <label>Tick (s)<input name="tick_seconds" type="number" min="5"></label>
+    <label>Sub-agent turn limit<input name="sub_agent_turn_limit" type="number" min="1"></label>
+    <label>Parallel workers<input name="max_parallel_workers" type="number" min="1"></label>
+    <label>Max sub-agent depth<input name="max_sub_agent_depth" type="number" min="1"></label>
+    <label>Input $/token<input name="llm.input_cost_per_token" type="number" step="any" min="0"></label>
+    <label>Output $/token<input name="llm.output_cost_per_token" type="number" step="any" min="0"></label>
+  </form>
+  <div class="sec"><button class="primary" id="settingsSave" type="button">Apply</button>
+  <span class="muted" id="settingsMsg"></span></div>
+</div></dialog>
 
 <script src="/static/app.js"></script>
 </body>

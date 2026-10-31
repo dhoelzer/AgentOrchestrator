@@ -10,7 +10,14 @@
     "num_retries": 3,
     "drop_params": true,
     "native_tool_calling": true,
-    "reasoning_effort": null
+    "reasoning_effort": null,
+    "adaptive_timeout": true,
+    "min_request_timeout": 60,
+    "max_request_timeout": 3600,
+    "timeout_growth": 2.0,
+    "empty_response_retries": 2,
+    "input_cost_per_token": 2e-06,
+    "output_cost_per_token": 1.5e-05
   },
   "data_dir": "data",
   "projects_dir": "data/projects",

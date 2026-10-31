@@ -85,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         store.flush()
         return 0
 
-    app = build_api(config, store, orchestrator)
+    app = build_api(config, store, orchestrator, config_path=args.config)
 
     loop_thread = threading.Thread(
         target=orchestrator.run_forever, name="orchestrator", daemon=True

@@ -176,6 +176,14 @@ def worker_assignment_prompt(task: dict, *, turns_remaining: int,
             f"- {d}" for d in task["deliverables"]))
     if task.get("depends_on_notes"):
         parts.append("Notes from upstream work:\n" + task["depends_on_notes"])
+    if task.get("blocked_reason"):
+        parts.append(
+            "## This task was previously blocked\n"
+            f"Reason: {task['blocked_reason']}\n"
+            "Resolve that blocker first; do not repeat the work that caused it."
+        )
+    for directive in task.get("user_directives") or []:
+        parts.append(f"## Direction from the user\n{directive.get('text', '')}")
     if prior:
         parts.append(f"## Your previous progress on this task\n{prior}")
     parts.append(f"You have {turns_remaining} turns left in this budget.")

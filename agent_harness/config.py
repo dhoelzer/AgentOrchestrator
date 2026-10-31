@@ -25,6 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = REPO_ROOT / "data"
 
 
+def _truthy(value: str) -> bool:
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "")
+
+
 class LLMConfig(BaseModel):
     """OpenAI-compatible endpoint settings shared by every agent."""
 
@@ -43,23 +47,43 @@ class LLMConfig(BaseModel):
     native_tool_calling: bool = Field(default=True)
     reasoning_effort: str | None = Field(default=None)
 
+    # Local/self-hosted endpoints are often slow and occasionally return an
+    # empty completion. Rather than fail the task, the runtime grows the
+    # timeout on each timeout and retries empty replies.
+    adaptive_timeout: bool = Field(default=True)
+    min_request_timeout: int = Field(default=60)
+    max_request_timeout: int = Field(default=3600)
+    timeout_growth: float = Field(default=2.0)
+    empty_response_retries: int = Field(default=2)
+
+    # USD per token, used for cost accounting. Defaults price the preconfigured
+    # Qwen endpoint ($2/M input, $15/M output); litellm cannot price an unknown
+    # custom model on its own, so without these every run reports $0.00.
+    input_cost_per_token: float | None = Field(default=0.000002)
+    output_cost_per_token: float | None = Field(default=0.000015)
+
     def resolved_api_key(self) -> str:
         if self.api_key_env:
             return os.environ.get(self.api_key_env) or self.api_key
         return os.environ.get("HARNESS_LLM_API_KEY") or self.api_key
 
-    def build_llm(self, usage_id: str) -> LLM:
+    def build_llm(self, usage_id: str, timeout: int | None = None) -> LLM:
         """Build an SDK LLM bound to this endpoint.
 
         ``usage_id`` keeps per-agent metrics separate so the UI can attribute
-        token usage to a specific agent.
+        token usage to a specific agent. ``timeout`` overrides the configured
+        request timeout, which is how the runtime widens it after a slow reply.
         """
+        effective_timeout = timeout or self.request_timeout
         kwargs: dict[str, Any] = {
             "model": self.model,
             "api_key": self.resolved_api_key(),
             "base_url": self.base_url,
             "api_mode": "chat",
-            "timeout": self.request_timeout,
+            "timeout": effective_timeout,
+            # litellm derives stream_idle_timeout from `timeout`; set it
+            # explicitly so a widened hard timeout also widens the idle one.
+            "stream_idle_timeout": effective_timeout,
             "num_retries": self.num_retries,
             "drop_params": self.drop_params,
             "caching_prompt": False,
@@ -67,6 +91,10 @@ class LLMConfig(BaseModel):
             "retry_min_wait": 2,
             "retry_max_wait": 30,
         }
+        if self.input_cost_per_token is not None:
+            kwargs["input_cost_per_token"] = self.input_cost_per_token
+        if self.output_cost_per_token is not None:
+            kwargs["output_cost_per_token"] = self.output_cost_per_token
         if self.max_input_tokens:
             kwargs["max_input_tokens"] = self.max_input_tokens
         if self.max_output_tokens:
@@ -127,11 +155,32 @@ class HarnessConfig(BaseModel):
         for key, attr in (
             ("HARNESS_TICK_SECONDS", "tick_seconds"),
             ("HARNESS_SUB_AGENT_TURN_LIMIT", "sub_agent_turn_limit"),
+            ("HARNESS_ORCHESTRATOR_TURN_LIMIT", "orchestrator_turn_limit"),
             ("HARNESS_MAX_PARALLEL_WORKERS", "max_parallel_workers"),
+            ("HARNESS_MAX_SUB_AGENT_DEPTH", "max_sub_agent_depth"),
             ("HARNESS_PORT", "port"),
         ):
             if env.get(key):
                 setattr(cfg, attr, int(env[key]))
+        for key, attr in (
+            ("HARNESS_LLM_REQUEST_TIMEOUT", "request_timeout"),
+            ("HARNESS_LLM_MAX_REQUEST_TIMEOUT", "max_request_timeout"),
+            ("HARNESS_LLM_MIN_REQUEST_TIMEOUT", "min_request_timeout"),
+            ("HARNESS_LLM_NUM_RETRIES", "num_retries"),
+            ("HARNESS_LLM_EMPTY_RESPONSE_RETRIES", "empty_response_retries"),
+        ):
+            if env.get(key):
+                setattr(cfg.llm, attr, int(env[key]))
+        if env.get("HARNESS_LLM_TIMEOUT_GROWTH"):
+            cfg.llm.timeout_growth = float(env["HARNESS_LLM_TIMEOUT_GROWTH"])
+        if env.get("HARNESS_LLM_ADAPTIVE_TIMEOUT") is not None:
+            cfg.llm.adaptive_timeout = _truthy(env["HARNESS_LLM_ADAPTIVE_TIMEOUT"])
+        for key, attr in (
+            ("HARNESS_LLM_INPUT_COST_PER_TOKEN", "input_cost_per_token"),
+            ("HARNESS_LLM_OUTPUT_COST_PER_TOKEN", "output_cost_per_token"),
+        ):
+            if env.get(key):
+                setattr(cfg.llm, attr, float(env[key]))
         if env.get("HARNESS_HOST"):
             cfg.host = env["HARNESS_HOST"]
 
