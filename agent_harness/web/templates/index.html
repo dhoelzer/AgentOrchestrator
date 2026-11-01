@@ -108,12 +108,15 @@
   .dot.llm_unavailable { background:var(--err); box-shadow:0 0 6px var(--err); }
   .pill.warn { border-color:var(--warn); color:var(--warn); }
   .pill.warn b { color:var(--warn); }
+  .pill.ver { border-color:var(--accent); color:var(--accent); font-weight:600;
+    vertical-align:middle; margin-left:6px; }
   form.settings { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
   form.settings label { display:flex; flex-direction:column; gap:4px; font-size:12px;
     color:var(--dim); }
   form.settings input { background:var(--bg); color:var(--text); border:1px solid var(--line);
     border-radius:8px; padding:8px 10px; font:inherit; }
   .blocked-reason { color:var(--warn); font-size:11px; margin-top:4px; }
+  .blocked-reason .fix { display:block; color:var(--dim); margin-top:2px; }
   .kv { color:var(--dim); font-size:11px; font-variant-numeric:tabular-nums; }
   .grid2 { display:grid; grid-template-columns:1.4fr 1fr; gap:20px; }
   .feed { max-height:420px; overflow:auto; }
@@ -143,7 +146,7 @@
 </head>
 <body>
 <header>
-  <h1>Orchestrator Harness</h1>
+  <h1>Orchestrator Harness <span class="pill ver" id="versionPill" title="Harness build version">v—</span></h1>
   <span class="pill" id="modelPill">model: <b>…</b></span>
   <span class="pill" id="tickPill">tick: <b>…</b></span>
   <span class="pill" id="budgetPill">sub-agent budget: <b>…</b></span>

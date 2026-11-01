@@ -94,6 +94,10 @@ class TaskSpec(_Model):
     # since. Directives are queued so the orchestrator cannot miss one that
     # arrives mid-cycle.
     blocked_reason: str | None = None
+    # Machine-readable class of `blocked_reason`. Lets reconcile() tell a block
+    # that resolves itself (upstream deps landed) from one needing judgement
+    # (budget, LLM outage) without pattern-matching prose.
+    blocked_cause: str | None = None
     user_directives: list[dict] = Field(default_factory=list)
 
     result_summary: str | None = None
@@ -141,6 +145,12 @@ class AgentSpec(_Model):
     runs: int = 0
     tokens: int = 0
     cost_usd: float = 0.0
+    # Spend/tokens from conversations this agent already closed. A fresh
+    # conversation restarts the SDK's accumulated metrics at 0, so without this
+    # baseline reconfigure_agent(fresh_conversation=True) would silently erase
+    # every dollar the agent had already spent.
+    prior_cost_usd: float = 0.0
+    prior_tokens: int = 0
 
     last_report: str | None = None
     last_error: str | None = None
@@ -323,6 +333,9 @@ class Store:
         self.agents = self._load_records(
             data.get("agents", []), AgentSpec, "agent", self._repair_agent)
         self.meta = data.get("meta", {})
+        # Which build wrote this file, kept separate from the running build so a
+        # version mismatch stays visible after meta is overwritten on save.
+        self.meta["harness_version_stored"] = self.meta.get("harness_version")
         if self.events_path.exists():
             lines = self.events_path.read_text().splitlines()[-400:]
             for line in lines:

@@ -7,6 +7,11 @@ const state = { data: null, openProjects: new Set(), tab: "board" };
 
 const money = (v) => "$" + (Number(v || 0)).toFixed(4).replace(/0+$/, "").replace(/\.$/, ".00");
 
+// A card with no worker has no spend to report; showing $0.00 there reads as a
+// bug, so distinguish "nobody has worked on this" from "worked for free".
+const cardCost = (t) =>
+  t.assigned_agent_id ? money(t.cost_usd) : '<span class="muted">no spend</span>';
+
 function agoLabel(ts) {
   if (!ts) return "never";
   // Cycle timestamps are epoch seconds; store records (revisions, events) are ISO.
@@ -26,6 +31,11 @@ function turnsClass(used, limit) {
 }
 
 function renderHeader(d) {
+  const ver = d.meta.harness_version || "unknown";
+  const stored = d.meta.harness_version_stored;
+  $("#versionPill").textContent = "v" + ver;
+  $("#versionPill").title = `Harness build ${ver}` +
+    (stored && stored !== ver ? ` — state.json last written by ${stored}` : "");
   $("#modelPill").innerHTML = `model: <b>${esc(d.config.model)}</b>`;
   $("#tickPill").innerHTML = `tick: <b>${d.config.tick_seconds}s</b>`;
   $("#budgetPill").innerHTML = `sub-agent budget: <b>${d.config.sub_agent_turn_limit} turns</b>`;
@@ -88,6 +98,17 @@ function renderAlerts(d) {
     .join("");
 }
 
+// What will clear each kind of block, so a blocked card tells the user whether
+// they need to act or the harness will resolve it on the next cycle.
+const BLOCK_FIX = {
+  budget: "grant more turns to re-run",
+  llm: "retries automatically once the endpoint recovers",
+  worker: "the worker will re-check the blocker when re-dispatched",
+  agent_failed: "re-dispatch, or reconfigure the agent",
+  dependency: "clears itself when upstream tasks finish",
+  manual: "needs your direction — add one below",
+};
+
 function taskCard(t) {
   return `<div class="task" data-task="${t.id}">
     <div class="t">${esc(t.title)}</div>
@@ -96,9 +117,14 @@ function taskCard(t) {
       <span class="${turnsClass(t.turns_used, t.turn_limit)}">${t.turns_used}/${t.turn_limit} turns</span>
       ${t.review_rounds ? `<span class="tag">review ×${t.review_rounds}</span>` : ""}
       ${t.review_verdict ? `<span class="tag">${esc(t.review_verdict)}</span>` : ""}
-      ${t.assigned_agent_id ? `<span class="tag">🤖 ${esc(t.assigned_agent_id)}</span>` : ""}
+      ${t.assigned_agent_id ? `<span class="tag">🤖 ${esc(t.agent_role || t.assigned_agent_id)}</span>` : ""}
+      <span class="kv cost" title="${t.assigned_agent_id
+        ? `Spend by ${esc(t.agent_role || t.assigned_agent_id)} on this card`
+        : "No worker assigned yet"}">${cardCost(t)}</span>
     </div>
-    ${t.blocked_reason ? `<div class="blocked-reason">⚠ ${esc(t.blocked_reason)}</div>` : ""}
+    ${t.blocked_reason ? `<div class="blocked-reason">⚠ ${esc(t.blocked_reason)}
+      <span class="fix">${esc(BLOCK_FIX[t.blocked_cause] || "will be re-checked next cycle")}</span>
+    </div>` : ""}
   </div>`;
 }
 
@@ -225,7 +251,10 @@ async function showTask(projectId, taskId) {
     <div class="sec"><h5>Review (${esc(t.review_verdict || "pending")}, round ${t.review_rounds})</h5>
       <pre>${esc(t.review_feedback || "—")}</pre></div>
     <div class="sec"><h5>Orchestrator note</h5><pre>${esc(t.orchestrator_note || "—")}</pre></div>
-    <div class="sec"><h5>Blocked</h5><pre>${esc(t.blocked_reason || "not blocked")}</pre></div>
+    <div class="sec"><h5>Blocked</h5><pre>${t.blocked_reason
+      ? `${esc(t.blocked_reason)}\ncause: ${esc(t.blocked_cause || "unknown")}\n` +
+        `resolution: ${esc(BLOCK_FIX[t.blocked_cause] || "re-checked next cycle")}`
+      : "not blocked"}</pre></div>
     <div class="sec"><h5>Direction for the next run</h5>
       <pre>${esc((t.user_directives || []).map((x) => `[${x.at}] ${x.text}`).join("\n") || "—")}</pre>
       <div style="display:flex;gap:8px;margin-top:8px">

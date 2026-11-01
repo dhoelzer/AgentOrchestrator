@@ -298,8 +298,11 @@ class UpdateTaskExecutor(ToolExecutor):
             task.column = action.column
             if action.column != "blocked":
                 task.blocked_reason = None
+                task.blocked_cause = None
         if action.blocked_reason:
             task.blocked_reason = action.blocked_reason
+            # A manual block from the orchestrator always needs judgement.
+            task.blocked_cause = "manual"
         for attr in ("title", "objective", "expertise"):
             value = getattr(action, attr)
             if value is not None:
@@ -601,15 +604,38 @@ def _dispatch(agent: AgentSpec, task: TaskSpec | None, message: str,
             task.blocked_reason = (
                 f"agent {agent.id} used all {agent.turn_limit} turns"
             )
+            task.blocked_cause = "budget"
         elif outcome.status == "llm_unavailable":
             task.column = "blocked"
             task.blocked_reason = (
                 "LLM endpoint returned no output; request timeout is now "
                 f"{c.runtime.llm_timeout}s"
             )
-        elif task.column == "in_progress":
+            task.blocked_cause = "llm"
+        elif outcome.status == "failed" or outcome.error:
+            task.column = "blocked"
+            task.blocked_cause = "agent_failed"
+            task.blocked_reason = (
+                f"agent {agent.id} failed: {outcome.error or outcome.status}"
+            )
+        elif not review and task.column in ("blocked", "rework", "in_progress"):
+            # A run that did not fail or run out of budget means whatever was
+            # holding the card (a block, review feedback) is no longer holding
+            # it. Move it forward and clear the stale reason; leaving a card in
+            # 'blocked' after a clean run is what makes the board lie. Reviewer
+            # dispatches are excluded: their verdict moves the card via
+            # record_review.
             task.column = "review"
+            if task.blocked_reason:
+                c.store.add_event(
+                    "task_unblocked",
+                    f"Task '{task.title}' ran clean; cleared block "
+                    f"'{task.blocked_reason}'.",
+                    project_id=task.project_id, task_id=task.id,
+                    agent_id=agent.id,
+                )
             task.blocked_reason = None
+            task.blocked_cause = None
         task.touch()
 
     c.store.add_event(
@@ -651,8 +677,12 @@ class ExtendAgentExecutor(ToolExecutor):
         if agent.task_id and agent.task_id in c.store.tasks:
             task = c.store.tasks[agent.task_id]
             task.turn_limit = agent.turn_limit
-            if task.column == "blocked":
+            # Granting turns resolves a budget block, so the stale reason goes
+            # with it; any other cause still stands.
+            if task.column == "blocked" and task.blocked_cause == "budget":
                 task.column = "ready"
+                task.blocked_reason = None
+                task.blocked_cause = None
             task.touch()
         c.store.add_event(
             "budget_extended",
@@ -722,8 +752,14 @@ class ReconfigureAgentExecutor(ToolExecutor):
             if not agent.is_reviewer and task.assigned_agent_id == agent.id:
                 task.turns_used = agent.turns_used
                 task.turn_limit = agent.turn_limit
-            if task.column == "blocked":
+            # Reconfiguring the agent resolves blocks that were about the agent
+            # itself (budget, LLM, its own report); a dependency or user-input
+            # block still stands, so its reason stays visible.
+            if task.column == "blocked" and task.blocked_cause in (
+                    "budget", "llm", "worker"):
                 task.column = "ready"
+                task.blocked_reason = None
+                task.blocked_cause = None
             task.touch()
 
         c.store.add_event(
@@ -918,6 +954,12 @@ class ReportToParentAction(Action):
     deliverables: list[str] = Field(default_factory=list,
                                     description="Files you created or changed.")
     concerns: str | None = Field(default=None, description="Risks, unknowns, next steps.")
+    blocker: str | None = Field(
+        default=None,
+        description="If status is 'blocked': what is blocking you NOW, and what would "
+                    "unblock it. If you resolved the blocker you were dispatched with, "
+                    "leave this empty and report 'complete' or 'partial' so the board "
+                    "clears the stale block.")
 
 
 class ReportToParentExecutor(ToolExecutor):
@@ -937,12 +979,37 @@ class ReportToParentExecutor(ToolExecutor):
             task.result_summary = agent.last_report
             if action.deliverables:
                 task.deliverables = list(dict.fromkeys(task.deliverables + action.deliverables))
+            # The worker on the card is the authority on whether it is still
+            # blocked: it just checked. Restate a new reason, or clear the old
+            # one once the blocker is confirmed gone.
+            if action.status == "blocked":
+                task.column = "blocked"
+                task.blocked_reason = action.blocker or (
+                    f"{agent.role} reported blocked without a reason"
+                )
+                task.blocked_cause = "worker"
+            elif task.column == "blocked":
+                c.store.add_event(
+                    "task_unblocked",
+                    f"Task '{task.title}' confirmed unblocked by {agent.role} "
+                    f"(was blocked: {task.blocked_reason or 'no reason recorded'}).",
+                    project_id=task.project_id, task_id=task.id, agent_id=agent.id,
+                )
+                task.column = "in_progress"
+                task.blocked_reason = None
+                task.blocked_cause = None
             task.touch()
+            c.store.upsert_task(task)
         c.store.add_event(
             "agent_report", f"{agent.role} reported {action.status}: {action.summary[:400]}",
             project_id=agent.project_id, agent_id=agent.id, task_id=agent.task_id,
         )
         c.store.flush()
+        if action.status == "blocked":
+            return _ok(
+                "Report filed and the card is marked blocked with your reason. "
+                "Now call `finish` with the same summary so the orchestrator can act."
+            )
         return _ok(
             "Report filed. Now call `finish` with the same summary - your turn budget "
             "is reserved for implementation, not re-explaining."

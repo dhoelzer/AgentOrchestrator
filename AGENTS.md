@@ -24,6 +24,7 @@ docker compose up -d --build          # containerized + Docker-in-Docker sidecar
 python tests/test_board_mechanics.py   # no LLM needed; fast, run this first
 python tests/test_runtime_and_config.py  # no LLM needed
 python tests/test_dashboard_features.py  # no LLM needed; removal, orphans, costs
+python tests/test_blocks_cost_version.py # no LLM needed; block causes, card cost, version
 python tests/test_e2e_llm.py 3         # needs the configured LLM endpoint
 python tests/test_turn_budget.py       # needs the configured LLM endpoint
 ```
@@ -31,6 +32,12 @@ python tests/test_turn_budget.py       # needs the configured LLM endpoint
 `test_board_mechanics.py` covers the whole board/delegation/review/delivery surface
 without an LLM. Prefer extending it over the LLM-backed tests when changing mechanics —
 the LLM tests take minutes and are non-deterministic.
+
+The LLM-backed tests print a `ConversationRunError: cannot schedule new futures
+after shutdown` traceback for one agent near the end. That is litellm's thread
+pool being torn down at interpreter exit while a background run is still
+finishing — it is logged by `_run_guarded`, does not fail the run, and the test
+still exits 0. Judge these tests by exit code, not by absence of ERROR lines.
 
 ## Non-obvious SDK facts
 
@@ -102,6 +109,32 @@ the LLM tests take minutes and are non-deterministic.
   way — `_dispatch`, `assign_task`, and `reconfigure_agent` — because the
   orchestrator reaches all of them with a reviewer attached to a task.
 
+## Blocked tasks: cause, and who may clear it
+
+- `TaskSpec.blocked_reason` is prose for humans; `TaskSpec.blocked_cause` is the
+  machine-readable class the harness branches on. **Always set both together**,
+  and clear both together. A card left in `blocked` with a stale reason is the
+  bug this section exists to prevent.
+- Causes: `budget` (turn limit hit), `llm` (endpoint returned nothing),
+  `agent_failed`, `worker` (the sub-agent reported blocked), `manual`
+  (orchestrator blocked it, usually awaiting the user), `dependency`.
+- Each cause has exactly one resolver, and it must clear the reason:
+  `budget` -> `extend_agent`; `budget`/`llm`/`worker` -> `reconfigure_agent`;
+  `dependency` -> `reconcile()` when upstream deps reach `done`; any -> a clean
+  re-dispatch through `_dispatch`, or a user directive via the directives
+  endpoint. `_dispatch` moves `blocked`/`rework`/`in_progress` to `review` on a
+  clean run — that is deliberate, a clean run means the blocker is gone.
+- `reconcile()` only auto-clears when deps are satisfied AND the cause is not
+  `budget`/`llm`/`manual`: those need judgement, so they stay for the cycle
+  briefing. Do not widen that set without a briefing-side equivalent.
+- `report_to_parent` gained a `blocker` field: a worker reporting `blocked`
+  restates the CURRENT reason; reporting `complete`/`partial` on a blocked card
+  clears it. The worker on the card is the authority — it just re-checked.
+- Reviewer dispatches are excluded from the `_dispatch` clean-run transition;
+  their verdict moves the card through `record_review`.
+- `BLOCK_FIX` in `app.js` mirrors the cause list for the UI. Update it when you
+  add a cause, or cards render the generic fallback.
+
 ## Dashboard: removal, cost, cycle freshness
 
 - Removing a project has three modes, all of which set `Project.status = "removed"`:
@@ -116,6 +149,19 @@ the LLM tests take minutes and are non-deterministic.
 - Cost is stored per agent (`AgentSpec.cost_usd`) and summed on demand by
   `Store.project_cost()`. There is no cached project total, so the per-agent
   figures always reconcile to the project total and the harness total.
+- SDK metrics are **per conversation**: a fresh conversation restarts
+  `accumulated_cost` at 0. Keep the invariant `cost_usd == prior_cost_usd +
+  current conversation spend`, which is what `run()` writes. `prior_*` is the
+  spend from already-closed conversations. `reset_conversation()` sets
+  `prior_* = cost_usd` (idempotent) and leaves `cost_usd` alone, so the board
+  never shows a `$0` agent between the reset and the next run. Zeroing
+  `cost_usd` on reset silently deletes an agent's spend — the bug these fields
+  exist to prevent. Do not write `prior += cost_usd`: `cost_usd` already
+  contains `prior`, so that double-counts on a second reset.
+- Kanban cards show cost by mirroring the assigned agent (`_task_json(...,
+  agents=store.agents)`). Cost is never stored on the card; if you add a cost
+  field, derive it, do not persist it. Unassigned cards render "no spend" rather
+  than `$0.00`, which reads as a bug.
 - Cycle metadata lives in `store.meta`: `cycle_started_at`/`cycle_status` are
   written *before* a cycle runs, `_record_cycle_end()` writes `last_tick`,
   `last_cycle_completed_at`, `last_cycle_attempt_at`, `cycle_count` and
@@ -204,3 +250,20 @@ the LLM tests take minutes and are non-deterministic.
 - Old state files have no version fields; `Store` loads them at `0.1`/empty log.
   Keep the `Project` field defaults rather than making them required, or
   upgrading breaks state loading.
+
+## Harness version (distinct from project version)
+
+- `agent_harness/version.py::__version__` is the **build** version of the harness
+  itself. Bump it on every change to the harness: patch = fixes/copy, minor = new
+  tools, endpoints, or backwards-compatible persisted fields, major = breaking
+  change to config, state schema, or the board model.
+- `version_string()` appends the git SHA from a checkout (`1.2.0+abc1234`) and is
+  bare inside an image. Set `HARNESS_GIT_SHA` to pin it in a build.
+- It surfaces in the dashboard header pill, `/health`, `/api/state`
+  (`meta.harness_version`), and FastAPI's OpenAPI info. This matters because the
+  stack bind-mounts its data volume: a container that was not rebuilt serves an
+  old build against new data, and that is otherwise invisible.
+- `Store._load()` copies the on-disk `meta.harness_version` into
+  `meta.harness_version_stored` before it is overwritten, so the header tooltip
+  can name the build that last wrote `state.json`. Do not read
+  `meta.harness_version` for that comparison — it is the running build.

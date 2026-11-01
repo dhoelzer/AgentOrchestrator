@@ -180,7 +180,13 @@ def worker_assignment_prompt(task: dict, *, turns_remaining: int,
         parts.append(
             "## This task was previously blocked\n"
             f"Reason: {task['blocked_reason']}\n"
-            "Resolve that blocker first; do not repeat the work that caused it."
+            "First, check whether that blocker still applies - another agent may have "
+            "resolved it, or the user may have supplied direction. Then:\n"
+            "- If it is resolved: proceed with the work and report status 'complete' or "
+            "'partial' with no `blocker` field. That clears the block on the board.\n"
+            "- If it still applies, or something else now blocks you: stop and call "
+            "`report_to_parent` with status 'blocked' and `blocker` set to the CURRENT "
+            "reason plus what would unblock it. Do not repeat the work that caused it."
         )
     for directive in task.get("user_directives") or []:
         parts.append(f"## Direction from the user\n{directive.get('text', '')}")

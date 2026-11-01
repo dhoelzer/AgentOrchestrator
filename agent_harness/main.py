@@ -21,6 +21,7 @@ from .orchestrator import Orchestrator
 from .runtime import AgentRuntime
 from .store import Store
 from .tools import register_harness_tools
+from .version import version_string
 from .web.api import build_api
 
 logger = logging.getLogger("harness")
@@ -73,10 +74,17 @@ def main(argv: list[str] | None = None) -> int:
     runtime = AgentRuntime(config, store)
     orchestrator = Orchestrator(config, store, runtime)
 
+    logger.info("Orchestrator harness v%s", version_string())
     logger.info("LLM: model=%s base_url=%s", config.llm.model, config.llm.base_url)
     logger.info("Sub-agent turn limit: %s | tick: %ss",
                 config.sub_agent_turn_limit, config.tick_seconds)
     logger.info("Data dir: %s", config.root_dir)
+    stored = store.meta.get("harness_version_stored")
+    if stored and stored != version_string():
+        logger.warning("state.json was last written by harness %s (running %s)",
+                       stored, version_string())
+    store.meta["harness_version"] = version_string()
+    store.flush()
 
     if args.once:
         reports = orchestrator.run_cycle()

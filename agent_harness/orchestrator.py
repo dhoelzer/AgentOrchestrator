@@ -73,16 +73,34 @@ class Orchestrator:
         """Deterministic board transitions that need no judgement."""
         for project in self.store.visible_projects():
             for task in self.store.project_tasks(project.id):
-                # A backlog task with satisfied dependencies is ready to staff.
-                if task.column == "backlog" and all(
+                deps_met = all(
                     d in self.store.tasks and self.store.tasks[d].column == "done"
                     for d in task.depends_on
-                ):
+                )
+                # A backlog task with satisfied dependencies is ready to staff.
+                if task.column == "backlog" and deps_met:
                     task.column = "ready"
                     task.touch()
                     self.store.add_event(
                         "task_unblocked",
                         f"Task '{task.title}' dependencies satisfied -> ready.",
+                        project_id=project.id, task_id=task.id,
+                    )
+                # A card blocked on upstream work is no longer blocked once that
+                # work lands - another agent resolved it, so re-queue it rather
+                # than waiting on judgement. Blocks the harness itself wrote for
+                # a reason that dependencies cannot fix (budget, LLM outage) stay
+                # put for the cycle briefing.
+                elif (task.column == "blocked" and deps_met and task.depends_on
+                      and task.blocked_cause not in ("budget", "llm", "manual")):
+                    task.column = "ready"
+                    task.blocked_reason = None
+                    task.blocked_cause = None
+                    task.touch()
+                    self.store.add_event(
+                        "task_unblocked",
+                        f"Task '{task.title}' unblocked: upstream dependencies "
+                        "are now done.",
                         project_id=project.id, task_id=task.id,
                     )
 

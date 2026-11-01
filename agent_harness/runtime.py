@@ -481,12 +481,15 @@ class AgentRuntime:
 
         metrics = conv.state.stats.get_combined_metrics()
         usage = metrics.accumulated_token_usage
-        spec.tokens = (
+        # Metrics are per-conversation: a fresh conversation restarts them at 0,
+        # so the agent's lifetime total is this conversation plus the baseline
+        # rolled over by reset_conversation.
+        spec.tokens = spec.prior_tokens + (
             (usage.prompt_tokens + usage.completion_tokens
              + usage.cache_read_tokens + usage.cache_write_tokens)
             if usage else 0
         )
-        spec.cost_usd = float(metrics.accumulated_cost or 0.0)
+        spec.cost_usd = spec.prior_cost_usd + float(metrics.accumulated_cost or 0.0)
 
         status = str(conv.state.execution_status.value
                      if hasattr(conv.state.execution_status, "value")
@@ -590,8 +593,12 @@ class AgentRuntime:
             spec.persistence_dir = None
             spec.turns_used = 0
             spec.runs = 0
-            spec.tokens = 0
-            spec.cost_usd = 0.0
+            # The closing conversation's spend is exactly (cost_usd - prior),
+            # since run() keeps cost_usd at prior + current conversation. So the
+            # new baseline is just cost_usd - not prior += cost_usd, which would
+            # double-count if a reset ever ran twice.
+            spec.prior_cost_usd = spec.cost_usd
+            spec.prior_tokens = spec.tokens
             spec.status = "idle"
             spec.touch()
             self.store.upsert_agent(spec)

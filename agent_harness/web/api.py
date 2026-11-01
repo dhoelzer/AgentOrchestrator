@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from ..config import HarnessConfig
 from ..orchestrator import Orchestrator
 from ..store import KANBAN_COLUMNS, AgentSpec, Store
+from ..version import __version__, version_string
 
 TEMPLATES = Path(__file__).parent / "templates"
 
@@ -31,7 +32,7 @@ class ProjectForm(BaseModel):
 
 def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
               config_path: str | None = None) -> FastAPI:
-    app = FastAPI(title="Orchestrator Harness", version="1.0")
+    app = FastAPI(title="Orchestrator Harness", version=__version__)
     app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")),
               name="static")
 
@@ -50,6 +51,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
     def health() -> dict:
         return {
             "ok": True,
+            "harness_version": version_string(),
             "model": config.llm.model,
             "base_url": config.llm.base_url,
             "tick_seconds": config.tick_seconds,
@@ -62,7 +64,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
     def state() -> dict:
         projects = []
         for project in store.visible_projects():
-            board = {col: [_task_json(t) for t in items]
+            board = {col: [_task_json(t, agents=store.agents) for t in items]
                      for col, items in store.board(project.id).items()}
             revisions = list(reversed(project.revision_log))
             projects.append({
@@ -92,7 +94,11 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                 "sub_agent_turn_limit": config.sub_agent_turn_limit,
                 "orchestrator_turn_limit": config.orchestrator_turn_limit,
             },
-            "meta": {"last_tick": store.meta.get("last_tick"),
+            "meta": {"harness_version": version_string(),
+                     # Build that last wrote state.json: differs from the running
+                     # build when a container was not rebuilt against new data.
+                     "harness_version_stored": store.meta.get("harness_version_stored"),
+                     "last_tick": store.meta.get("last_tick"),
                      "inflight": sorted(orchestrator.runtime.inflight),
                      "llm": _llm_health(orchestrator),
                      "cycle": _cycle_status(store, config.tick_seconds)},
@@ -314,9 +320,20 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
         # A user speaking up is exactly the event that should put a stalled task
-        # back in play; the next cycle's briefing will carry the directive.
+        # back in play; the next cycle's briefing will carry the directive. The
+        # block is answered, so its reason goes with it - otherwise the card
+        # keeps advertising a blocker the user has already resolved.
         if task.column == "blocked":
+            cleared = task.blocked_reason
             task.column = "ready"
+            task.blocked_reason = None
+            task.blocked_cause = None
+            if cleared:
+                store.add_event(
+                    "task_unblocked",
+                    f"Task '{task.title}' unblocked by user direction "
+                    f"(was blocked: {cleared}).",
+                    project_id=project_id, task_id=task_id)
         task.touch()
         store.add_event("user_directive", f"User direction on '{task.title}': {text}",
                         project_id=project_id, task_id=task_id)
@@ -335,7 +352,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         task = store.tasks.get(task_id)
         if task is None or task.project_id != project_id:
             raise HTTPException(404, "Unknown task")
-        return _task_json(task, full=True)
+        return _task_json(task, full=True, agents=store.agents)
 
     @app.get("/api/projects/{project_id}/agents/{agent_id}")
     def agent_detail(project_id: str, agent_id: str) -> dict:
@@ -366,7 +383,10 @@ def _llm_health(orchestrator: Orchestrator) -> dict:
     }
 
 
-def _task_json(task, full: bool = False) -> dict:
+def _task_json(task, full: bool = False, agents: dict | None = None) -> dict:
+    # Cost lives on the agent, not the card; mirror it here so the kanban card
+    # shows what its worker has actually spent.
+    agent = (agents or {}).get(task.assigned_agent_id or "")
     data = {
         "id": task.id, "title": task.title, "expertise": task.expertise,
         "column": task.column, "assigned_agent_id": task.assigned_agent_id,
@@ -376,6 +396,10 @@ def _task_json(task, full: bool = False) -> dict:
         "depends_on": task.depends_on,
         "review_verdict": task.review_verdict,
         "blocked_reason": task.blocked_reason,
+        "blocked_cause": task.blocked_cause,
+        "cost_usd": agent.cost_usd if agent else None,
+        "agent_role": agent.role if agent else None,
+        "agent_status": agent.status if agent else None,
         "updated_at": task.updated_at,
     }
     if full:
