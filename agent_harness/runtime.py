@@ -31,7 +31,7 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.security.confirmation_policy import AlwaysConfirm, NeverConfirm
 
 from .config import HarnessConfig
-from .store import AgentSpec, Store
+from .store import AGENT_STATUSES, AgentSpec, Store
 
 logger = get_logger(__name__)
 
@@ -527,6 +527,12 @@ class AgentRuntime:
     @staticmethod
     def _map_status(status: str, budget_exhausted: bool, error: str | None,
                     no_progress: bool = False) -> str:
+        """Map an SDK execution status onto a valid AgentStatus.
+
+        Total by construction: AgentSpec validates on assignment, so returning
+        anything outside AGENT_STATUSES would raise inside a live run. Unknown
+        values become 'failed' rather than being passed through.
+        """
         if budget_exhausted:
             return "budget_exhausted"
         if error:
@@ -535,11 +541,15 @@ class AgentRuntime:
             # The endpoint answered with nothing; this is an infrastructure
             # problem, not an agent that ran out of ideas.
             return "llm_unavailable"
-        if status in ("finished", "idle"):
-            return "idle"
-        if status in ("error", "stuck"):
-            return "failed"
-        return status
+        mapped = {
+            "finished": "idle", "idle": "idle",
+            "running": "running",
+            "paused": "paused",
+            # Only reachable with confirm_tools enabled.
+            "waiting_for_confirmation": "paused",
+            "error": "failed", "stuck": "failed", "deleting": "failed",
+        }.get(status)
+        return mapped if mapped in AGENT_STATUSES else "failed"
 
     @staticmethod
     def _run_limit_code(conv: Conversation, since: int) -> str | None:

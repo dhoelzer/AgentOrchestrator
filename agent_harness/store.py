@@ -7,14 +7,17 @@ orchestrator loop share one source of truth that survives restarts.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+logger = logging.getLogger(__name__)
 
 KANBAN_COLUMNS = [
     "backlog",
@@ -34,8 +37,15 @@ Column = Literal[
     "backlog", "ready", "in_progress", "review", "rework", "done", "blocked"
 ]
 AgentStatus = Literal[
-    "idle", "running", "waiting_budget", "budget_exhausted", "paused", "failed", "done"
+    "idle", "running", "waiting_budget", "budget_exhausted", "paused", "failed",
+    "done", "llm_unavailable",
 ]
+# Derived from the Literal so the repair path in Store._load can never drift
+# out of sync with the model.
+AGENT_STATUSES: tuple[str, ...] = get_args(AgentStatus)
+ProjectStatus = Literal["active", "ready_for_delivery", "delivered", "paused",
+                        "removed"]
+PROJECT_STATUSES: tuple[str, ...] = get_args(ProjectStatus)
 
 
 def now_iso() -> str:
@@ -46,7 +56,19 @@ def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
 
-class TaskSpec(BaseModel):
+class _Model(BaseModel):
+    """Base for persisted models.
+
+    validate_assignment matters here: the store flushes these objects to JSON
+    and re-validates them on load. Without it, an invalid field assignment is
+    accepted in memory, written to disk, and only surfaces as a crash on the
+    *next* startup — long after the code that caused it ran.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+
+class TaskSpec(_Model):
     """A unit of work on the board."""
 
     id: str = Field(default_factory=lambda: new_id("task"))
@@ -88,7 +110,7 @@ class TaskSpec(BaseModel):
         self.updated_at = now_iso()
 
 
-class AgentSpec(BaseModel):
+class AgentSpec(_Model):
     """A specialist agent in the hierarchy (orchestrator is the root)."""
 
     id: str = Field(default_factory=lambda: new_id("agent"))
@@ -129,7 +151,7 @@ class AgentSpec(BaseModel):
         self.updated_at = now_iso()
 
 
-class Project(BaseModel):
+class Project(_Model):
     """A long-running project owned by the orchestrator."""
 
     id: str = Field(default_factory=lambda: new_id("proj"))
@@ -137,8 +159,7 @@ class Project(BaseModel):
     goal: str
     constraints: str = ""
     workspace: str
-    status: Literal["active", "ready_for_delivery", "delivered", "paused",
-                    "removed"] = "active"
+    status: ProjectStatus = "active"
     delivery_signaled: bool = False
     delivered_at: str | None = None
     # When the project became ready_for_delivery. ready_generation increments on
@@ -173,7 +194,7 @@ class Project(BaseModel):
         self.updated_at = now_iso()
 
 
-class HarnessEvent(BaseModel):
+class HarnessEvent(_Model):
     """Append-only log line surfaced in the UI activity feed."""
 
     id: str = Field(default_factory=lambda: new_id("ev"))
@@ -183,6 +204,26 @@ class HarnessEvent(BaseModel):
     agent_id: str | None = None
     task_id: str | None = None
     message: str
+
+
+def _one_line(exc: Exception) -> str:
+    """Compact a pydantic ValidationError for a single log line.
+
+    str(exc) is multi-line and gets truncated by log shippers, which is exactly
+    when an operator needs to see which field was rejected.
+    """
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        try:
+            parts = []
+            for e in errors():
+                loc = ".".join(str(x) for x in (e.get("loc") or ())) or "?"
+                parts.append(f"{loc}: {e.get('msg')} (got {e.get('input')!r})")
+            if parts:
+                return "; ".join(parts)
+        except Exception:  # noqa: BLE001
+            pass
+    return " ".join(str(exc).split())
 
 
 class Store:
@@ -204,13 +245,83 @@ class Store:
 
     # ---------- persistence ----------
 
+    def _load_records(self, raw: list[dict], model: type[_Model], label: str,
+                      repair) -> dict[str, Any]:
+        """Validate records, repairing or dropping bad ones instead of dying.
+
+        A single malformed record must not brick startup: the harness is a
+        long-running service whose whole board lives in one JSON file, and an
+        unhandled error here means the container crash-loops with no way to
+        recover through the UI.
+        """
+        out: dict[str, Any] = {}
+        for record in raw:
+            try:
+                out[record["id"]] = model.model_validate(record)
+                continue
+            except Exception as exc:  # noqa: BLE001 - startup must not raise
+                first_error = exc
+            repaired = repair(record)
+            if repaired is None:
+                logger.error("Dropping unreadable %s record %r: %s",
+                             label, record.get("id"), _one_line(first_error))
+                continue
+            try:
+                obj = model.model_validate(repaired)
+            except Exception as exc2:  # noqa: BLE001
+                logger.error("Dropping unreadable %s record %r: %s",
+                             label, record.get("id"), _one_line(exc2))
+                continue
+            logger.warning("Repaired %s record %s: %s",
+                           label, obj.id, _one_line(first_error))
+            out[obj.id] = obj
+        return out
+
+    @staticmethod
+    def _repair_agent(record: dict) -> dict | None:
+        """Coerce an unknown agent status to 'failed', keeping the record.
+
+        Statuses are the field most likely to go stale across versions, and
+        'failed' is already surfaced as an alert, so a repaired agent stays
+        visible instead of silently vanishing from the board.
+        """
+        if "status" in record and record["status"] not in AGENT_STATUSES:
+            fixed = dict(record)
+            fixed["status"] = "failed"
+            fixed["last_error"] = (
+                f"(repaired on load: status {record['status']!r} is not a known "
+                "agent status)")
+            return fixed
+        return None
+
+    @staticmethod
+    def _repair_project(record: dict) -> dict | None:
+        if "status" in record and record["status"] not in PROJECT_STATUSES:
+            fixed = dict(record)
+            fixed["status"] = "active"
+            return fixed
+        return None
+
+    @staticmethod
+    def _repair_task(record: dict) -> dict | None:
+        if "column" in record and record["column"] not in KANBAN_COLUMNS:
+            fixed = dict(record)
+            fixed["column"] = "blocked"
+            fixed["blocked_reason"] = (
+                f"repaired on load: unknown column {record['column']!r}")
+            return fixed
+        return None
+
     def _load(self) -> None:
         if not self.state_path.exists():
             return
         data = json.loads(self.state_path.read_text())
-        self.projects = {p["id"]: Project.model_validate(p) for p in data.get("projects", [])}
-        self.tasks = {t["id"]: TaskSpec.model_validate(t) for t in data.get("tasks", [])}
-        self.agents = {a["id"]: AgentSpec.model_validate(a) for a in data.get("agents", [])}
+        self.projects = self._load_records(
+            data.get("projects", []), Project, "project", self._repair_project)
+        self.tasks = self._load_records(
+            data.get("tasks", []), TaskSpec, "task", self._repair_task)
+        self.agents = self._load_records(
+            data.get("agents", []), AgentSpec, "agent", self._repair_agent)
         self.meta = data.get("meta", {})
         if self.events_path.exists():
             lines = self.events_path.read_text().splitlines()[-400:]

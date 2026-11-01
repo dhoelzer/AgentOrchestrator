@@ -159,6 +159,29 @@ the LLM tests take minutes and are non-deterministic.
   `total = projects + orchestrator`. `project.final_cost_usd` is snapshotted via
   `project_cost()` at removal, so hidden/archived projects keep a consistent total.
 
+## Persisted-model validation (state.json)
+
+- All persisted models inherit `_Model`, which sets
+  `model_config = ConfigDict(validate_assignment=True)`. This is load-bearing:
+  the store flushes these objects to JSON and re-validates on load, so without
+  it an invalid assignment is accepted in memory, written to disk, and only
+  crashes on the **next** startup — a crash loop under `restart: unless-stopped`
+  with no UI to recover through. This exact bug shipped when `llm_unavailable`
+  was added to the runtime but not to the `AgentStatus` Literal.
+- `Store._load` never raises for a bad record: `_load_records` tries the model,
+  then a per-kind `_repair_*` (unknown agent status -> `failed`, unknown project
+  status -> `active`, unknown task column -> `blocked` + a `blocked_reason`),
+  and drops the record with a logged error only if repair is impossible. Repair
+  preserves turns/cost/version, so a bad enum never loses work.
+- `AGENT_STATUSES` / `PROJECT_STATUSES` are derived with `get_args()` from the
+  Literals — never hand-maintain a second copy of the status list.
+- `AgentRuntime._map_status` must stay **total**: it feeds a validating field, so
+  an unmapped SDK `ConversationExecutionStatus` value would raise inside a live
+  run. Unknown values degrade to `failed`. If the SDK adds statuses, add a
+  mapping (the test asserts coverage over every enum member).
+- `_one_line()` compacts a `ValidationError` for logs; `str(exc)` is multi-line
+  and gets truncated by log shippers exactly when the rejected field matters.
+
 ## Project versions and revisions
 
 - `Project.version_major`/`version_minor` render as `major.minor` through the

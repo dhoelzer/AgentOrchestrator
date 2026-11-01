@@ -13,7 +13,14 @@ sys.path.insert(0, ".")
 from agent_harness.config import HarnessConfig, resolve_config_path
 from agent_harness.orchestrator import Orchestrator
 from agent_harness.runtime import AgentRuntime, ConcurrencyGate, TurnCounter
-from agent_harness.store import Store
+from agent_harness.store import (
+    AGENT_STATUSES,
+    KANBAN_COLUMNS,
+    AgentSpec,
+    Store,
+    TaskSpec,
+)
+from pydantic import ValidationError
 from agent_harness.tools import (
     AssignTaskAction,
     AssignTaskExecutor,
@@ -461,6 +468,167 @@ def test_run_reports_llm_unavailable_when_endpoint_stays_down():
         print("llm_unavailable reported ok")
 
 
+def test_llm_unavailable_survives_a_flush_and_reload():
+    """Regression: an invalid status used to crash startup, not the write.
+
+    Pydantic does not validate on assignment by default, so a bad status was
+    accepted in memory, flushed to state.json, and only blew up as a
+    ValidationError inside Store._load() on the *next* start - which under
+    `restart: unless-stopped` meant a crash loop with no UI to recover from.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = make(tmp)
+        conv = FakeConv("orch-conv")
+        CreateProjectExecutor()(CreateProjectAction(
+            name="Persist", goal="status must round-trip", constraints=""), conv)
+        pid = list(store.projects)[0]
+        CreateSubAgentExecutor()(CreateSubAgentAction(
+            role="backend-dev", specialty="backend",
+            mission="build", project_id=pid), conv)
+        agent_id = [a.id for a in store.project_agents(pid) if a.depth == 1][0]
+
+        store.agents[agent_id].status = "llm_unavailable"
+        store.flush()
+
+        on_disk = json.loads((Path(tmp) / "state.json").read_text())
+        saved = {a["id"]: a["status"] for a in on_disk["agents"]}
+        assert saved[agent_id] == "llm_unavailable", saved
+
+        reloaded = Store(cfg.data_dir)
+        assert reloaded.agents[agent_id].status == "llm_unavailable"
+        assert reloaded.agents[agent_id].turns_used == 0
+        print("llm_unavailable round-trips through reload ok")
+
+
+def test_bad_agent_status_is_repaired_on_load_not_fatal():
+    """A record the model rejects must not brick startup.
+
+    Simulates state written by an older/newer build: the status is something
+    this build does not know, so it is coerced to 'failed' (which already
+    surfaces as an alert) instead of dropping the agent or raising.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = make(tmp)
+        conv = FakeConv("orch-conv")
+        CreateProjectExecutor()(CreateProjectAction(
+            name="Legacy", goal="unknown status in state", constraints=""), conv)
+        pid = list(store.projects)[0]
+        CreateSubAgentExecutor()(CreateSubAgentAction(
+            role="backend-dev", specialty="backend",
+            mission="build", project_id=pid), conv)
+        agent_id = [a.id for a in store.project_agents(pid) if a.depth == 1][0]
+        store.agents[agent_id].turns_used = 41
+        store.flush()
+
+        state_path = Path(tmp) / "state.json"
+        data = json.loads(state_path.read_text())
+        for a in data["agents"]:
+            if a["id"] == agent_id:
+                a["status"] = "quantum_leaking"
+        state_path.write_text(json.dumps(data))
+
+        reloaded = Store(cfg.data_dir)
+        kept = reloaded.agents[agent_id]
+        assert kept.status == "failed", kept.status
+        assert kept.turns_used == 41, "repair must not lose the turn count"
+        assert "quantum_leaking" in (kept.last_error or ""), kept.last_error
+        # Still visible on the board and still alerting.
+        assert reloaded.project_agents(pid), "repaired agent vanished"
+        alerts = TestClient(build_api(cfg, reloaded, Orchestrator(
+            cfg, reloaded, AgentRuntime(cfg, reloaded)))).get("/api/state").json()["alerts"]
+        assert any("backend-dev is failed" in a["message"]
+                   and "41/100" in a["message"] for a in alerts), alerts
+        print("unknown agent status repaired on load ok")
+
+
+def test_unknown_project_status_and_task_column_are_repaired_on_load():
+    """Same guard for the other two record kinds, without losing their state."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = make(tmp)
+        conv = FakeConv("orch-conv")
+        CreateProjectExecutor()(CreateProjectAction(
+            name="Repair", goal="bad enums in state", constraints=""), conv)
+        pid = list(store.projects)[0]
+        CreateTaskExecutor()(CreateTaskAction(
+            project_id=pid, title="Card", objective="x", expertise="backend",
+            acceptance_criteria=["works"], deliverables=["out"]), conv)
+        task_id = [t.id for t in store.project_tasks(pid)][0]
+        store.projects[pid].version_minor = 7
+        store.tasks[task_id].turns_used = 12
+        store.flush()
+
+        state_path = Path(tmp) / "state.json"
+        data = json.loads(state_path.read_text())
+        data["projects"][0]["status"] = "melting"
+        data["tasks"][0]["column"] = "sideways"
+        state_path.write_text(json.dumps(data))
+
+        reloaded = Store(cfg.data_dir)
+        assert reloaded.projects[pid].status == "active", reloaded.projects[pid].status
+        assert reloaded.projects[pid].version == "0.7", reloaded.projects[pid].version
+        task = reloaded.tasks[task_id]
+        assert task.column == "blocked", task.column
+        assert task.turns_used == 12, task.turns_used
+        assert "sideways" in (task.blocked_reason or ""), task.blocked_reason
+        # A repaired task in blocked must carry a reason or the UI shows a
+        # reasonless blocker; the orchestrator resumes it on the next cycle.
+        assert task.column in KANBAN_COLUMNS
+        print("unknown project status / task column repaired ok")
+
+
+def test_assignment_of_invalid_status_raises_at_the_write():
+    """validate_assignment turns a silent disk-poisoning write into a loud one."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = make(tmp)
+        spec = AgentSpec(role="w", specialty="x", mission="m", system_prompt="p")
+        store.agents[spec.id] = spec
+        try:
+            spec.status = "not_a_real_status"
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("invalid status assignment was accepted")
+        # Same guard on the other persisted models.
+        proj = store.create_project("G", "goal", str(Path(tmp) / "ws"))
+        try:
+            proj.status = "on_fire"
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("invalid project status assignment was accepted")
+        task = TaskSpec(project_id=proj.id, title="t", objective="o",
+                        expertise="e", acceptance_criteria=["a"],
+                        deliverables=["d"])
+        store.tasks[task.id] = task
+        try:
+            task.column = "shredded"
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("invalid task column assignment was accepted")
+        print("invalid assignments rejected at the write ok")
+
+
+def test_map_status_covers_every_sdk_execution_status():
+    """_map_status must be total: it feeds a field that now validates.
+
+    An unmapped SDK status would otherwise raise inside a live run.
+    """
+    from openhands.sdk.conversation.state import ConversationExecutionStatus
+
+    for status in ConversationExecutionStatus:
+        mapped = AgentRuntime._map_status(status.value, False, None)
+        assert mapped in AGENT_STATUSES, (status.value, mapped)
+    # Unknown/future values degrade to 'failed' rather than passing through.
+    assert AgentRuntime._map_status("deleting", False, None) == "failed"
+    assert AgentRuntime._map_status("brand_new", False, None) == "failed"
+    assert AgentRuntime._map_status("brand_new", True, None) == "budget_exhausted"
+    assert AgentRuntime._map_status("brand_new", False, "boom") == "failed"
+    assert AgentRuntime._map_status("brand_new", False, None, True) == "llm_unavailable"
+    print("map_status total over", len(list(ConversationExecutionStatus)),
+          "sdk statuses ok")
+
+
 def test_auth_errors_are_not_retried():
     import litellm
 
@@ -744,6 +912,11 @@ if __name__ == "__main__":
     test_adaptive_timeout_growth_is_bounded()
     test_run_retries_empty_and_transient_failures()
     test_run_reports_llm_unavailable_when_endpoint_stays_down()
+    test_llm_unavailable_survives_a_flush_and_reload()
+    test_bad_agent_status_is_repaired_on_load_not_fatal()
+    test_unknown_project_status_and_task_column_are_repaired_on_load()
+    test_assignment_of_invalid_status_raises_at_the_write()
+    test_map_status_covers_every_sdk_execution_status()
     test_auth_errors_are_not_retried()
     test_reviewer_does_not_steal_the_worker_link()
     test_dispatch_without_assign_task_still_links_counters()
