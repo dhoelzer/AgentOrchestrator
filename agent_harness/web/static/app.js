@@ -110,9 +110,13 @@ const BLOCK_FIX = {
 };
 
 function taskCard(t) {
-  return `<div class="task" data-task="${t.id}">
-    <div class="t">${esc(t.title)}</div>
-    <div class="m">
+  const done = t.column === "done";
+  return `<div class="task${done ? " done" : ""}${t.active ? " active" : ""}" data-task="${t.id}">
+    <div class="t"><span class="light ${t.active ? "on" : "off"}" title="${
+      t.assigned_agent_id
+        ? `${esc(t.agent_role || t.assigned_agent_id)} is ${t.active ? "working on this now" : "not running"}`
+        : "No worker assigned"}"></span>${esc(t.title)}</div>
+    ${done ? "" : `<div class="m">
       <span class="tag">${esc(t.expertise)}</span>
       <span class="${turnsClass(t.turns_used, t.turn_limit)}">${t.turns_used}/${t.turn_limit} turns</span>
       ${t.review_rounds ? `<span class="tag">review ×${t.review_rounds}</span>` : ""}
@@ -121,11 +125,11 @@ function taskCard(t) {
       <span class="kv cost" title="${t.assigned_agent_id
         ? `Spend by ${esc(t.agent_role || t.assigned_agent_id)} on this card`
         : "No worker assigned yet"}">${cardCost(t)}</span>
-    </div>
+    </div>`}
     ${t.blocked_reason ? `<div class="blocked-reason">⚠ ${esc(t.blocked_reason)}
       <span class="fix">${esc(BLOCK_FIX[t.blocked_cause] || "will be re-checked next cycle")}</span>
     </div>` : ""}
-  </div>`;
+  </div>`
 }
 
 function renderTree(nodes) {
@@ -134,7 +138,9 @@ function renderTree(nodes) {
     const kids = (n.children || []).map((c) => walk(c)).join("");
     return `<div class="node ${root ? "root" : ""}">
       <div class="row" data-agent="${n.id}">
-        <span class="dot ${esc(n.status)}"></span>
+        <span class="light ${n.active ? "on" : "off"}" title="${
+          n.active ? "Running right now" : "Not running"}"></span>
+        <span class="dot ${esc(n.status)}" title="status: ${esc(n.status)}"></span>
         <span class="role">${esc(n.role)}</span>
         <span class="spec">${esc(n.specialty)}</span>
         <span class="kv">${n.turns_used}/${n.turn_limit} turns · ${esc(n.status)}</span>

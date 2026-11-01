@@ -267,3 +267,35 @@ still exits 0. Judge these tests by exit code, not by absence of ERROR lines.
   `meta.harness_version_stored` before it is overwritten, so the header tooltip
   can name the build that last wrote `state.json`. Do not read
   `meta.harness_version` for that comparison — it is the running build.
+
+## Active lights (task cards + agent hierarchy)
+
+- `runtime.inflight` is the **only** authoritative "is this agent running right
+  now" signal. Do not use `agent.status == "running"`: it is a persisted field
+  that a crash mid-run leaves stale, which would pin a card's light on forever.
+- `AgentRuntime._inflight` is a **refcount map, not a set**. `submit()` marks an
+  agent and the `run()` it dispatches marks the same agent again; with a set the
+  inner unmark would clear it while the outer dispatch is still going, flickering
+  the light and letting `remove project` slip past the running-agent guard. The
+  nesting depth is asserted in `test_inflight_refcount_survives_nested_submit_and_run`.
+- `run()` does the marking (not just `submit()`), so the orchestrator's own cycle
+  and any synchronous `run_agent` also light up. `submit()` still does its own
+  check-and-mark inside one lock — that guard is what prevents double dispatch.
+- API exposes it as a boolean `active` on `_task_json`, `_agent_json`, and every
+  `_agent_tree` node. A card's light follows its `assigned_agent_id`, so one agent
+  working lights every card it is linked to. Unassigned cards stay dark.
+- The frontend contract is asserted by `test_ui_assets_wire_the_light_and_collapsed_done_cards`
+  (it greps `app.js`/`index.html`). If you rename `active` or the `.light` classes,
+  that test fails on purpose — update it deliberately.
+
+## Done-column cards
+
+- Done cards render **title only** (no expertise/turns/cost meta) plus their light.
+  Rationale: a landed card has no live counters worth scanning, and the column is
+  usually the busiest one. Detail view still has everything; the card stays clickable.
+- A card must never carry `blocked_reason` while not in the `blocked` column.
+  `record_review` clears the block fields on approval, and `Store._normalize_loaded_tasks()`
+  sweeps legacy state on every load (older builds left the reason behind, so 14 of
+  21 done cards advertised blockers they had resolved). The sweep runs after
+  `_load_records`, not in `_repair_task` — that hook only fires when validation
+  *fails*, and this data is valid, just inconsistent.

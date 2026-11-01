@@ -225,7 +225,10 @@ class AgentRuntime:
             max_workers=max(1, config.max_parallel_workers),
             thread_name_prefix="worker",
         )
-        self._inflight: set[str] = set()
+        # Refcount, not a set: submit() marks a background dispatch and the run()
+        # it eventually calls marks the same agent again, so a plain set would be
+        # cleared by the inner unmark while the outer one is still in flight.
+        self._inflight: dict[str, int] = {}
         # Live LLM tuning, shared by every agent: one slow reply widens the
         # timeout for all of them.
         self._llm_lock = threading.RLock()
@@ -241,22 +244,41 @@ class AgentRuntime:
 
     @property
     def inflight(self) -> set[str]:
+        """Agent ids with a run in progress right now.
+
+        Authoritative for every run, including the orchestrator's own, unlike
+        ``status == "running"``, which is a persisted field that can be left
+        stale by a crash mid-run.
+        """
         with self._lock:
-            return set(self._inflight)
+            return {aid for aid, n in self._inflight.items() if n > 0}
+
+    def _mark_inflight(self, agent_id: str) -> None:
+        with self._lock:
+            self._inflight[agent_id] = self._inflight.get(agent_id, 0) + 1
+
+    def _unmark_inflight(self, agent_id: str) -> None:
+        with self._lock:
+            left = self._inflight.get(agent_id, 0) - 1
+            if left > 0:
+                self._inflight[agent_id] = left
+            else:
+                self._inflight.pop(agent_id, None)
 
     def submit(self, agent_id: str, fn) -> None:
         """Run a worker stretch off the loop thread."""
+        # Check and mark in one lock: the guard is what stops a task being
+        # dispatched twice, so it must not be racy.
         with self._lock:
-            if agent_id in self._inflight:
+            if self._inflight.get(agent_id, 0) > 0:
                 raise RuntimeError(f"Agent {agent_id} is already running")
-            self._inflight.add(agent_id)
+            self._inflight[agent_id] = 1
 
         def guarded() -> None:
             try:
                 fn()
             finally:
-                with self._lock:
-                    self._inflight.discard(agent_id)
+                self._unmark_inflight(agent_id)
 
         self._pool.submit(guarded)
 
@@ -386,7 +408,13 @@ class AgentRuntime:
         """
         with self._agent_lock(spec.id):
             with self.gate.slot():
-                return self._run_guarded(spec, tools, message, turn_limit)
+                # Tracked here rather than only in submit() so the orchestrator's
+                # own run, and any synchronous run_agent, also show as active.
+                self._mark_inflight(spec.id)
+                try:
+                    return self._run_guarded(spec, tools, message, turn_limit)
+                finally:
+                    self._unmark_inflight(spec.id)
 
     def _run_guarded(self, spec: AgentSpec, tools: list, message: str,
                      turn_limit: int | None) -> RunOutcome:

@@ -64,7 +64,9 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
     def state() -> dict:
         projects = []
         for project in store.visible_projects():
-            board = {col: [_task_json(t, agents=store.agents) for t in items]
+            active = orchestrator.runtime.inflight
+            board = {col: [_task_json(t, agents=store.agents, active=active)
+                           for t in items]
                      for col, items in store.board(project.id).items()}
             revisions = list(reversed(project.revision_log))
             projects.append({
@@ -84,7 +86,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                 "cost_usd": store.project_cost(project.id),
                 "board": board,
                 "counts": store.column_counts(project.id),
-                "tree": _agent_tree(store, project.id),
+                "tree": _agent_tree(store, project.id, active=active),
             })
         return {
             "config": {
@@ -352,14 +354,16 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         task = store.tasks.get(task_id)
         if task is None or task.project_id != project_id:
             raise HTTPException(404, "Unknown task")
-        return _task_json(task, full=True, agents=store.agents)
+        return _task_json(task, full=True, agents=store.agents,
+                        active=orchestrator.runtime.inflight)
 
     @app.get("/api/projects/{project_id}/agents/{agent_id}")
     def agent_detail(project_id: str, agent_id: str) -> dict:
         agent = store.agents.get(agent_id)
         if agent is None or agent.project_id != project_id:
             raise HTTPException(404, "Unknown agent")
-        return _agent_json(agent, full=True)
+        return _agent_json(agent, full=True,
+                        active=orchestrator.runtime.inflight)
 
     def _get_project(project_id: str):
         project = store.projects.get(project_id)
@@ -383,10 +387,16 @@ def _llm_health(orchestrator: Orchestrator) -> dict:
     }
 
 
-def _task_json(task, full: bool = False, agents: dict | None = None) -> dict:
+def _task_json(task, full: bool = False, agents: dict | None = None,
+               active: set | None = None) -> dict:
     # Cost lives on the agent, not the card; mirror it here so the kanban card
     # shows what its worker has actually spent.
     agent = (agents or {}).get(task.assigned_agent_id or "")
+    # The card's light follows the worker assigned to it. It uses the runtime's
+    # in-flight set rather than the persisted status, which a crash mid-run can
+    # leave stuck on "running".
+    is_active = bool(task.assigned_agent_id) and bool(
+        active and task.assigned_agent_id in active)
     data = {
         "id": task.id, "title": task.title, "expertise": task.expertise,
         "column": task.column, "assigned_agent_id": task.assigned_agent_id,
@@ -400,6 +410,7 @@ def _task_json(task, full: bool = False, agents: dict | None = None) -> dict:
         "cost_usd": agent.cost_usd if agent else None,
         "agent_role": agent.role if agent else None,
         "agent_status": agent.status if agent else None,
+        "active": is_active,
         "updated_at": task.updated_at,
     }
     if full:
@@ -417,10 +428,11 @@ def _task_json(task, full: bool = False, agents: dict | None = None) -> dict:
     return data
 
 
-def _agent_json(agent, full: bool = False) -> dict:
+def _agent_json(agent, full: bool = False, active: set | None = None) -> dict:
     data = {
         "id": agent.id, "role": agent.role, "specialty": agent.specialty,
         "status": agent.status, "depth": agent.depth,
+        "active": bool(active and agent.id in active),
         "turns_used": agent.turns_used, "turn_limit": agent.turn_limit,
         "task_id": agent.task_id, "tokens": agent.tokens,
         "cost_usd": agent.cost_usd,
@@ -440,7 +452,8 @@ def _agent_json(agent, full: bool = False) -> dict:
     return data
 
 
-def _agent_tree(store: Store, project_id: str) -> list[dict]:
+def _agent_tree(store: Store, project_id: str,
+                active: set | None = None) -> list[dict]:
     """Nested agent hierarchy for the project, orchestrator first.
 
     Children come from parent_agent_id, not child_agent_ids: retiring an agent
@@ -476,7 +489,7 @@ def _agent_tree(store: Store, project_id: str) -> list[dict]:
             if child.id not in seen:
                 seen.add(child.id)
                 children.append(node(child, seen))
-        return {**_agent_json(agent), "children": children}
+        return {**_agent_json(agent, active=active), "children": children}
 
     return [node(a, {a.id}) for a in roots]
 

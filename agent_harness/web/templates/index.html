@@ -85,8 +85,20 @@
   .task { background:var(--panel); border:1px solid var(--line); border-radius:8px;
     padding:9px 10px; margin-bottom:8px; cursor:pointer; }
   .task:hover { border-color:var(--accent); }
-  .task .t { font-size:13px; font-weight:500; }
+  .task .t { font-size:13px; font-weight:500; display:flex; align-items:center; gap:7px; }
   .task .m { font-size:11px; color:var(--dim); margin-top:5px; display:flex; gap:8px; flex-wrap:wrap; }
+  /* Done cards carry no live state worth reading, so they collapse to just the
+     title and stay clickable for the detail view. */
+  .task.done { padding:4px 8px; margin-bottom:4px; opacity:.62; }
+  .task.done .t { font-size:12px; font-weight:400; color:var(--dim); }
+  .task.done:hover { opacity:1; }
+  /* Active light: whether the agent behind this card/tree node is running right
+     now, independent of the persisted status dot. */
+  .light { width:8px; height:8px; border-radius:50%; flex:0 0 auto; }
+  .light.on { background:var(--ok); box-shadow:0 0 6px var(--ok);
+    animation:pulse 1.4s ease-in-out infinite; }
+  .light.off { background:#3a3f4b; border:1px solid var(--line); }
+  @keyframes pulse { 50% { opacity:.45; } }
   .tag { border:1px solid var(--line); border-radius:5px; padding:1px 6px; }
   .turns { font-variant-numeric:tabular-nums; }
   .turns.hot { color:var(--warn); }

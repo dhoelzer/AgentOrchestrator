@@ -332,6 +332,7 @@ class Store:
             data.get("tasks", []), TaskSpec, "task", self._repair_task)
         self.agents = self._load_records(
             data.get("agents", []), AgentSpec, "agent", self._repair_agent)
+        self._normalize_loaded_tasks()
         self.meta = data.get("meta", {})
         # Which build wrote this file, kept separate from the running build so a
         # version mismatch stays visible after meta is overwritten on save.
@@ -343,6 +344,20 @@ class Store:
                     self.recent_events.append(HarnessEvent.model_validate(json.loads(line)))
                 except Exception:
                     continue
+
+    def _normalize_loaded_tasks(self) -> None:
+        """Clear block fields on tasks that are no longer blocked.
+
+        Older builds approved a review without clearing blocked_reason, leaving
+        done cards advertising a blocker they had already resolved. The data is
+        valid, so _repair_task never sees it; this sweep runs on every load.
+        """
+        for task in self.tasks.values():
+            if task.column != "blocked" and task.blocked_reason:
+                logger.warning("Cleared stale block on %s task %s: %s",
+                               task.column, task.id, task.blocked_reason)
+                task.blocked_reason = None
+                task.blocked_cause = None
 
     def flush(self) -> None:
         with self._lock:

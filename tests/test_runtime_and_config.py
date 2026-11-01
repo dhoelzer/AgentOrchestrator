@@ -902,6 +902,65 @@ def test_qwen_cost_defaults():
     print("qwen token costs ok")
 
 
+def test_inflight_refcount_survives_nested_submit_and_run():
+    """submit() marks an agent, and the run() it calls marks it again.
+
+    A plain set would let the inner unmark clear the agent while the outer
+    dispatch is still going, flickering the dashboard's active light and
+    letting remove-project slip past the running-agent guard.
+    """
+    import threading
+    import time
+
+    from agent_harness.runtime import RunOutcome
+    from agent_harness.store import AgentSpec
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = make(tmp)
+        agent = AgentSpec(role="w", specialty="x", mission="m",
+                          system_prompt="p", project_id="p1")
+        store.upsert_agent(agent)
+
+        entered = threading.Event()
+        release = threading.Event()
+        seen: list[int] = []
+
+        def fake_guarded(spec, tools, message, turn_limit):
+            # submit() already marked it, so run()'s mark makes this depth 2.
+            seen.append(runtime._inflight.get(agent.id, 0))
+            entered.set()
+            release.wait(10)
+            return RunOutcome(turns_used=0, turns_this_run=0, status="idle",
+                              final_report="", budget_exhausted=False,
+                              tokens=0, cost_usd=0.0)
+
+        runtime._run_guarded = fake_guarded
+        runtime.submit(agent.id, lambda: runtime.run(agent, [], "go"))
+        try:
+            assert entered.wait(5), "run never started"
+            assert agent.id in runtime.inflight, "lost the mark mid-run"
+        finally:
+            release.set()
+
+        deadline = time.time() + 5
+        while agent.id in runtime.inflight and time.time() < deadline:
+            time.sleep(0.05)
+        assert agent.id not in runtime.inflight, "refcount leaked after both exited"
+
+        hold = threading.Event()
+        runtime.submit(agent.id, lambda: hold.wait(10))
+        try:
+            try:
+                runtime.submit(agent.id, lambda: None)
+                raise AssertionError("double submit must be refused")
+            except RuntimeError:
+                pass
+        finally:
+            hold.set()
+        assert seen == [2], seen
+        print("inflight refcount nesting ok")
+
+
 if __name__ == "__main__":
     test_concurrency_gate_serialises_below_limit()
     test_turn_counter_counts_unique_response_ids()
@@ -924,4 +983,5 @@ if __name__ == "__main__":
     test_config_edits_persist_to_the_loaded_file()
     test_env_overrides_are_not_baked_into_the_config_file()
     test_qwen_cost_defaults()
+    test_inflight_refcount_survives_nested_submit_and_run()
     print("\nALL RUNTIME/CONFIG TESTS PASSED")

@@ -18,6 +18,8 @@ from agent_harness.orchestrator import Orchestrator
 from agent_harness.runtime import AgentRuntime
 from agent_harness.store import Store, REVISION_LOG_LIMIT
 from agent_harness.tools import (
+    AssignTaskAction,
+    AssignTaskExecutor,
     CreateProjectAction,
     CreateProjectExecutor,
     CreateSubAgentAction,
@@ -213,6 +215,144 @@ def test_remove_refuses_while_agents_are_running():
             while agent.id in runtime.inflight and time.time() < deadline:
                 time.sleep(0.05)
         print("remove refuses running agents ok")
+
+
+def test_done_cards_do_not_keep_a_stale_block_reason():
+    """Approving a review clears the block; old data is swept on load."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = seed(tmp)
+        pid = list(store.projects)[0]
+        task = next(iter(store.project_tasks(pid)))
+        task.column = "blocked"
+        task.blocked_reason = "turn budget exhausted"
+        task.blocked_cause = "turn_budget"
+        store.upsert_task(task)
+        store.flush()
+
+        task.column = "review"
+        store.upsert_task(task)
+        RecordReviewExecutor()(RecordReviewAction(
+            task_id=task.id, verdict="approved", feedback="ship it"), FakeConv())
+        assert store.tasks[task.id].column == "done"
+        assert store.tasks[task.id].blocked_reason is None, \
+            "approval left a blocker on a done card"
+
+        # Legacy state written by an older build: valid JSON, inconsistent data.
+        raw = json.loads(store.state_path.read_text())
+        for rec in raw["tasks"]:
+            if rec["column"] == "done":
+                rec["blocked_reason"] = "agent used all its turns"
+                rec["blocked_cause"] = "turn_budget"
+        store.state_path.write_text(json.dumps(raw))
+        reloaded = Store(cfg.data_dir)
+        stale = [t for t in reloaded.tasks.values()
+                 if t.column != "blocked" and t.blocked_reason]
+        assert not stale, [t.id for t in stale]
+        blocked = [t for t in reloaded.tasks.values() if t.column == "blocked"]
+        for t in blocked:
+            assert t.blocked_reason, "sweep must not clear a real block"
+        print("done cards drop stale block reasons ok")
+
+
+# ---------------------------------------------------------------- active lights
+
+
+def _wait_inflight(runtime, agent_id, want=True, limit=5.0):
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        if (agent_id in runtime.inflight) is want:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_task_and_agent_active_flags_track_inflight_runs():
+    """The card light follows the assigned worker's live run, not stored status."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = seed(tmp)
+        pid = list(store.projects)[0]
+        task = next(iter(store.project_tasks(pid)))
+        worker = next(a for a in store.project_agents(pid)
+                      if a.role == "backend-dev")
+        AssignTaskExecutor()(AssignTaskAction(
+            task_id=task.id, agent_id=worker.id), FakeConv())
+
+        app = build_api(cfg, store, orch)
+        client = TestClient(app)
+
+        def flags():
+            st = client.get("/api/state").json()
+            proj = next(p for p in st["projects"] if p["id"] == pid)
+            card = next(t for col in proj["board"].values() for t in col
+                        if t["id"] == task.id)
+            node = next(n for n in _flatten_tree(proj["tree"])
+                        if n["id"] == worker.id)
+            return card["active"], node["active"]
+
+        assert flags() == (False, False), "idle agent must read as off"
+
+        # A stale persisted status must not light the card: only a live run can.
+        worker.status = "running"
+        store.upsert_agent(worker)
+        assert flags() == (False, False), "stale 'running' status lit the card"
+
+        hold = threading.Event()
+        runtime.submit(worker.id, lambda: hold.wait(10))
+        try:
+            assert _wait_inflight(runtime, worker.id), "never registered inflight"
+            assert flags() == (True, True), "live run must light card and node"
+            detail = client.get(f"/api/projects/{pid}/tasks/{task.id}").json()
+            assert detail["active"] is True
+            adetail = client.get(f"/api/projects/{pid}/agents/{worker.id}").json()
+            assert adetail["active"] is True
+        finally:
+            hold.set()
+            assert _wait_inflight(runtime, worker.id, want=False)
+        assert flags() == (False, False), "light stayed on after the run"
+        print("active flags track inflight runs ok")
+
+
+def test_unassigned_and_orchestrator_cards_stay_dark():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = seed(tmp)
+        pid = list(store.projects)[0]
+        task = next(iter(store.project_tasks(pid)))
+        task.assigned_agent_id = None
+        store.upsert_task(task)
+        app = build_api(cfg, store, orch)
+        client = TestClient(app)
+        st = client.get("/api/state").json()
+        proj = next(p for p in st["projects"] if p["id"] == pid)
+        card = next(t for col in proj["board"].values() for t in col
+                    if t["id"] == task.id)
+        assert card["active"] is False, "unassigned card must be dark"
+
+        # The orchestrator is only active while its own cycle is running.
+        orch_agent = next(a for a in store.agents.values()
+                          if a.role == "orchestrator")
+        node = next(n for n in _flatten_tree(proj["tree"]) if n["id"] == orch_agent.id)
+        assert node["active"] is False
+        print("unassigned card and idle orchestrator stay dark ok")
+
+
+def _flatten_tree(nodes):
+    for n in nodes:
+        yield n
+        yield from _flatten_tree(n.get("children") or [])
+
+
+def test_ui_assets_wire_the_light_and_collapsed_done_cards():
+    """Guard the JS/CSS contract the API feeds: renamed fields break the UI."""
+    js = (Path(__file__).resolve().parents[1]
+          / "agent_harness" / "web" / "static" / "app.js").read_text()
+    html = (Path(__file__).resolve().parents[1]
+            / "agent_harness" / "web" / "templates" / "index.html").read_text()
+    assert 'class="light ${t.active ? "on" : "off"}"' in js, "card light missing"
+    assert 'class="light ${n.active ? "on" : "off"}"' in js, "tree light missing"
+    assert 't.column === "done"' in js, "done-card collapse missing"
+    assert '${done ? "" : `<div class="m">' in js, "done-card meta hidden missing"
+    for sel in (".light.on", ".light.off", ".task.done"):
+        assert sel in html, f"{sel} style missing"
 
 
 # ---------------------------------------------------------------- costs
@@ -960,6 +1100,10 @@ def main() -> None:
     test_editing_scope_bumps_the_version_and_is_reported()
     test_version_survives_a_restart_and_old_state_gets_a_default()
     test_revision_log_is_capped()
+    test_done_cards_do_not_keep_a_stale_block_reason()
+    test_task_and_agent_active_flags_track_inflight_runs()
+    test_unassigned_and_orchestrator_cards_stay_dark()
+    test_ui_assets_wire_the_light_and_collapsed_done_cards()
     print("\nALL DASHBOARD FEATURE TESTS PASSED")
 
 

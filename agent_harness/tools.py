@@ -870,6 +870,10 @@ class RecordReviewExecutor(ToolExecutor):
         if action.verdict == "approved":
             task.column = "done"
             task.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            # A card that just landed cannot also be blocked; leaving the old
+            # reason behind makes a done card advertise a blocker it resolved.
+            task.blocked_reason = None
+            task.blocked_cause = None
         else:
             task.column = "rework"
         task.touch()
