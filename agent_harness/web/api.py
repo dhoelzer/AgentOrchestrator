@@ -106,6 +106,8 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                      "last_tick": store.meta.get("last_tick"),
                      "inflight": sorted(orchestrator.runtime.inflight),
                      "llm": _llm_health(orchestrator),
+                     "llm_fleet": orchestrator.runtime.rotator.status(),
+                     "capacity": orchestrator.runtime.capacity(),
                      "cycle": _cycle_status(store, config.tick_seconds)},
             "total_cost_usd": store.harness_cost(),
             "project_cost_usd": sum(store.project_cost(p.id)
@@ -248,8 +250,11 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         # The API key is never echoed to the UI; it is only ever written to.
         redacted = config.model_dump()
         redacted["llm"]["api_key"] = "***" if config.llm.resolved_api_key() else ""
+        for srv in redacted.get("llm_servers", []):
+            srv["api_key"] = "***" if srv.get("api_key") else ""
         return {
             "config": redacted,
+            "llm_servers": orchestrator.runtime.rotator.status(),
             "runtime": {
                 "llm_timeout": orchestrator.runtime.llm_timeout,
                 "llm_timeouts_widened": orchestrator.runtime.llm_timeouts_widened,
@@ -276,9 +281,13 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                 _write_config(config, persist, changed)
             except OSError as exc:
                 raise HTTPException(500, f"Could not write config: {exc}") from exc
+            # The live config is already updated; tell the loop so it does not
+            # read its own write back as an external edit next tick.
+            orchestrator.note_config_written()
         store.add_event(
             "config_updated",
-            "Runtime config updated: " + ", ".join(f"{k}={v}" for k, v in changed),
+            "Runtime config updated: " + ", ".join(
+                f"{k}={_summarize(k, v)}" for k, v in changed),
         )
         store.flush()
         return {"changed": dict(changed),
@@ -673,6 +682,8 @@ _PATCHABLE = {
     "sub_agent_turn_limit": ("runtime", int),
     "orchestrator_turn_limit": ("runtime", int),
     "max_parallel_workers": ("gate", int),
+    "llm_queue_depth": ("pool", int),
+    "llm_servers": ("servers", list),
     "max_sub_agent_depth": ("runtime", int),
     "max_children_per_agent": ("runtime", int),
     "review_attempts_before_escalation": ("runtime", int),
@@ -711,7 +722,10 @@ def _apply_config_patch(config: HarnessConfig, orchestrator: Orchestrator,
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, f"{key} must be {expected_type.__name__}") from exc
 
-        if key.startswith("llm."):
+        if key == "llm_servers":
+            coerced = _validate_servers(value)
+            config.llm_servers = coerced
+        elif key.startswith("llm."):
             setattr(config.llm, key.split(".", 1)[1], coerced)
         else:
             setattr(config, key, coerced)
@@ -723,8 +737,35 @@ def _apply_config_patch(config: HarnessConfig, orchestrator: Orchestrator,
     timeout_patch = next((v for k, v in changed if k == "llm.request_timeout"), None)
     if timeout_patch is not None:
         orchestrator.runtime.set_llm_timeout(int(timeout_patch))
+    if any(k in ("max_parallel_workers", "llm_queue_depth") for k, _ in changed):
+        orchestrator.runtime.sync_pool_size()
 
     return changed
+
+
+def _validate_servers(value: list) -> list:
+    """Validate a posted server list before it can affect live routing."""
+    from agent_harness.config import LLMServerConfig
+
+    if not isinstance(value, list):
+        raise HTTPException(400, "llm_servers must be a list of server objects.")
+    try:
+        servers = [LLMServerConfig.model_validate(v) for v in value]
+    except Exception as exc:  # noqa: BLE001 - surface pydantic detail to the UI
+        raise HTTPException(400, f"Invalid llm_servers: {exc}") from exc
+    names = [s.name for s in servers]
+    if len(set(names)) != len(names):
+        raise HTTPException(400, f"Server names must be unique; got {names}.")
+    return servers
+
+
+def _summarize(key: str, value):
+    """Readable form for the event log; persistence still uses the real value."""
+    if key == "llm_servers":
+        return [f"{srv.name} ({srv.route()} @ {srv.base_url})" for srv in value]
+    if key == "llm.api_key":
+        return "***"
+    return value
 
 
 def _write_config(config: HarnessConfig, path: str, changed: list) -> None:
@@ -746,6 +787,9 @@ def _write_config(config: HarnessConfig, path: str, changed: list) -> None:
         node = on_disk
         for part in parts[:-1]:
             node = node.setdefault(part, {})
+        # Nested pydantic models (the server list) need plain dicts on disk.
+        if key == "llm_servers":
+            value = [srv.model_dump(exclude_none=True) for srv in value]
         node[parts[-1]] = value
 
     payload = json.dumps(on_disk, indent=2, sort_keys=True)

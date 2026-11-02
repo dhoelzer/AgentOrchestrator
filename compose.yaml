@@ -63,6 +63,12 @@ services:
       HARNESS_LLM_BASE_URL: ${HARNESS_LLM_BASE_URL:-}
       HARNESS_LLM_MODEL: ${HARNESS_LLM_MODEL:-}
       HARNESS_LLM_API_KEY: ${HARNESS_LLM_API_KEY:-}
+      # Optional extra LLM endpoints to round-robin across, as a JSON array.
+      # Each entry names the literal model key that endpoint expects, e.g.
+      #   HARNESS_LLM_SERVERS='[{"name":"ollama-a","provider":"ollama_chat",
+      #     "base_url":"http://host.docker.internal:11434/v1","model":"qwen2.5:7b"}]'
+      HARNESS_LLM_SERVERS: ${HARNESS_LLM_SERVERS:-}
+      HARNESS_LLM_QUEUE_DEPTH: ${HARNESS_LLM_QUEUE_DEPTH:-}
 
     ports:
       - "8090:8090"

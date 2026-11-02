@@ -349,3 +349,72 @@ the drain is missing or the new code leaves something in `inflight` forever.
 - Splits are traceable via `TaskSpec.parent_task_id` (settable on
   `create_task`). Without it a split loses the audit trail of why three small
   cards replaced one big one.
+
+## The queued lane needs a pool bigger than the gate
+
+- `submit()` puts work on the `ThreadPoolExecutor`; the LLM queue entry is only
+  created inside `run()`, once the gate slot is held. If the pool ceiling equals
+  the gate limit, every dispatched run immediately gets a pool thread and then
+  blocks *inside the pool's own `_work_queue`*, where nothing can see it — the
+  dashboard's `queued` lane stays empty no matter how much work is waiting.
+- Fix: pool ceiling = `max_parallel_workers + llm_queue_depth`. The surplus
+  threads sit on the gate and are visible as `status == "queued"`. The gate, not
+  the pool, is what bounds real LLM concurrency.
+- Pool resizing is **grow-only**: a CPython worker thread only exits on the
+  shutdown sentinel and never re-checks `_max_workers`, so lowering the ceiling
+  cannot reclaim live threads. Surplus threads parked on the queue are harmless.
+
+## Multiple LLM servers (`llm_servers`)
+
+- `HarnessConfig.servers()` returns `llm` first, then `llm_servers`, deduped by
+  `(base_url, route())`. Primary-first means a config with no `llm_servers`
+  needs no special case anywhere.
+- `LLMServerConfig.model` is the **literal model key** for that endpoint.
+  `route()` applies the provider prefix: `openai` → `openai/<model>`, while
+  `ollama` / `ollama_chat` pass the key through verbatim (`qwen2.5:7b`).
+  `extra_body` → `litellm_extra_body` for Ollama knobs (`num_ctx`, `keep_alive`).
+- `LLMRotator` round-robins on a shared cursor so the spread is even across all
+  agents/projects. `usage_id` is `<agent_id>@<server>` — that separates token
+  metrics per endpoint *and* lets the SDK reuse an LLM it already registered.
+- Cooldown: a `TIMEOUT_LIKE_ERRORS` fault parks the server for
+  `min(max(30, llm_timeout), 600)`s. A 429 does **not** park it (that means
+  slow down, not down). If every server is cooling, `pick()` returns the primary
+  so the failure surfaces as a normal transient error rather than "no LLM".
+- Because the SDK caches one LLM per conversation, load balancing only actually
+  happens via `Conversation.switch_llm()` — see `AgentRuntime._bind_server()`.
+  After switching, re-track `conv.agent.llm` and `conv.agent.condenser.llm` in
+  `_llms[agent_id]`, or adaptive timeout retuning silently stops applying.
+
+## Live reconfiguration at the start of every tick
+
+- `Orchestrator.run_cycle()` calls `reload_config_if_changed()` **first**, before
+  any scheduling. The live `HarnessConfig` object is mutated field-by-field,
+  never rebound: the API, `tools.init_context` and the runtime all hold that same
+  instance.
+- Change detection is a **sha256 of the file contents**, not mtime/size. FS
+  timestamp granularity is coarse enough for a write to keep the same mtime, and
+  `max_parallel_workers: 2 -> 6` leaves the byte count identical — both miss the
+  edit.
+- `note_config_written()` is called by the API after it patches config.json.
+  Without it the loop reads its own write as an external edit and emits a
+  spurious `config_reloaded` every tick.
+- Shrinking `max_parallel_workers` drains: the gate limit drops for new runs, but
+  in-flight agents are never interrupted.
+- `rebind_stale_servers()` catches both a removed server and a server that kept
+  its name but changed endpoint (compare `LLMServerConfig.fingerprint()`). Idle
+  conversations are switched to a live server; conversations whose agent is
+  `inflight` are left alone and switch on their next run.
+- A malformed config.json must not stop the loop: keep the previous settings,
+  emit `config_reload_failed`, carry on.
+- Config changes reach the model as `CONFIG CHANGED` / `CAPACITY NOW` lines in
+  the per-project attention list (broadcast to every project — capacity is
+  shared), plus a `config_reloaded` event in the feed.
+
+## Test boundaries
+
+- Stub at the **conversation** (`open_conversation` returning a fake with
+  `send_message`/`run`/`state.events`), not `_run_guarded`, when testing retry,
+  timeout-widening, or server-health behaviour — that logic lives *inside*
+  `_run_guarded`, so stubbing it bypasses the code under test.
+- Test stubs for `_run_guarded` take `**_kw`: `server_name` is keyword-only
+  specifically so existing 4-positional stubs keep working.

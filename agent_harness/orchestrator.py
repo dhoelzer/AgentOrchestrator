@@ -9,6 +9,7 @@ Every ``tick_seconds`` the scheduler:
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from openhands.sdk import Tool
 from openhands.sdk.logger import get_logger
 
 from . import prompts, tools as harness_tools
-from .config import HarnessConfig
+from .config import HarnessConfig, resolve_config_path
 from .runtime import AgentRuntime
 from .store import AgentSpec, Store, new_id, now_iso
 
@@ -36,13 +37,148 @@ class CycleReport:
 class Orchestrator:
     """Root agent that plans, delegates, reviews, and delivers."""
 
-    def __init__(self, config: HarnessConfig, store: Store, runtime: AgentRuntime):
+    def __init__(self, config: HarnessConfig, store: Store, runtime: AgentRuntime,
+                 config_path: str | None = None):
         self.config = config
         self.store = store
         self.runtime = runtime
+        self.config_path = resolve_config_path(config_path)
+        # Fingerprint of config.json as last seen, so an edit made outside the
+        # API (or by another process) is noticed on the next tick.
+        self._config_fp = self._file_fingerprint()
         self._stop = threading.Event()
+        self.config_notes: list[str] = []
         harness_tools.init_context(config, store, runtime)
         self.spec = self._load_or_create_spec()
+
+    # ---------- config reload ----------
+
+    def _file_fingerprint(self) -> str:
+        """Identity of config.json as it exists on disk right now.
+
+        Hashed content rather than mtime/size: filesystem timestamp granularity
+        is coarse enough that a write can land with an unchanged mtime, and an
+        edit like max_parallel_workers 2 -> 6 leaves the byte count identical.
+        The file is small and this runs once per tick, so hashing is cheap.
+        """
+        try:
+            return hashlib.sha256(self.config_path.read_bytes()).hexdigest()
+        except OSError:
+            return "missing"
+
+    def note_config_written(self) -> None:
+        """Called after the API patches config.json.
+
+        The live config was already updated in place by the patch, so the next
+        tick must not treat its own write as an external edit and emit a
+        spurious reload event.
+        """
+        self._config_fp = self._file_fingerprint()
+
+    def reload_config_if_changed(self) -> list[str]:
+        """Re-read config.json at the start of a tick if it changed.
+
+        Returns a human-readable list of what was reconfigured (empty if
+        nothing changed). The live config object is mutated in place rather
+        than replaced: the API, the tool context and the runtime all hold this
+        same object, so rebinding it here would leave them on stale settings.
+        """
+        fp = self._file_fingerprint()
+        if fp == self._config_fp:
+            return []
+        self._config_fp = fp
+
+        try:
+            fresh = HarnessConfig.load(self.config_path)
+        except Exception as exc:  # noqa: BLE001 - a bad edit must not stop the loop
+            self.store.add_event(
+                "config_reload_failed",
+                f"config.json changed but could not be loaded; keeping the "
+                f"previous settings: {type(exc).__name__}: {exc}")
+            logger.exception("Config reload failed")
+            return []
+
+        before = self._config_snapshot()
+        # In-place update: keep every holder of this object in sync.
+        for field in type(self.config).model_fields:
+            setattr(self.config, field, getattr(fresh, field))
+
+        notes = self._apply_config_changes(before)
+        if notes:
+            self.store.add_event(
+                "config_reloaded",
+                "Config changed on disk; reconfigured: " + "; ".join(notes))
+            logger.info("Config reloaded: %s", "; ".join(notes))
+        return notes
+
+    def _config_snapshot(self) -> dict:
+        cfg = self.config
+        return {
+            "tick_seconds": cfg.tick_seconds,
+            "max_parallel_workers": cfg.max_parallel_workers,
+            "llm_queue_depth": cfg.llm_queue_depth,
+            "sub_agent_turn_limit": cfg.sub_agent_turn_limit,
+            "orchestrator_turn_limit": cfg.orchestrator_turn_limit,
+            "max_sub_agent_depth": cfg.max_sub_agent_depth,
+            "max_children_per_agent": cfg.max_children_per_agent,
+            "request_timeout": cfg.llm.request_timeout,
+            "servers": {s.name: s.fingerprint() for s in cfg.servers()},
+        }
+
+    def _apply_config_changes(self, before: dict) -> list[str]:
+        """Push changed settings into the live runtime, describing each move."""
+        cfg = self.config
+        notes: list[str] = []
+
+        if cfg.max_parallel_workers != before["max_parallel_workers"]:
+            old, new = before["max_parallel_workers"], cfg.max_parallel_workers
+            self.runtime.gate.set_limit(new)
+            if new > old:
+                notes.append(
+                    f"parallel LLM slots {old} -> {new}: {new - old} more agents "
+                    "can run at once, so schedule more of the ready work now")
+            else:
+                notes.append(
+                    f"parallel LLM slots {old} -> {new}: running agents are left "
+                    f"to drain down; do not start more than {new} at a time")
+
+        if (cfg.max_parallel_workers != before["max_parallel_workers"]
+                or cfg.llm_queue_depth != before["llm_queue_depth"]):
+            self.runtime.sync_pool_size()
+
+        if cfg.llm.request_timeout != before["request_timeout"]:
+            self.runtime.set_llm_timeout(cfg.llm.request_timeout)
+            notes.append(f"LLM request timeout -> {cfg.llm.request_timeout}s")
+
+        after = {s.name: s.fingerprint() for s in cfg.servers()}
+        added = sorted(set(after) - set(before["servers"]))
+        removed = sorted(set(before["servers"]) - set(after))
+        changed = sorted(n for n in set(after) & set(before["servers"])
+                         if after[n] != before["servers"][n])
+        if added or removed or changed:
+            notes.append(
+                "LLM servers now: " + ", ".join(after)
+                + (f" (added {', '.join(added)})" if added else "")
+                + (f" (removed {', '.join(removed)})" if removed else "")
+                + (f" (reconfigured {', '.join(changed)})" if changed else ""))
+            rebound, draining = self.runtime.rebind_stale_servers()
+            if rebound:
+                notes.append(f"{rebound} idle agent(s) moved onto live endpoints")
+            if draining:
+                notes.append(
+                    f"{draining} running agent(s) left on their current endpoint "
+                    "to finish; they switch on their next run")
+            self.store.meta["llm_servers_active"] = list(after)
+
+        for attr, label in (("tick_seconds", "tick"),
+                            ("sub_agent_turn_limit", "sub-agent turn limit"),
+                            ("orchestrator_turn_limit", "orchestrator turn limit"),
+                            ("max_sub_agent_depth", "max sub-agent depth"),
+                            ("max_children_per_agent", "max children per agent")):
+            if getattr(cfg, attr) != before[attr]:
+                notes.append(f"{label} {before[attr]} -> {getattr(cfg, attr)}")
+
+        return notes
 
     # ---------- identity ----------
 
@@ -395,10 +531,17 @@ class Orchestrator:
         return lines
 
     def run_cycle(self) -> list[CycleReport]:
-        """One scheduler tick: sweep, reconcile, detect, then let the orchestrator act."""
+        """One scheduler tick: reload config, sweep, reconcile, detect, act."""
+        # First thing every tick: settings may have been edited through the UI
+        # or by hand, and the whole point is that the harness adapts without a
+        # restart. The notes describe the new capacity so the briefing can tell
+        # the orchestrator to use it (or hold back).
+        self.config_notes = self.reload_config_if_changed()
         self.sweep_orphans()
         self.reconcile()
         attention_map = self.detect()
+        for project_id, notes in self._config_attention().items():
+            attention_map.setdefault(project_id, []).extend(notes)
         reports: list[CycleReport] = []
 
         for project in self.store.visible_projects():
@@ -432,6 +575,28 @@ class Orchestrator:
             meta["last_cycle_completed_at"] = now
         meta["last_cycle_attempt_at"] = now
         meta["loop_started_at"] = meta.get("loop_started_at") or now
+
+    def _config_attention(self) -> dict[str, list[str]]:
+        """Turn config changes into instructions the orchestrator must act on.
+
+        Broadcast to every project: capacity is shared, so a new LLM server or
+        an extra slot is relevant to each one's queue.
+        """
+        notes = getattr(self, "config_notes", [])
+        if not notes:
+            return {}
+        lines = [f"CONFIG CHANGED (applied this tick): {n}" for n in notes]
+        cap = self.runtime.capacity()
+        lines.append(
+            f"CAPACITY NOW: {cap['slots_free']} of {cap['llm_slots']} LLM slots "
+            f"free, {cap['queued']} action(s) already queued, "
+            f"{len(cap['llm_servers'])} LLM server(s) in rotation "
+            f"({', '.join(cap['llm_servers'])}).")
+        if cap["slots_free"] > 0:
+            lines.append(
+                "More capacity than before: dispatch additional ready cards in "
+                "the background now instead of leaving them in ready/in_progress.")
+        return {pid: lines for pid in self.store.projects}
 
     def _run_project_cycle(self, project, attention: list[str]) -> CycleReport:
         board = {col: [self._task_to_dict(t) for t in items]

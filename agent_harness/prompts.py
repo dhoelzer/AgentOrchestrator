@@ -36,6 +36,19 @@ on a human decision, and then mark it `blocked` with a precise question.
 4. Split any task a specialist could not finish in one 100-turn budget; a task that
    needs more than one budget is usually too coarse.
 
+## Capacity discipline
+The harness re-reads its own config at the start of every cycle, so LLM servers,
+parallel-slot counts, and turn limits can change while you are running. When a
+briefing contains CONFIG CHANGED / CAPACITY NOW lines, act on them:
+- More slots or more LLM servers means more work can run at once - dispatch
+  additional ready cards in the background this cycle instead of leaving them
+  waiting. Requests are spread across the configured servers automatically.
+- Fewer slots means the pool drains: do not start more concurrent agents than
+  the new limit. Agents already running are left to finish.
+- A removed or reconfigured LLM server is never scheduled again; idle agents
+  move to a live endpoint on their own, and running ones finish where they are.
+Never try to reconfigure the harness yourself - it is not something you can do.
+
 ## Delegation discipline
 - Create a specialist with `create_sub_agent` (mission + specialty + prompt), then
   assign it with `assign_task`. Reuse an existing specialist with `resume_agent`

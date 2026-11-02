@@ -92,6 +92,8 @@ CLI overrides: `--base-url`, `--model`, `--api-key`, `--tick`, `--port`, `--conf
 | `sub_agent_turn_limit` | 100 | Hard turn budget per sub-agent |
 | `orchestrator_turn_limit` | 60 | Turn budget granted per orchestrator cycle |
 | `max_parallel_workers` | 3 | Sub-agents that may run concurrently |
+| `llm_queue_depth` | 8 | Extra dispatched runs that wait visibly for a slot |
+| `llm_servers` | `[]` | Additional LLM endpoints to round-robin across |
 | `max_sub_agent_depth` | 3 | How deep sub-agents may nest |
 | `max_children_per_agent` | 6 | Fan-out limit per agent |
 | `review_attempts_before_escalation` | 3 | Failed reviews before escalation |
@@ -104,6 +106,63 @@ CLI overrides: `--base-url`, `--model`, `--api-key`, `--tick`, `--port`, `--conf
 | `llm.empty_response_retries` | 2 | Retries when the endpoint returns nothing |
 | `llm.input_cost_per_token` | 0.000002 | USD/token billed for prompts |
 | `llm.output_cost_per_token` | 0.000015 | USD/token billed for completions |
+
+### Multiple LLM servers
+
+`llm_servers` spreads requests across several OpenAI-compatible endpoints. Each
+entry names the **literal model key that endpoint expects**, so an Ollama server
+can be given `qwen2.5:7b` while the primary uses `openai/qwen`:
+
+```json
+{
+  "llm": { "base_url": "http://192.168.2.107:8080/v1/", "model": "openai/qwen" },
+  "llm_servers": [
+    { "name": "ollama-a", "provider": "ollama_chat",
+      "base_url": "http://ollama-a:11434/v1", "model": "qwen2.5:7b",
+      "extra_body": { "num_ctx": 32768, "keep_alive": "10m" } },
+    { "name": "vllm-b", "provider": "openai",
+      "base_url": "http://vllm-b:8000/v1", "model": "Qwen2.5-14B-Instruct" }
+  ]
+}
+```
+
+`provider` picks the request route: `openai` prefixes an unprefixed model with
+`openai/`, while `ollama` / `ollama_chat` send the model key verbatim. The
+primary `llm` block is always server #1 in the rotation, so a config with no
+`llm_servers` behaves exactly as before.
+
+Runs are assigned round-robin across live servers. A server that throws a
+connection fault is parked for a cooldown and skipped until it answers again; a
+429 does not park it. If every server is down, the primary is used so the
+failure surfaces as a normal transient error.
+
+Set them from the environment as JSON instead:
+
+```bash
+HARNESS_LLM_SERVERS='[{"name":"ollama-a","provider":"ollama_chat",
+  "base_url":"http://ollama-a:11434/v1","model":"qwen2.5:7b"}]'
+```
+
+### Live reconfiguration
+
+The orchestrator re-reads `config.json` at the **start of every tick**, so
+settings can change while it runs — from the Settings panel or by editing the
+file directly:
+
+- **More `max_parallel_workers`** → the gate limit rises immediately and the
+  briefing tells the orchestrator to dispatch more of the ready work.
+- **Fewer** → the limit drops for new runs; agents already running are left to
+  finish, so the pool drains down instead of being interrupted.
+- **Added servers** → they enter the rotation on the next run.
+- **Removed or reconfigured server** → never scheduled again. Idle agents are
+  switched onto a live endpoint; a mid-run agent finishes on the endpoint it
+  started with and switches on its next run.
+- **Broken `config.json`** → the previous settings are kept, a
+  `config_reload_failed` event is logged, and the loop keeps running.
+
+Every change is recorded in the activity feed as `config_reloaded`, and the
+briefing carries `CONFIG CHANGED` / `CAPACITY NOW` lines telling the
+orchestrator what the new limits are.
 
 ### Cost accounting
 

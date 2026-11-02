@@ -88,7 +88,7 @@ def test_run_queues_then_executes_then_clears():
     def snapshot() -> list[tuple[str, str]]:
         return [(e["agent_role"], e["status"]) for e in runtime.llm_queue()]
 
-    def fake_guarded(spec, tools, message, turn_limit):
+    def fake_guarded(spec, tools, message, turn_limit, **_kw):
         states.append(snapshot())
         entered.set()
         release.wait(10)
@@ -138,7 +138,7 @@ def test_queue_orders_by_request_and_keeps_full_prompt():
     seen = threading.Event()
     release = threading.Event()
 
-    def fake_guarded(spec, tools, message, turn_limit):
+    def fake_guarded(spec, tools, message, turn_limit, **_kw):
         seen.set()
         release.wait(10)
         return outcome()
@@ -185,7 +185,7 @@ def test_queue_endpoints_and_state_exposure():
     hold = threading.Event()
     release = threading.Event()
 
-    def fake_guarded(spec, tools, message, turn_limit):
+    def fake_guarded(spec, tools, message, turn_limit, **_kw):
         release.wait(10)
         return outcome()
 
@@ -222,7 +222,7 @@ def test_orchestrator_cycle_shows_as_orchestrator_kind():
     cfg, store, runtime, orch = seed(tempfile.mkdtemp())
     kinds: list[str] = []
 
-    def fake_guarded(spec, tools, message, turn_limit):
+    def fake_guarded(spec, tools, message, turn_limit, **_kw):
         kinds.append(runtime.llm_queue()[0]["kind"])
         return outcome()
 
@@ -280,7 +280,7 @@ def test_user_input_reaches_attention_and_briefing():
 
     captured: list[str] = []
 
-    def fake_guarded(spec, tools, message, turn_limit):
+    def fake_guarded(spec, tools, message, turn_limit, **_kw):
         captured.append(message)
         return outcome()
 

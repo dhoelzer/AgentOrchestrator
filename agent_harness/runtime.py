@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import openai
-from openhands.sdk import Agent, Conversation, LLMSummarizingCondenser
+from openhands.sdk import Agent, Conversation, LLM, LLMSummarizingCondenser
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.conversation.visualizer import ConversationVisualizerBase
 from openhands.sdk.event.base import Event
@@ -49,6 +49,80 @@ TRANSIENT_LLM_ERRORS = (
 # Only these justify concluding "the endpoint needs a longer timeout". A rate
 # limit needs a backoff, not a bigger deadline.
 TIMEOUT_LIKE_ERRORS = (openai.APIConnectionError,)
+
+
+class LLMRotator:
+    """Round-robins agent runs across the configured LLM servers.
+
+    A server is skipped while it is cooling down after a connection failure, so
+    one dead endpoint does not stall the fleet. The cursor is shared, so the
+    spread is even across every agent and project.
+    """
+
+    def __init__(self, config: HarnessConfig, store: Store):
+        self.config = config
+        self.store = store
+        self._lock = threading.Lock()
+        self._cursor = int(store.meta.get("llm_rr_cursor", 0) or 0)
+        # server name -> monotonic deadline it is unusable until
+        self._cooldown: dict[str, float] = {}
+        self._failures: dict[str, int] = {}
+
+    def servers(self) -> list:
+        return self.config.servers()
+
+    def pick(self) -> tuple[object, bool]:
+        """Next server in rotation, and whether any server was skipped.
+
+        Falls back to the primary when every server is cooling down: a dead
+        endpoint should surface as a normal transient error, not as 'no LLM'.
+        """
+        servers = self.servers()
+        if len(servers) == 1:
+            return servers[0], False
+        now = time.monotonic()
+        with self._lock:
+            start = self._cursor % len(servers)
+            self._cursor += 1
+            ordered = servers[start:] + servers[:start]
+            for srv in ordered:
+                if self._cooldown.get(srv.name, 0.0) <= now:
+                    return srv, any(
+                        self._cooldown.get(s.name, 0.0) > now for s in servers)
+            return servers[0], True
+
+    def mark_failure(self, name: str, seconds: float) -> None:
+        """Take a server out of rotation for `seconds` after a connection fault."""
+        with self._lock:
+            self._failures[name] = self._failures.get(name, 0) + 1
+            self._cooldown[name] = time.monotonic() + seconds
+
+    def mark_success(self, name: str) -> None:
+        with self._lock:
+            self._failures.pop(name, None)
+            self._cooldown.pop(name, None)
+
+    def status(self) -> list[dict]:
+        now = time.monotonic()
+        with self._lock:
+            return [{
+                "name": s.name,
+                "provider": s.provider,
+                "model": s.model,
+                "base_url": s.base_url,
+                "cooling_down": self._cooldown.get(s.name, 0.0) > now,
+                "cooldown_seconds": max(
+                    0.0, round(self._cooldown.get(s.name, 0.0) - now, 1)),
+                "consecutive_failures": self._failures.get(s.name, 0),
+            } for s in self.servers()]
+
+    def persist(self) -> None:
+        """Save the rotation position so a restart does not re-hit one server."""
+        with self._lock:
+            self.store.meta["llm_rr_cursor"] = self._cursor
+        # meta only reaches disk on a flush; without this the cursor is lost on
+        # every restart, which is the whole point of persisting it.
+        self.store.flush()
 
 
 class ConcurrencyGate:
@@ -231,6 +305,8 @@ class LLMQueueEntry:
     queued_at: float
     started_at: float | None = None
     status: str = "queued"   # queued | executing
+    server: str | None = None    # LLM server the action is bound to
+    skipped_servers: bool = False  # a server was cooling down when picked
 
 
 class AgentRuntime:
@@ -247,7 +323,11 @@ class AgentRuntime:
         self._lock = threading.RLock()
         self._agent_locks: dict[str, threading.Lock] = {}
         self._pool = ThreadPoolExecutor(
-            max_workers=max(1, config.max_parallel_workers),
+            # The pool must be larger than the gate. If they are the same size,
+            # every dispatched thread immediately wins a gate slot, so the
+            # backlog hides in the pool's own work queue and the dashboard's
+            # 'queued' lane is always empty.
+            max_workers=self._pool_size(config),
             thread_name_prefix="worker",
         )
         # Refcount, not a set: submit() marks a background dispatch and the run()
@@ -266,11 +346,101 @@ class AgentRuntime:
         self.llm_empty_responses = int(store.meta.get("llm_empty_responses", 0))
         self.llm_transient_errors = int(store.meta.get("llm_transient_errors", 0))
         self.gate = ConcurrencyGate(config.max_parallel_workers)
+        # Round-robins each run across the configured LLM servers.
+        self.rotator = LLMRotator(config, store)
         # Agent actions awaiting the LLM, in request order. Entries live only
         # for the duration of a run; the dashboard renders them as a queue.
         self._queue_lock = threading.Lock()
         self._llm_queue: list[LLMQueueEntry] = []
         self._queue_seq = 0
+
+    @staticmethod
+    def _pool_size(config: HarnessConfig) -> int:
+        """Threads the pool may run: gate slots plus the visible queue backlog."""
+        return max(1, config.max_parallel_workers) + max(0, config.llm_queue_depth)
+
+    def capacity(self) -> dict:
+        """How much LLM capacity exists right now, for scheduling decisions."""
+        with self._queue_lock:
+            queued = sum(1 for e in self._llm_queue if e.status == "queued")
+        limit = self.gate.limit
+        active = self.gate.active
+        return {
+            "llm_slots": limit,
+            "slots_in_use": active,
+            "slots_free": max(0, limit - active),
+            "queued": queued,
+            "pool_size": self._pool._max_workers,
+            "llm_servers": [s.name for s in self.rotator.servers()],
+        }
+
+    def rebind_stale_servers(self) -> tuple[int, int]:
+        """Move conversations onto live endpoints after a config change.
+
+        Catches both failure modes: a server removed from the config, and a
+        server that kept its name but now points somewhere else (new base_url
+        or model key). Returns (rebound, draining).
+
+        A conversation whose agent is mid-run is deliberately left alone:
+        swapping the LLM out from under a running step is not safe, and that
+        run finishes on the endpoint it started with. Its next run gets a live
+        server because the rotator no longer offers the stale one, so the old
+        endpoint drains down instead of being cut off mid-request.
+        """
+        servers = {s.name: s for s in self.rotator.servers()}
+        if not servers:
+            return (0, 0)
+        rebound = draining = 0
+        with self._lock:
+            open_convs = list(self._conversations.items())
+        for agent_id, conv in open_convs:
+            name = self._bound_server_name(conv.agent.llm)
+            server = servers.get(name)
+            if server is not None and self._llm_matches(conv.agent.llm, server):
+                continue
+            if agent_id in self.inflight:
+                draining += 1
+                continue
+            spec = self.store.agents.get(agent_id)
+            if spec is None:
+                continue
+            self._bind_server(spec, self.rotator.pick()[0].name)
+            rebound += 1
+        return (rebound, draining)
+
+    @staticmethod
+    def _bound_server_name(llm) -> str:
+        """Which configured server a live LLM was built for.
+
+        build_agent/_bind_server suffix usage_id with @server; an unrotated
+        conversation (usage_id == agent id) is on the primary endpoint.
+        """
+        usage_id = getattr(llm, "usage_id", "") or ""
+        return usage_id.rsplit("@", 1)[-1] if "@" in usage_id else ""
+
+    @staticmethod
+    def _llm_matches(llm, server) -> bool:
+        """Is this live LLM still pointed at this server's endpoint?"""
+        if llm.model != server.route() or (llm.base_url or "") != server.base_url:
+            return False
+        return (llm.max_input_tokens == server.max_input_tokens
+                and llm.max_output_tokens == server.max_output_tokens)
+
+    def sync_pool_size(self) -> None:
+        """Re-derive the pool ceiling from the current config."""
+        self.set_pool_size(self._pool_size(self.config))
+
+    def set_pool_size(self, limit: int) -> None:
+        """Raise the pool ceiling when the gate limit or queue depth is patched.
+
+        Grow-only: a stdlib worker thread only exits on a shutdown sentinel, so
+        lowering the ceiling cannot reclaim threads that already exist. That is
+        harmless here — surplus threads park on the work queue, and the gate,
+        not the pool, is what bounds real LLM concurrency.
+        """
+        size = max(1, limit)
+        if size > self._pool._max_workers:
+            self._pool._max_workers = size
 
     @property
     def inflight(self) -> set[str]:
@@ -320,12 +490,17 @@ class AgentRuntime:
         scope = agent.project_id or "global"
         return str(self.config.root_dir / "conversations" / scope / agent.id)
 
-    def build_agent(self, spec: AgentSpec, tools: list) -> Agent:
-        """Build the SDK Agent for a stored spec."""
-        llm = self.config.llm.build_llm(usage_id=spec.id, timeout=self.llm_timeout)
-        condenser_llm = self.config.llm.build_llm(
-            usage_id=f"{spec.id}-condenser", timeout=self.llm_timeout
-        )
+    def build_agent(self, spec: AgentSpec, tools: list,
+                    server_name: str | None = None) -> Agent:
+        """Build the SDK Agent for a stored spec, bound to one LLM server."""
+        server = self.config.server_named(server_name) or self.config.llm
+        suffix = f"@{server.name}" if server_name else ""
+        llm = LLM(**server.build_kwargs(
+            f"{spec.id}{suffix}", self.llm_timeout,
+            self.config.llm.num_retries, self.config.llm.drop_params))
+        condenser_llm = LLM(**server.build_kwargs(
+            f"{spec.id}{suffix}-condenser", self.llm_timeout,
+            self.config.llm.num_retries, self.config.llm.drop_params))
         condenser = LLMSummarizingCondenser(
             llm=condenser_llm,
             max_size=120,
@@ -377,6 +552,14 @@ class AgentRuntime:
                     current + cfg.min_request_timeout)
         return self.set_llm_timeout(grown)
 
+    def _server_cooldown(self) -> int:
+        """How long to park a server after a connection fault.
+
+        Tied to the current request timeout: that is roughly how long the
+        attempt already spent failing, and it grows with the adaptive timeout.
+        """
+        return int(min(max(30, self.llm_timeout), 600))
+
     def _persist_llm_health(self) -> None:
         self.store.meta.update({
             "llm_timeout": self.llm_timeout,
@@ -389,7 +572,8 @@ class AgentRuntime:
         with self._lock:
             return self._agent_locks.setdefault(agent_id, threading.Lock())
 
-    def open_conversation(self, spec: AgentSpec, tools: list) -> Conversation:
+    def open_conversation(self, spec: AgentSpec, tools: list,
+                          server_name: str | None = None) -> Conversation:
         """Open (or reuse) the persistent conversation for an agent spec."""
         with self._lock:
             existing = self._conversations.get(spec.id)
@@ -406,7 +590,7 @@ class AgentRuntime:
                 self.store.upsert_agent(spec)
 
             conv = Conversation(
-                agent=self.build_agent(spec, tools),
+                agent=self.build_agent(spec, tools, server_name),
                 workspace=spec.workspace or str(self.config.root_dir),
                 persistence_dir=persistence_dir,
                 conversation_id=conv_id,
@@ -429,11 +613,16 @@ class AgentRuntime:
     # ---------- LLM action queue ----------
 
     def _enqueue_llm(self, spec: AgentSpec, message: str, kind: str) -> LLMQueueEntry:
+        # The server is chosen when the request is made, not when the run is
+        # dispatched, so the rotation reflects real request order and the queue
+        # card can show which endpoint each action is bound to.
+        server, skipped = self.rotator.pick()
         entry = LLMQueueEntry(
             id=new_id("llm"), seq=self._next_seq(), agent_id=spec.id,
             agent_role=spec.role, project_id=spec.project_id,
             task_id=spec.task_id, kind=kind, depth=spec.depth,
             prompt=message, queued_at=time.time(),
+            server=server.name, skipped_servers=skipped,
         )
         with self._queue_lock:
             self._llm_queue.append(entry)
@@ -478,6 +667,8 @@ class AgentRuntime:
                     time.time() - e.started_at, 1) if e.started_at else None,
                 "prompt_chars": len(e.prompt),
                 "prompt_preview": e.prompt[:400],
+                "server": e.server,
+                "skipped_servers": e.skipped_servers,
             } for e in ordered]
 
     def llm_prompt(self, entry_id: str) -> str | None:
@@ -505,16 +696,63 @@ class AgentRuntime:
             with self._agent_lock(spec.id):
                 with self.gate.slot():
                     self._begin_llm(entry)
+                    self._bind_server(spec, entry.server)
                     # Tracked here rather than only in submit() so the
                     # orchestrator's own run, and any synchronous run_agent,
                     # also show as active.
                     self._mark_inflight(spec.id)
                     try:
-                        return self._run_guarded(spec, tools, message, turn_limit)
+                        return self._run_guarded(
+                            spec, tools, message, turn_limit,
+                            server_name=entry.server)
                     finally:
                         self._unmark_inflight(spec.id)
         finally:
             self._drop_llm(entry)
+            # Keep the rotation position across restarts so a restart does not
+            # send every first run to the same server.
+            self.rotator.persist()
+
+    def _bind_server(self, spec: AgentSpec, server_name: str | None) -> None:
+        """Point an already-open conversation at the server rotation picked.
+
+        The SDK caches one LLM per conversation, so switching is what actually
+        load-balances. usage_id is per agent+server: that keeps each server's
+        token metrics separate and lets the SDK reuse an LLM it already
+        registered when an agent lands on the same server again.
+        """
+        if not server_name:
+            return
+        server = self.config.server_named(server_name)
+        if server is None:
+            return
+        with self._lock:
+            conv = self._conversations.get(spec.id)
+        if conv is None:
+            return  # not open yet; build_agent will use this server directly
+        usage_id = f"{spec.id}@{server_name}"
+        if conv.agent.llm.usage_id == usage_id:
+            return
+        # Match the live timeout: the SDK only rebuilds the summarizing
+        # condenser onto the new endpoint when the swapped-in LLM otherwise
+        # matches the one it replaced, and set_llm_timeout mutates that timeout.
+        timeout = getattr(conv.agent.llm, "timeout", None) or self.llm_timeout
+        llm = LLM(**server.build_kwargs(
+            usage_id, timeout,
+            self.config.llm.num_retries, self.config.llm.drop_params))
+        try:
+            conv.switch_llm(llm)
+        except Exception:  # noqa: BLE001 - rotation must not fail the run
+            logger.exception("Could not switch %s to server %s", spec.id, server_name)
+            return
+        # Track whatever the conversation actually holds now (the SDK may have
+        # reused a cached LLM) so timeout retuning still reaches it.
+        with self._llm_lock:
+            live = [conv.agent.llm]
+            condenser_llm = getattr(conv.agent.condenser, "llm", None)
+            if condenser_llm is not None:
+                live.append(condenser_llm)
+            self._llms[spec.id] = live
 
     @staticmethod
     def _classify_run(spec: AgentSpec, tools: list) -> str:
@@ -527,13 +765,14 @@ class AgentRuntime:
         return "worker"
 
     def _run_guarded(self, spec: AgentSpec, tools: list, message: str,
-                     turn_limit: int | None) -> RunOutcome:
+                     turn_limit: int | None, *,
+                     server_name: str | None = None) -> RunOutcome:
         cfg = self.config.llm
         if turn_limit is not None:
             spec.turn_limit = turn_limit
 
         before_turns = spec.turns_used
-        conv = self.open_conversation(spec, tools)
+        conv = self.open_conversation(spec, tools, server_name)
         events_before = len(list(conv.state.events))
         conv.max_iteration_per_run = self._budget_for(spec)
 
@@ -570,6 +809,11 @@ class AgentRuntime:
                 error = f"{type(exc).__name__}: {exc}"
                 self.llm_transient_errors += 1
                 self._persist_llm_health()
+                # A connection fault means this endpoint is down or saturated;
+                # park it so the next runs go to a server that answers.
+                if server_name and isinstance(exc, TIMEOUT_LIKE_ERRORS):
+                    self.rotator.mark_failure(server_name, self._server_cooldown())
+                    health.append(f"server:{server_name}:down")
                 health.append(f"transient:{type(exc).__name__}")
                 logger.warning("Agent %s hit a transient LLM error: %s",
                                spec.id, error)
@@ -587,6 +831,8 @@ class AgentRuntime:
             spec.turns_used = turns_now
 
             if error is None and turns_now > before_turns:
+                if server_name:
+                    self.rotator.mark_success(server_name)
                 break  # the endpoint answered and the agent made progress
             if not retryable or attempt + 1 >= attempts:
                 break

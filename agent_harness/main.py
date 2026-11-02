@@ -72,7 +72,8 @@ def main(argv: list[str] | None = None) -> int:
 
     store = Store(config.data_dir)
     runtime = AgentRuntime(config, store)
-    orchestrator = Orchestrator(config, store, runtime)
+    orchestrator = Orchestrator(config, store, runtime,
+                       config_path=resolve_config_path(args.config))
 
     logger.info("Orchestrator harness v%s", version_string())
     logger.info("LLM: model=%s base_url=%s", config.llm.model, config.llm.base_url)

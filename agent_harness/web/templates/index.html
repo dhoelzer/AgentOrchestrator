@@ -164,6 +164,15 @@
     color:var(--dim); }
   form.settings input { background:var(--bg); color:var(--text); border:1px solid var(--line);
     border-radius:8px; padding:8px 10px; font:inherit; }
+  .serverrows { display:flex; flex-direction:column; gap:8px; margin:10px 0; }
+  .serverrow { display:grid; grid-template-columns:1fr 1.2fr 2fr 1.6fr 1.2fr auto;
+    gap:8px; align-items:center; }
+  .serverrow input, .serverrow select { background:var(--bg); color:var(--text);
+    border:1px solid var(--line); border-radius:8px; padding:7px 9px; font:inherit; }
+  .serverhealth { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .tag.ok { border-color:var(--ok); color:var(--ok); }
+  .tag.bad { border-color:var(--warn); color:var(--warn); }
+  .qcard .qserver { color:var(--dim); font-size:10px; }
   .blocked-reason { color:var(--warn); font-size:11px; margin-top:4px; }
   .blocked-reason .fix { display:block; color:var(--dim); margin-top:2px; }
   .kv { color:var(--dim); font-size:11px; font-variant-numeric:tabular-nums; }
@@ -278,10 +287,15 @@
     <label>Tick (s)<input name="tick_seconds" type="number" min="5"></label>
     <label>Sub-agent turn limit<input name="sub_agent_turn_limit" type="number" min="1"></label>
     <label>Parallel workers<input name="max_parallel_workers" type="number" min="1"></label>
+    <label>LLM queue depth<input name="llm_queue_depth" type="number" min="0"></label>
     <label>Max sub-agent depth<input name="max_sub_agent_depth" type="number" min="1"></label>
     <label>Input $/token<input name="llm.input_cost_per_token" type="number" step="any" min="0"></label>
     <label>Output $/token<input name="llm.output_cost_per_token" type="number" step="any" min="0"></label>
   </form>
+  <h4>LLM servers <span class="muted">(requests round-robin across these)</span></h4>
+  <div id="serverHealth" class="serverhealth"></div>
+  <div id="serverRows" class="serverrows"></div>
+  <div class="sec"><button class="ghost" id="addServer" type="button">Add server</button></div>
   <div class="sec"><button class="primary" id="settingsSave" type="button">Apply</button>
   <span class="muted" id="settingsMsg"></span></div>
 </div></dialog>

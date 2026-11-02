@@ -77,12 +77,22 @@ function renderHeader(d) {
     `Removed projects keep their spend in the activity feed.`;
   const llm = d.meta.llm || {};
   const unhealthy = (llm.empty_responses || 0) + (llm.transient_errors || 0) > 0;
+  const fleet = d.meta.llm_fleet || [];
+  const cap = d.meta.capacity || {};
+  const down = fleet.filter((s) => s.cooling_down);
   $("#llmPill").innerHTML =
     `llm: <b>${llm.timeout ?? "?"}s timeout</b>` +
+    (fleet.length > 1 ? ` · <b>${fleet.length - down.length}/${fleet.length}</b> servers` : "") +
     (unhealthy
       ? ` · <b>${(llm.empty_responses || 0) + (llm.transient_errors || 0)}</b> retried`
       : "");
-  $("#llmPill").classList.toggle("warn", unhealthy);
+  $("#llmPill").classList.toggle("warn", unhealthy || down.length > 0);
+  $("#llmPill").title =
+    `Endpoints in rotation (round-robin):\n` +
+    fleet.map((s) => `  ${s.name} · ${s.model} @ ${s.base_url}` +
+      (s.cooling_down ? ` · cooling ${s.cooldown_seconds}s` : "")).join("\n") +
+    `\nSlots: ${cap.slots_in_use ?? 0}/${cap.llm_slots ?? 0} in use` +
+    `, ${cap.queued ?? 0} queued`;
 }
 
 function renderAlerts(d) {
@@ -188,6 +198,8 @@ function renderQueue(queue) {
     <span class="qmeta">${e.status === "executing"
       ? `running ${e.running_seconds ?? 0}s`
       : `queued ${e.waiting_seconds}s`} · ${e.prompt_chars} chars</span>
+    ${e.server ? `<span class="qserver">${esc(e.server)}${
+        e.skipped_servers ? " · failover" : ""}</span>` : ""}
   </div>`;
   return `<div class="queue">
     <div class="qlane">
@@ -410,6 +422,19 @@ document.addEventListener("click", async (e) => {
     await saveSettings();
     return;
   }
+  if (t.id === "addServer") {
+    syncServerList();
+    serverList.push({ name: "", provider: "ollama_chat", base_url: "", model: "" });
+    $("#serverRows").innerHTML = serverList.map(serverRow).join("");
+    return;
+  }
+  if (t.dataset.srvdel !== undefined) {
+    syncServerList();
+    serverList.splice(Number(t.dataset.srvdel), 1);
+    $("#serverRows").innerHTML = serverList.map(serverRow).join("")
+      || '<p class="muted">No extra servers.</p>';
+    return;
+  }
   if (t.id === "ackAllBtn") {
     await fetch("/api/alerts/ack", {
       method: "POST",
@@ -550,9 +575,50 @@ async function doRemove() {
 const SETTING_KEYS = [
   "llm.model", "llm.base_url", "llm.api_key", "llm.request_timeout",
   "llm.max_request_timeout", "llm.empty_response_retries", "tick_seconds",
-  "sub_agent_turn_limit", "max_parallel_workers", "max_sub_agent_depth",
-  "llm.input_cost_per_token", "llm.output_cost_per_token",
+  "sub_agent_turn_limit", "max_parallel_workers", "llm_queue_depth",
+  "max_sub_agent_depth", "llm.input_cost_per_token",
+  "llm.output_cost_per_token",
 ];
+
+let serverList = [];
+let serversBaseline = "[]";
+
+function serverRow(srv, i) {
+  const s = srv || { name: "", provider: "ollama_chat", base_url: "", model: "" };
+  const cell = (f, ph) => `<input data-srv="${i}" data-field="${f}"
+      value="${esc(s[f] ?? "")}" placeholder="${ph}">`;
+  return `<div class="serverrow">
+    ${cell("name", "name")}
+    <select data-srv="${i}" data-field="provider">
+      ${["openai", "ollama", "ollama_chat"].map((p) =>
+        `<option ${s.provider === p ? "selected" : ""}>${p}</option>`).join("")}
+    </select>
+    ${cell("base_url", "http://host:11434/v1")}
+    ${cell("model", "model key sent to the server")}
+    ${cell("api_key", "(unchanged)")}
+    <button class="ghost" type="button" data-srvdel="${i}">Remove</button>
+  </div>`;
+}
+
+function syncServerList() {
+  // Capture what is currently typed before a re-render replaces the inputs.
+  serverList = collectServers();
+}
+
+function renderServers(cfg, health) {
+  serverList = (cfg.llm_servers || []).map((s) => ({ ...s }));
+  serversBaseline = JSON.stringify(serverList);
+  $("#serverRows").innerHTML = serverList.map(serverRow).join("")
+    || '<p class="muted">No extra servers — every request goes to the primary '
+     + 'endpoint above.</p>';
+  const primary = { name: cfg.llm?.name || "primary", model: cfg.llm?.model,
+                    base_url: cfg.llm?.base_url, provider: "openai" };
+  const rows = [primary, ...(health || [])];
+  $("#serverHealth").innerHTML = rows.map((h) => `<span class="tag ${
+      h.cooling_down ? "bad" : "ok"}" title="${esc(h.base_url || "")}">${
+      esc(h.name)} · ${esc(h.model)}${
+      h.cooling_down ? ` · cooling ${h.cooldown_seconds}s` : ""}</span>`).join("");
+}
 
 async function openSettings() {
   const res = await fetch("/api/config");
@@ -567,8 +633,22 @@ async function openSettings() {
     if (!input) continue;
     input.value = key === "llm.api_key" ? "" : (flat[key] ?? "");
   }
+  renderServers(d.config, d.llm_servers);
   $("#settingsMsg").textContent = "";
   $("#settings").showModal();
+}
+
+function collectServers() {
+  // Merge onto the loaded server objects: fields with no input here
+  // (extra_body, token caps, api_key_env) must survive an unrelated edit.
+  const out = serverList.map((s) => ({ ...s }));
+  for (const el of document.querySelectorAll("[data-srv][data-field]")) {
+    const i = Number(el.dataset.srv);
+    const row = out[i] || (out[i] = {});
+    const v = el.value.trim();
+    if (v) row[el.dataset.field] = v;
+  }
+  return out.filter((s) => s.name && s.base_url && s.model);
 }
 
 async function saveSettings() {
@@ -578,6 +658,10 @@ async function saveSettings() {
     const input = form.elements[key];
     if (!input || input.value === "") continue;
     patch[key] = input.value;
+  }
+  const servers = collectServers();
+  if (JSON.stringify(servers) !== serversBaseline) {
+    patch.llm_servers = servers;
   }
   if (!Object.keys(patch).length) {
     $("#settingsMsg").textContent = "Nothing to change.";

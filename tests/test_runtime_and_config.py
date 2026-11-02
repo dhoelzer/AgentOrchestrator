@@ -925,7 +925,7 @@ def test_inflight_refcount_survives_nested_submit_and_run():
         release = threading.Event()
         seen: list[int] = []
 
-        def fake_guarded(spec, tools, message, turn_limit):
+        def fake_guarded(spec, tools, message, turn_limit, **_kw):
             # submit() already marked it, so run()'s mark makes this depth 2.
             seen.append(runtime._inflight.get(agent.id, 0))
             entered.set()
