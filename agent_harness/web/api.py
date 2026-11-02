@@ -87,6 +87,9 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                 "board": board,
                 "counts": store.column_counts(project.id),
                 "tree": _agent_tree(store, project.id, active=active),
+                # Queued user input the orchestrator has not acted on yet, so
+                # the UI can show a request as 'pending' until a cycle consumes it.
+                "user_messages": project.user_messages,
             })
         return {
             "config": {
@@ -109,6 +112,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                                     for p in store.visible_projects()),
             "orchestrator_cost_usd": store.orchestrator_cost(),
             "columns": KANBAN_COLUMNS,
+            "llm_queue": orchestrator.runtime.llm_queue(),
             "projects": projects,
             "events": [e.model_dump() for e in store.recent_events[-60:]][::-1],
             "alerts": [a for a in _alerts(store) if not a["acknowledged"]],
@@ -343,6 +347,40 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         return {"id": task.id, "column": task.column,
                 "directives": len(task.user_directives)}
 
+    @app.post("/api/projects/{project_id}/messages")
+    def add_project_message(project_id: str, body: dict) -> dict:
+        """Add information or a new request for the orchestrator to act on.
+
+        The orchestrator turns it into task cards and agents on the next tick;
+        the harness cannot guess what new scope means for the plan.
+        """
+        project = _get_project(project_id)
+        text = (body.get("text") or "").strip()
+        if not text:
+            raise HTTPException(400, "Message text is required")
+        project.user_messages.append({
+            "text": text,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+        # A delivered/ready project would otherwise be skipped by the loop, so
+        # the user's new request would sit unread. Reopening it is what makes
+        # the button work after delivery.
+        reopened = project.status in ("ready_for_delivery", "delivered")
+        if reopened:
+            project.status = "active"
+            project.delivery_signaled = False
+            store.add_event(
+                "project_reopened",
+                f"Project '{project.name}' reopened by a new user request.",
+                project_id=project_id)
+        project.touch()
+        store.add_event("user_message",
+                        f"User added direction to '{project.name}': {text[:300]}",
+                        project_id=project_id)
+        store.flush()
+        return {"id": project.id, "messages": len(project.user_messages),
+                "status": project.status, "reopened": reopened}
+
     @app.post("/api/tick")
     def force_tick() -> dict:
         """Run one orchestrator cycle in the background, immediately."""
@@ -356,6 +394,25 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
             raise HTTPException(404, "Unknown task")
         return _task_json(task, full=True, agents=store.agents,
                         active=orchestrator.runtime.inflight)
+
+    @app.get("/api/projects/{project_id}/queue")
+    def project_queue(project_id: str) -> dict:
+        """Agent actions awaiting the LLM, oldest first.
+
+        Kept out of the card payloads because it is live runtime state, not
+        board state: the strip above the kanban polls it on its own cadence.
+        """
+        _get_project(project_id)
+        return {"queue": [e for e in orchestrator.runtime.llm_queue()
+                          if e["project_id"] in (project_id, None)]}
+
+    @app.get("/api/queue/{entry_id}/prompt")
+    def queue_prompt(entry_id: str) -> dict:
+        """The full prompt an queued action is waiting to send to the LLM."""
+        prompt = orchestrator.runtime.llm_prompt(entry_id)
+        if prompt is None:
+            raise HTTPException(404, "Queue entry already dispatched or gone")
+        return {"id": entry_id, "prompt": prompt}
 
     @app.get("/api/projects/{project_id}/agents/{agent_id}")
     def agent_detail(project_id: str, agent_id: str) -> dict:
@@ -400,6 +457,8 @@ def _task_json(task, full: bool = False, agents: dict | None = None,
     data = {
         "id": task.id, "title": task.title, "expertise": task.expertise,
         "column": task.column, "assigned_agent_id": task.assigned_agent_id,
+        "parent_task_id": task.parent_task_id,
+        "block_strikes": task.block_strikes,
         "reviewer_agent_id": task.reviewer_agent_id,
         "turns_used": task.turns_used, "turn_limit": task.turn_limit,
         "review_rounds": task.review_rounds,

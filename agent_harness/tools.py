@@ -134,6 +134,9 @@ def _task_dict(task: TaskSpec) -> dict:
         "review_verdict": task.review_verdict,
         "review_feedback": task.review_feedback,
         "blocked_reason": task.blocked_reason,
+        "blocked_cause": task.blocked_cause,
+        "block_strikes": task.block_strikes,
+        "parent_task_id": task.parent_task_id,
         "orchestrator_note": task.orchestrator_note,
         "user_directives": task.user_directives,
     }
@@ -239,6 +242,11 @@ class CreateTaskAction(Action):
         default_factory=list, description="File paths expected to exist when done.")
     depends_on: list[str] = Field(
         default_factory=list, description="Task IDs that must be done first.")
+    parent_task_id: str | None = Field(
+        default=None,
+        description="Set when this card is a piece of a bigger task you split. "
+                    "Give it the blocked/oversized task's id so the split is "
+                    "traceable on the board.")
     column: str = Field(default="backlog", description=f"One of {KANBAN_COLUMNS}.")
 
 
@@ -249,15 +257,21 @@ class CreateTaskExecutor(ToolExecutor):
             return _err(f"Unknown project_id {action.project_id}.")
         if action.column not in KANBAN_COLUMNS:
             return _err(f"Invalid column {action.column}. Use one of {KANBAN_COLUMNS}.")
+        if action.parent_task_id and action.parent_task_id not in c.store.tasks:
+            return _err(f"Unknown parent_task_id {action.parent_task_id}.")
         task = TaskSpec(
             project_id=action.project_id, title=action.title, objective=action.objective,
             expertise=action.expertise, acceptance_criteria=action.acceptance_criteria,
             deliverables=action.deliverables, depends_on=action.depends_on,
+            parent_task_id=action.parent_task_id,
             column=action.column, turn_limit=c.config.sub_agent_turn_limit,
         )
         c.store.upsert_task(task)
-        c.store.add_event("task_created", f"Task '{task.title}' created in {task.column}.",
-                          project_id=task.project_id, task_id=task.id)
+        c.store.add_event(
+            "task_created",
+            f"Task '{task.title}' created in {task.column}."
+            + (f" (split from {action.parent_task_id})" if action.parent_task_id else ""),
+            project_id=task.project_id, task_id=task.id)
         c.store.revise_project(task.project_id, f"plan: task '{task.title}' added")
         return _ok(f"Task {task.id} created in column '{task.column}'.")
 

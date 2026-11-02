@@ -248,6 +248,17 @@ specialists at once.
 - `POST /api/projects` — create a project
 - `POST /api/tick` — run a cycle immediately
 - `GET /api/config`, `POST /api/config` — read / live-patch runtime settings
+- `POST /api/projects/{id}/messages` — add information or a new request to a
+  running project (`{"text": "..."}`). The orchestrator reads it on its next tick
+  and turns it into task cards, staffing them with existing agents or new
+  specialists. Adding one to a `ready_for_delivery` / `delivered` project
+  reopens it, since the loop otherwise skips finished projects.
+- `GET /api/projects/{id}/queue` — agent actions waiting on the LLM, oldest
+  first (the UI renders newest on the left). Each entry carries the agent name,
+  run kind, `queued`/`executing` status, wait/run seconds and prompt size.
+- `GET /api/queue/{entry_id}/prompt` — the full prompt a queued action is about
+  to send. Entries only live while pending or in flight, so this 404s once the
+  model has answered.
 - `POST /api/projects/{id}/tasks/{id}/directives` — send the worker direction; a
   blocked task moves back to ready and the directive is injected into its next
   assignment prompt
@@ -275,6 +286,17 @@ shared across projects, so its spend is reported as harness overhead rather
 than being charged to whichever project it last touched. The header also
 reports loop health: agents running, cycles completed, and when the last cycle
 completed versus attempted.
+
+Above the kanban, a strip shows the **LLM action queue**: every agent action
+waiting for the model, as a card naming the agent. Queued actions run
+left-to-right newest-first, and the action the model is answering right now sits
+in its own pinned *executing* lane on the right. Click a card to read the prompt
+it is waiting to send. The strip polls every 1.5 s — faster than the board —
+because it is live runtime state, and it patches its own container instead of
+re-rendering the page.
+
+Each project also has a text box for adding information or a new request while
+it runs. Anything pending is shown as a warning tag until a cycle consumes it.
 
 ## Orphaned agents
 

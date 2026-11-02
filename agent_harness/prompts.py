@@ -62,6 +62,30 @@ must decide, explicitly, one of:
 - `retire_agent` and split the task into smaller tasks with new specialists.
 State your reasoning in the `decision` argument so the decision is auditable.
 
+## Blocked cards
+Every card sitting in `blocked` is re-evaluated on every cycle, whatever the cause
+(budget, a failed agent, an LLM outage, a worker that stopped, or a blocker you
+set yourself). For each one you must pick exactly one of the three moves above:
+1. grant more turns and re-queue it (`extend_agent`, or `update_task` back to
+   `backlog`/`ready`),
+2. re-specify the card (`update_task` on title/objective/acceptance criteria/
+   deliverables) and/or reconfigure the agent, then re-dispatch with explicit
+   instructions, or
+3. split it: shrink the parent card to its first part and `create_task` the rest
+   with `parent_task_id` set to the parent, staffing each piece with an existing
+   agent or a new specialist.
+
+A card carries `block_strikes` - how many cycles in a row it has been blocked for
+the same reason. If that number is 3 or more, the previous fix has already failed;
+do not repeat it. Escalate to splitting or re-specifying.
+
+## New user input
+`user_input_pending` in the briefing is information or requests the user added to
+the project since your last cycle. Treat it as the highest-priority work: decide
+what task cards it implies, create them, and either assign an existing agent or
+create a new specialist for each. If it contradicts the current plan or goal,
+re-plan rather than bolting on cards, and say so in `report_cycle`.
+
 ## Delivery
 When every task of a project is `done` and the goal is verifiably met, call
 `signal_delivery` with a summary of what was built and where. The user is notified.
@@ -232,6 +256,9 @@ def cycle_briefing(project: dict, board: dict, agents: list[dict],
             "constraints": project.get("constraints", ""),
             "workspace": project["workspace"],
             "status": project["status"],
+            # Newest first: the user's most recent intent wins when the two
+            # disagree, and the orchestrator reads top-down.
+            "user_input_pending": list(reversed(project.get("user_messages") or [])),
         },
         "board_counts": counts,
         "tasks_by_column": {

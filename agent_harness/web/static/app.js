@@ -3,7 +3,7 @@ const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-const state = { data: null, openProjects: new Set(), tab: "board" };
+const state = { data: null, openProjects: new Set(), tab: "board", queues: {} };
 
 const money = (v) => "$" + (Number(v || 0)).toFixed(4).replace(/0+$/, "").replace(/\.$/, ".00");
 
@@ -154,6 +154,69 @@ function renderTree(nodes) {
   return `<div class="tree">${nodes.map((n) => walk(n, true)).join("")}</div>`;
 }
 
+/* Agent actions waiting on the LLM. The API returns request order (oldest
+   first); the strip shows newest on the left and pins the executing action to
+   the right, so reading left-to-right reads as "just queued ... in flight". */
+/* Where the user adds information or a new request to a running project. The
+   orchestrator reads it on its next tick and turns it into cards and agents. */
+function renderMessageBar(p) {
+  const pending = (p.user_messages || []).slice(-3).reverse();
+  return `<div class="msgbar">
+    <form class="msgform" data-msg="${esc(p.id)}">
+      <input name="text" placeholder="Add information or a new request — the orchestrator will plan it next tick" autocomplete="off">
+      <button type="submit">Add to project</button>
+    </form>
+    ${pending.length ? `<div class="msgpending">${pending.map((m) =>
+        `<span class="tag pending" title="${esc(m.at)}">pending: ${esc(m.text.slice(0, 80))}</span>`
+      ).join("")}</div>` : ""}
+  </div>`;
+}
+
+function renderQueue(queue) {
+  const items = queue || [];
+  if (!items.length)
+    return '<div class="queue-empty muted">Nothing waiting on the LLM.</div>';
+  const executing = items.filter((e) => e.status === "executing");
+  const waiting = items.filter((e) => e.status !== "executing").reverse();
+  const card = (e) => `<div class="qcard ${esc(e.status)}" data-queue="${esc(e.id)}"
+      title="${esc(e.agent_role)} · ${esc(e.kind)} · ${
+        e.status === "executing"
+          ? `sending to the LLM for ${e.running_seconds ?? 0}s`
+          : `waiting ${e.waiting_seconds}s for a slot`}">
+    <span class="qkind ${esc(e.kind)}">${esc(e.kind)}</span>
+    <span class="qrole">${esc(e.agent_role)}</span>
+    <span class="qmeta">${e.status === "executing"
+      ? `running ${e.running_seconds ?? 0}s`
+      : `queued ${e.waiting_seconds}s`} · ${e.prompt_chars} chars</span>
+  </div>`;
+  return `<div class="queue">
+    <div class="qlane">
+      <span class="qlabel">queued</span>
+      <div class="qrow">${waiting.map(card).join("") || '<span class="muted">none</span>'}</div>
+    </div>
+    <div class="qlane exec">
+      <span class="qlabel">executing</span>
+      <div class="qrow">${executing.map(card).join("") || '<span class="muted">idle</span>'}</div>
+    </div>
+  </div>`;
+}
+
+async function showQueuePrompt(entryId) {
+  const res = await fetch(`/api/queue/${encodeURIComponent(entryId)}/prompt`);
+  const body = await res.json();
+  if (!res.ok) {
+    // The entry only lives while the run is pending or in flight, so it is
+    // normal for a click to arrive just after the LLM finished with it.
+    $("#detailBody").innerHTML = `<h3>Action already dispatched</h3>
+      <div class="muted">${esc(body.detail || "That action is no longer in the queue.")}</div>`;
+  } else {
+    $("#detailBody").innerHTML = `<h3>Prompt waiting for the LLM</h3>
+      <div class="muted">${esc(body.id)}</div>
+      <div class="sec"><h5>Prompt</h5><pre>${esc(body.prompt)}</pre></div>`;
+  }
+  $("#detail").showModal();
+}
+
 function renderBoard(p) {
   return `<div class="kanban">${p.columns_order
     .map((col) => {
@@ -204,6 +267,8 @@ function renderProjects(d) {
             <span class="spacer"></span>
             <span class="kv">${esc(p.workspace)}</span>
           </div>
+          ${renderMessageBar(p)}
+          <div id="queue-${p.id}" class="qwrap">${renderQueue(state.queues[p.id])}</div>
           <div class="grid2">
             <div>${state.tab === "board" ? renderBoard(p) : renderTree(p.tree)}</div>
             <div>
@@ -287,6 +352,24 @@ async function showAgent(projectId, agentId) {
 }
 
 document.addEventListener("submit", async (e) => {
+  const msgForm = e.target.dataset ? e.target.dataset.msg : null;
+  if (msgForm) {
+    e.preventDefault();
+    const text = (e.target.querySelector("input[name=text]").value || "").trim();
+    if (!text) return;
+    const res = await fetch(`/api/projects/${msgForm}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (res.ok) {
+      e.target.reset();
+      await refresh();
+    } else {
+      alert("Could not add that: " + (await res.text()));
+    }
+    return;
+  }
   if (e.target.id !== "projForm") return;
   e.preventDefault();
   const fd = new FormData(e.target);
@@ -329,6 +412,11 @@ document.addEventListener("click", async (e) => {
       body: JSON.stringify({ all: true }),
     });
     await refresh();
+    return;
+  }
+  const queueCard = t.closest && t.closest("[data-queue]");
+  if (queueCard) {
+    await showQueuePrompt(queueCard.dataset.queue);
     return;
   }
   if (t.dataset.ack) {
@@ -507,4 +595,21 @@ async function saveSettings() {
 }
 
 refresh();
+/* The queue is live runtime state, so it is polled faster than the board and
+   patched into its own container rather than re-rendering the whole page. */
+async function refreshQueues() {
+  const projects = (state.data && state.data.projects) || [];
+  await Promise.all(projects.map(async (p) => {
+    try {
+      const res = await fetch(`/api/projects/${p.id}/queue`);
+      if (!res.ok) return;
+      const body = await res.json();
+      state.queues[p.id] = body.queue;
+      const host = document.getElementById(`queue-${p.id}`);
+      if (host) host.innerHTML = renderQueue(body.queue);
+    } catch { /* harness mid-restart; next tick retries */ }
+  }));
+}
+
 setInterval(refresh, 5000);
+setInterval(refreshQueues, 1500);

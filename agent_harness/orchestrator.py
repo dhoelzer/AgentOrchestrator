@@ -104,6 +104,14 @@ class Orchestrator:
                         project_id=project.id, task_id=task.id,
                     )
 
+                # A card that is not blocked carries no grudge: reset its strike
+                # count so a later, unrelated block starts from one.
+                if task.column != "blocked" and (
+                        task.block_strikes or task.block_strike_reason):
+                    task.block_strikes = 0
+                    task.block_strike_reason = None
+                    task.touch()
+
             tasks = self.store.project_tasks(project.id)
             if tasks and all(t.column == "done" for t in tasks) \
                     and project.status == "active":
@@ -131,6 +139,17 @@ class Orchestrator:
         for project in self.store.visible_projects():
             board = self.store.board(project.id)
 
+            # Anything the user typed into the project box. This is the highest
+            # priority attention item: it is a direct human request, and the
+            # only thing that can turn it into work is the orchestrator.
+            for msg in project.user_messages:
+                note(project.id,
+                     f"NEW USER INPUT for this project (at {msg.get('at', '')}): "
+                     f"{msg.get('text', '')} - decide what task cards this implies, "
+                     "then create them and either assign an existing agent or "
+                     "create a new specialist for each. If it changes the goal or "
+                     "scope, say so in your report.")
+
             for task in board["review"]:
                 note(project.id,
                      f"Task {task.id} '{task.title}' is WAITING FOR REVIEW - coordinate a "
@@ -139,6 +158,10 @@ class Orchestrator:
 
             for task in board["blocked"]:
                 agent = self.store.agents.get(task.assigned_agent_id or "")
+                # Every blocked card is evaluated on every tick, so count how
+                # long it has sat blocked on the same reason. A changed blocker
+                # is a new problem and restarts the count.
+                strikes = self._count_strike(task)
                 if task.user_directives:
                     queued = "; ".join(
                         f"[{d.get('at', '')}] {d.get('text', '')}"
@@ -173,6 +196,7 @@ class Orchestrator:
                          + (f": {task.blocked_reason}" if task.blocked_reason else "")
                          + " - decide whether to re-dispatch, reconfigure, split it, "
                          "or ask the user for direction.")
+                note(project.id, self._recovery_menu(task, agent, strikes))
 
             for task in board["rework"]:
                 note(project.id,
@@ -257,6 +281,63 @@ class Orchestrator:
                 attention[project_id].append(health)
 
         return attention
+
+    def _count_strike(self, task) -> int:
+        """Record that this card was blocked again for the same reason.
+
+        Returns the count including this cycle. The escalation is what stops a
+        card cycling through the same failed plan forever: the orchestrator is
+        told plainly when repeating the same move has already not worked.
+        """
+        reason = task.blocked_reason or ""
+        if task.block_strike_reason != reason:
+            task.block_strike_reason = reason
+            task.block_strikes = 1
+        else:
+            task.block_strikes += 1
+        self.store.upsert_task(task)
+        return task.block_strikes
+
+    @staticmethod
+    def _recovery_menu(task, agent, strikes: int) -> str:
+        """The three ways out of a block, escalated by how long it has lasted.
+
+        The orchestrator must pick one deliberately rather than re-dispatching
+        the same agent on the same instructions and hoping for a different
+        result.
+        """
+        turns = f"{task.turns_used}/{task.turn_limit}"
+        head = (f"RECOVERY DECISION for blocked task {task.id} '{task.title}' "
+                f"(turns {turns}, blocked {strikes} cycle(s) in a row"
+                + (f", cause {task.blocked_cause}" if task.blocked_cause else "")
+                + "). Choose exactly one:")
+        options = [
+            "1. MORE TURNS: if the agent was making real progress and simply ran "
+            "out of budget, call `extend_agent` (it moves the card back to ready) "
+            "then `resume_agent` with the same agent, or move the card to backlog "
+            "with `update_task` to re-queue it.",
+            "2. RE-SPECIFY: if the agent was confused, drifting out of scope, or "
+            "misreading the objective, call `update_task` to rewrite the title, "
+            "objective, acceptance criteria and deliverables, and `reconfigure_agent` "
+            "to change its prompt/tools/model. Then re-dispatch with explicit "
+            "`instructions`.",
+            "3. SPLIT: if the work is simply too big for one agent, call "
+            "`update_task` to reduce the parent to the first part, then "
+            "`create_task` with parent_task_id set to this card for each remaining "
+            "part, and staff each with an existing agent or a new specialist.",
+        ]
+        if strikes >= 3:
+            options.append(
+                f"ESCALATION: this card has been blocked on the same reason for "
+                f"{strikes} cycles. Repeating the previous fix has not worked - "
+                "prefer option 3 (split) or option 2 (re-specify), and record your "
+                "reasoning in the `note`/`decision` field.")
+        if agent is not None and agent.status == "budget_exhausted":
+            options.append(
+                f"Note: {agent.id} ({agent.role}) is budget_exhausted at "
+                f"{agent.turns_used}/{agent.turn_limit} turns; its last report is "
+                "the best evidence for which option fits.")
+        return head + "\n   " + "\n   ".join(options)
 
     def housekeeping(self) -> tuple[dict[str, list[str]], list[str]]:
         """Back-compat wrapper: reconcile then detect."""
@@ -359,7 +440,8 @@ class Orchestrator:
         briefing = prompts.cycle_briefing(
             {"id": project.id, "name": project.name, "goal": project.goal,
              "constraints": project.constraints, "workspace": project.workspace,
-             "status": project.status},
+             "status": project.status,
+             "user_messages": project.user_messages},
             board, agents, attention,
         )
 
@@ -369,9 +451,31 @@ class Orchestrator:
         self.spec.project_id = project.id
         self.spec.touch()
 
+        # The queued user input is now in the briefing, so it is consumed here:
+        # keeping it queued would replay the same request every cycle. If the
+        # cycle fails, the messages go back so the request is never silently
+        # dropped.
+        queued = list(project.user_messages)
+        if queued:
+            project.user_messages = []
+            self.store.flush()
+
         tool_specs = [Tool(name=n) for n in harness_tools.ORCHESTRATOR_TOOLS]
-        outcome = self.runtime.run(self.spec, tool_specs, briefing,
-                                   turn_limit=self.spec.turn_limit)
+        try:
+            outcome = self.runtime.run(self.spec, tool_specs, briefing,
+                                       turn_limit=self.spec.turn_limit,
+                                       kind="orchestrator")
+        except Exception:
+            if queued:
+                project.user_messages = queued + project.user_messages
+                self.store.flush()
+            raise
+        # A run that never reached the model (endpoint down, agent failed before
+        # acting) consumed the briefing without acting on it. Put the user's
+        # request back so it is re-briefed next cycle instead of vanishing.
+        if queued and outcome.status in ("llm_unavailable", "failed"):
+            project.user_messages = queued + project.user_messages
+            self.store.flush()
 
         actions = [e.message for e in self.store.recent_events[-25:]
                    if e.kind in ("task_created", "agent_created", "agent_dispatched",
@@ -391,8 +495,11 @@ class Orchestrator:
             "acceptance_criteria": task.acceptance_criteria,
             "deliverables": task.deliverables,
             "assigned_agent_id": task.assigned_agent_id,
+            "parent_task_id": task.parent_task_id,
             "turns_used": task.turns_used, "turn_limit": task.turn_limit,
             "review_rounds": task.review_rounds,
+            "blocked_cause": task.blocked_cause,
+            "block_strikes": task.block_strikes,
             "result_summary": task.result_summary,
             "review_verdict": task.review_verdict,
             "review_feedback": task.review_feedback,

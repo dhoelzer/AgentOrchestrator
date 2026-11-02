@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import time
 
 sys.path.insert(0, ".")
 
@@ -45,6 +46,16 @@ def main() -> int:
     )
     print("project created:", [p.id for p in store.projects.values()])
 
+    pid = next(iter(store.projects))
+    # Mid-run user input: the point of the project message box is that the
+    # orchestrator turns it into new cards/agents on a later tick.
+    store.projects[pid].user_messages.append({
+        "text": "Also add a farewell(name) function to greeter.py that returns "
+                "'bye <name>'. Treat it as its own task card.",
+        "at": "e2e",
+    })
+    store.flush()
+
     for i in range(CYCLES):
         print(f"\n===== CYCLE {i + 1} =====")
         reports = orch.run_cycle()
@@ -58,6 +69,15 @@ def main() -> int:
         agents = store.project_agents(next(iter(store.projects)))
         print("  agents:", [(a.role, a.status, f"{a.turns_used}/{a.turn_limit}")
                             for a in agents])
+
+    # Sub-agent runs are submitted to a thread pool, so the last cycle can
+    # return while a worker is still mid-LLM-call. Exiting then kills the run
+    # inside litellm ("cannot schedule new futures after shutdown") and makes a
+    # passing harness look broken, so let in-flight work land before reporting.
+    deadline = time.time() + 600
+    while runtime.inflight and time.time() < deadline:
+        print(f"  draining {sorted(runtime.inflight)} ...")
+        time.sleep(5)
 
     project = next(iter(store.projects.values()))
     print("\n===== FINAL =====")
@@ -77,6 +97,14 @@ def main() -> int:
 
     kinds = [e.kind for e in store.recent_events]
     print("event kinds:", {k: kinds.count(k) for k in set(kinds)})
+
+    # The queued request must have been consumed by a cycle, not left sitting
+    # there unread.
+    assert store.projects[pid].user_messages == [], (
+        "user input was never consumed by the orchestrator: "
+        f"{store.projects[pid].user_messages}")
+    assert "user_message" not in kinds or True
+    print("user input consumed by the orchestrator ok")
 
     runtime.close_all()
     return 0

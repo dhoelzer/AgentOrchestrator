@@ -25,6 +25,7 @@ python tests/test_board_mechanics.py   # no LLM needed; fast, run this first
 python tests/test_runtime_and_config.py  # no LLM needed
 python tests/test_dashboard_features.py  # no LLM needed; removal, orphans, costs
 python tests/test_blocks_cost_version.py # no LLM needed; block causes, card cost, version
+python tests/test_queue_input_recovery.py # no LLM needed; LLM queue, project input, recovery
 python tests/test_e2e_llm.py 3         # needs the configured LLM endpoint
 python tests/test_turn_budget.py       # needs the configured LLM endpoint
 ```
@@ -33,11 +34,12 @@ python tests/test_turn_budget.py       # needs the configured LLM endpoint
 without an LLM. Prefer extending it over the LLM-backed tests when changing mechanics —
 the LLM tests take minutes and are non-deterministic.
 
-The LLM-backed tests print a `ConversationRunError: cannot schedule new futures
-after shutdown` traceback for one agent near the end. That is litellm's thread
-pool being torn down at interpreter exit while a background run is still
-finishing — it is logged by `_run_guarded`, does not fail the run, and the test
-still exits 0. Judge these tests by exit code, not by absence of ERROR lines.
+`test_e2e_llm.py` drains `runtime.inflight` before it prints its final report.
+Sub-agent runs go to a thread pool, so the last cycle can return while a worker
+is still mid-LLM-call; exiting then tears down litellm's thread pool under the
+run and raises `ConversationRunError: cannot schedule new futures after
+shutdown`. That is a test-harness race, not a harness bug — if you see it again,
+the drain is missing or the new code leaves something in `inflight` forever.
 
 ## Non-obvious SDK facts
 
@@ -299,3 +301,51 @@ still exits 0. Judge these tests by exit code, not by absence of ERROR lines.
   21 done cards advertised blockers they had resolved). The sweep runs after
   `_load_records`, not in `_repair_task` — that hook only fires when validation
   *fails*, and this data is valid, just inconsistent.
+
+
+## LLM action queue
+
+- `AgentRuntime._llm_queue` holds one `LLMQueueEntry` per agent action, created
+  **before** the concurrency gate is acquired. That ordering is the whole point:
+  an action that has a prompt but no slot is visible as `queued`, and flips to
+  `executing` only once it holds the slot and is actually in the model.
+- Entries are removed when the run returns, so the queue is live state only —
+  never persisted, never historical. `llm_queue()` returns **request order**
+  (ascending `seq`); the newest-left display is a frontend choice
+  (`.reverse()` in `renderQueue`), not the API contract.
+- The executing lane can hold more than one entry: the gate limit is
+  `max_concurrent_agents`, so several agents can be in the model at once.
+- The strip polls `/api/projects/{id}/queue` every 1.5 s and patches its own
+  container. Do not fold it into `/api/state`'s 5 s poll: the point is to show
+  what the model is doing *right now*, and a 5 s board poll is too coarse.
+  `/api/state` still carries `llm_queue` for the initial paint.
+
+## Project-level user input
+
+- `Project.user_messages` is the queue for "add information / new request" from
+  the dashboard. It is separate from `TaskSpec.user_directives`: a directive
+  steers an existing card's worker, a project message creates new scope.
+- The cycle **consumes** the messages when it builds the briefing, and puts them
+  back if the run did not reach the model (`llm_unavailable` / `failed`) or
+  raised. Consuming without restoring replays nothing; restoring on success would
+  re-ask the orchestrator to do the same work every tick.
+- Posting a message to a `ready_for_delivery` / `delivered` project must reopen
+  it (`status = "active"`, `delivery_signaled = False`) — `run_cycle()` skips
+  finished projects, so without the reopen the button silently does nothing
+  after delivery.
+- `prompts.orchestrator_briefing` passes them as `user_input_pending`, newest
+  first, because the orchestrator reads top-down and the latest intent wins.
+
+## Blocked cards are re-evaluated every tick
+
+- Every card in `blocked` gets a `RECOVERY DECISION` briefing line on every
+  cycle, whatever wrote the block — not just budget exhaustion. It names the
+  three moves: more turns, re-specify the card/agent, or split the card.
+- `block_strikes` counts consecutive cycles blocked on the **same**
+  `blocked_reason`; `block_strike_reason` is what the run is counting, so a
+  changed blocker restarts at 1 and leaving the column clears both
+  (`Orchestrator.reconcile`). At 3+ the briefing escalates and tells the
+  orchestrator the previous fix already failed.
+- Splits are traceable via `TaskSpec.parent_task_id` (settable on
+  `create_task`). Without it a split loses the audit trail of why three small
+  cards replaced one big one.

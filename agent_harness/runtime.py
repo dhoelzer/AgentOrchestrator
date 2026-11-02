@@ -31,7 +31,7 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.security.confirmation_policy import AlwaysConfirm, NeverConfirm
 
 from .config import HarnessConfig
-from .store import AGENT_STATUSES, AgentSpec, Store
+from .store import AGENT_STATUSES, AgentSpec, Store, new_id
 
 logger = get_logger(__name__)
 
@@ -208,6 +208,31 @@ class RunOutcome:
     llm_health: str | None = None
 
 
+@dataclass
+class LLMQueueEntry:
+    """One agent action waiting for, or currently using, the LLM.
+
+    The dashboard shows these as a queue: entries are created when a run is
+    requested and removed when it finishes, so 'queued' means the prompt is
+    written and waiting on a concurrency slot, and 'executing' means the LLM
+    has it. The prompt is kept here so the user can read exactly what the
+    harness is about to send.
+    """
+
+    id: str
+    seq: int
+    agent_id: str
+    agent_role: str
+    project_id: str | None
+    task_id: str | None
+    kind: str            # orchestrator | worker | reviewer
+    depth: int
+    prompt: str
+    queued_at: float
+    started_at: float | None = None
+    status: str = "queued"   # queued | executing
+
+
 class AgentRuntime:
     """Creates, resumes and runs agent conversations with budget enforcement."""
 
@@ -241,6 +266,11 @@ class AgentRuntime:
         self.llm_empty_responses = int(store.meta.get("llm_empty_responses", 0))
         self.llm_transient_errors = int(store.meta.get("llm_transient_errors", 0))
         self.gate = ConcurrencyGate(config.max_parallel_workers)
+        # Agent actions awaiting the LLM, in request order. Entries live only
+        # for the duration of a run; the dashboard renders them as a queue.
+        self._queue_lock = threading.Lock()
+        self._llm_queue: list[LLMQueueEntry] = []
+        self._queue_seq = 0
 
     @property
     def inflight(self) -> set[str]:
@@ -396,25 +426,105 @@ class AgentRuntime:
         remaining = max(0, spec.turn_limit - spec.turns_used)
         return max(1, remaining)
 
-    # ---------- execution ----------
+    # ---------- LLM action queue ----------
+
+    def _enqueue_llm(self, spec: AgentSpec, message: str, kind: str) -> LLMQueueEntry:
+        entry = LLMQueueEntry(
+            id=new_id("llm"), seq=self._next_seq(), agent_id=spec.id,
+            agent_role=spec.role, project_id=spec.project_id,
+            task_id=spec.task_id, kind=kind, depth=spec.depth,
+            prompt=message, queued_at=time.time(),
+        )
+        with self._queue_lock:
+            self._llm_queue.append(entry)
+        return entry
+
+    def _next_seq(self) -> int:
+        with self._queue_lock:
+            self._queue_seq += 1
+            return self._queue_seq
+
+    def _begin_llm(self, entry: LLMQueueEntry) -> None:
+        """Mark the entry as holding the LLM (it has its concurrency slot)."""
+        with self._queue_lock:
+            entry.status = "executing"
+            entry.started_at = time.time()
+
+    def _drop_llm(self, entry: LLMQueueEntry) -> None:
+        with self._queue_lock:
+            try:
+                self._llm_queue.remove(entry)
+            except ValueError:
+                pass
+
+    def llm_queue(self) -> list[dict]:
+        """Queue snapshot in request order: oldest first, newest last.
+
+        The UI renders this reversed (newest on the left) with the executing
+        entry pinned to the right, so the order here is the source of truth and
+        the display is a presentation choice.
+        """
+        with self._queue_lock:
+            ordered = sorted(self._llm_queue, key=lambda e: e.seq)
+            return [{
+                "id": e.id, "seq": e.seq, "agent_id": e.agent_id,
+                "agent_role": e.agent_role, "project_id": e.project_id,
+                "task_id": e.task_id, "kind": e.kind, "depth": e.depth,
+                "status": e.status, "queued_at": e.queued_at,
+                "started_at": e.started_at,
+                "waiting_seconds": round(
+                    (e.started_at or time.time()) - e.queued_at, 1),
+                "running_seconds": round(
+                    time.time() - e.started_at, 1) if e.started_at else None,
+                "prompt_chars": len(e.prompt),
+                "prompt_preview": e.prompt[:400],
+            } for e in ordered]
+
+    def llm_prompt(self, entry_id: str) -> str | None:
+        with self._queue_lock:
+            for e in self._llm_queue:
+                if e.id == entry_id:
+                    return e.prompt
+        return None
 
     def run(self, spec: AgentSpec, tools: list, message: str,
-            turn_limit: int | None = None) -> RunOutcome:
+            turn_limit: int | None = None, kind: str | None = None) -> RunOutcome:
         """Run one budgeted stretch of an agent's conversation.
 
         A run that produces no agent turn at all — an empty completion, or an
         endpoint that timed out before answering — is retried with a widened
         timeout instead of being reported as an agent failure.
+
+        The run is queued before the concurrency gate is acquired, so the
+        dashboard can show a prompt that is written and waiting on a slot as
+        distinct from one the LLM is currently working on.
         """
-        with self._agent_lock(spec.id):
-            with self.gate.slot():
-                # Tracked here rather than only in submit() so the orchestrator's
-                # own run, and any synchronous run_agent, also show as active.
-                self._mark_inflight(spec.id)
-                try:
-                    return self._run_guarded(spec, tools, message, turn_limit)
-                finally:
-                    self._unmark_inflight(spec.id)
+        entry = self._enqueue_llm(
+            spec, message, kind or self._classify_run(spec, tools))
+        try:
+            with self._agent_lock(spec.id):
+                with self.gate.slot():
+                    self._begin_llm(entry)
+                    # Tracked here rather than only in submit() so the
+                    # orchestrator's own run, and any synchronous run_agent,
+                    # also show as active.
+                    self._mark_inflight(spec.id)
+                    try:
+                        return self._run_guarded(spec, tools, message, turn_limit)
+                    finally:
+                        self._unmark_inflight(spec.id)
+        finally:
+            self._drop_llm(entry)
+
+    @staticmethod
+    def _classify_run(spec: AgentSpec, tools: list) -> str:
+        """Label the queue card by what the agent is being asked to do."""
+        if spec.role == "orchestrator":
+            return "orchestrator"
+        names = {getattr(t, "name", "") for t in tools}
+        if spec.is_reviewer or "record_review" in names:
+            return "reviewer"
+        return "worker"
 
     def _run_guarded(self, spec: AgentSpec, tools: list, message: str,
                      turn_limit: int | None) -> RunOutcome:

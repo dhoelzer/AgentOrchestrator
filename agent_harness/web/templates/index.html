@@ -99,6 +99,43 @@
     animation:pulse 1.4s ease-in-out infinite; }
   .light.off { background:#3a3f4b; border:1px solid var(--line); }
   @keyframes pulse { 50% { opacity:.45; } }
+
+  /* LLM action queue: newest queued action at the left, the one the model has
+     right now pinned to the right. */
+  .qwrap { margin:10px 0 4px; }
+  .queue { display:flex; gap:14px; align-items:stretch; flex-wrap:wrap;
+    border:1px solid var(--line); border-radius:10px; padding:8px 10px;
+    background:rgba(255,255,255,.02); }
+  .qlane { display:flex; align-items:center; gap:8px; min-width:0; flex:1 1 auto; }
+  .qlane.exec { flex:0 0 auto; }
+  .qlane.exec .qrow { border-left:1px solid var(--line); padding-left:10px; }
+  .qlabel { font-size:10px; text-transform:uppercase; letter-spacing:.06em;
+    color:var(--dim); flex:0 0 auto; }
+  .qrow { display:flex; gap:6px; align-items:center; overflow-x:auto;
+    max-width:100%; scrollbar-width:thin; }
+  .qcard { display:flex; flex-direction:column; gap:2px; cursor:pointer;
+    border:1px solid var(--line); border-radius:8px; padding:5px 8px;
+    background:var(--panel); min-width:118px; flex:0 0 auto; }
+  .qcard:hover { border-color:var(--accent); }
+  .qcard.executing { border-color:var(--ok);
+    box-shadow:0 0 8px rgba(63,178,127,.35); }
+  .qkind { font-size:9px; text-transform:uppercase; letter-spacing:.05em;
+    color:var(--dim); }
+  .qcard.executing .qkind { color:var(--ok); }
+  .qrole { font-size:12px; font-weight:600; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; max-width:190px; }
+  .qmeta { font-size:10px; color:var(--dim); font-variant-numeric:tabular-nums; }
+  .queue-empty { font-size:11px; margin:6px 0; }
+
+  /* Project-level user input: the box that feeds the orchestrator new scope. */
+  .msgbar { margin:10px 0 0; display:flex; flex-direction:column; gap:6px; }
+  .msgform { display:flex; gap:8px; }
+  .msgform input { flex:1; background:var(--bg); color:var(--text);
+    border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  .msgpending { display:flex; gap:6px; flex-wrap:wrap; }
+  .tag.pending { border-color:var(--warn); color:var(--warn); }
+  .tag.split { border-style:dashed; }
+
   .tag { border:1px solid var(--line); border-radius:5px; padding:1px 6px; }
   .turns { font-variant-numeric:tabular-nums; }
   .turns.hot { color:var(--warn); }

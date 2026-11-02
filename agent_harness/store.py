@@ -89,6 +89,13 @@ class TaskSpec(_Model):
     turn_limit: int = 100
     runs: int = 0
     review_rounds: int = 0
+    # How many cycles in a row this card has been blocked for the same reason.
+    # The orchestrator gets a nudge that escalates with the count: one block is
+    # a hiccup, several identical blocks mean the current plan is not working.
+    block_strikes: int = 0
+    # The blocked_reason the current strike run is counting, so a *changed*
+    # blocker restarts the count instead of inheriting the old one.
+    block_strike_reason: str | None = None
 
     # Why the task sits in 'blocked', and any direction the user has supplied
     # since. Directives are queued so the orchestrator cannot miss one that
@@ -193,6 +200,11 @@ class Project(_Model):
     # derived from the event log, which rotates) so the dashboard can show a
     # version history even long after the events scrolled off.
     revision_log: list[dict] = Field(default_factory=list)
+    # Free-text the user has added since the last cycle: new information, a
+    # changed mind, an extra request. Queued rather than applied directly
+    # because only the orchestrator can turn it into tasks and agents. Consumed
+    # by the cycle that briefs on it, so nothing is missed or replayed.
+    user_messages: list[dict] = Field(default_factory=list)
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
 
