@@ -437,6 +437,8 @@ def test_ui_assets_wire_the_queue_and_message_box():
     assert ".reverse()" in js, "newest-left ordering missing"
     assert "renderMessageBar" in js, "project message box missing"
     assert "/messages" in js, "message POST missing"
+    # The strip must be right on first paint, not only after the fast poll.
+    assert "d.llm_queue" in js, "refresh() must seed queues from /api/state"
     for sel in (".qcard", ".qlane.exec", ".msgform"):
         assert sel in html, f"{sel} style missing"
     print("queue/message UI contract ok")

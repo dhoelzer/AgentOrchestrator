@@ -299,8 +299,13 @@ async function refresh() {
   const res = await fetch("/api/state");
   const d = await res.json();
   state.data = d;
+  // Seed the queue from the state payload so the strip is right on first paint;
+  // the faster per-project poll keeps it current between refreshes.
+  const q = d.llm_queue || [];
   d.projects.forEach((p) => {
     p.columns_order = d.columns;
+    state.queues[p.id] = q.filter(
+      (e) => e.project_id === p.id || e.project_id === null);
     if (!state.openProjects.has(p.id) && p.status !== "delivered") state.openProjects.add(p.id);
   });
   renderHeader(d);
