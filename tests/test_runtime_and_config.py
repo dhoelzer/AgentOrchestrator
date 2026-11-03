@@ -427,9 +427,20 @@ def test_run_retries_empty_and_transient_failures():
         assert outcome.llm_retries == 2, outcome
         assert outcome.status == "idle", outcome
         assert len(flaky.messages) == 3, flaky.messages
-        # Every attempt carries the same assignment: the failure is the
-        # endpoint's, and the agent must not be told about it.
-        assert flaky.messages == ["do the work"] * 3, flaky.messages
+        # Attempt 2 resends the assignment verbatim: the request timed out, so
+        # the model may never have seen it. The agent is never told about the
+        # endpoint failure either way.
+        assert flaky.messages[0] == "do the work", flaky.messages
+        assert flaky.messages[1] == "do the work", flaky.messages
+        # Attempt 3 follows an *empty completion*: the model got the whole
+        # briefing and answered with nothing, so re-appending it would double
+        # the prefill of a prompt that can run to hundreds of thousands of
+        # tokens. A short nudge is enough.
+        assert flaky.messages[2] != "do the work", flaky.messages
+        assert "do the work" not in flaky.messages[2]
+        for m in flaky.messages:
+            for tell in ("timed out", "returned nothing", "no usable output"):
+                assert tell not in m, (m, tell)
         # The timeout grew because the endpoint timed out.
         assert runtime.llm_timeout > cfg.llm.request_timeout, runtime.llm_timeout
         assert runtime.llm_transient_errors >= 1

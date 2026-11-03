@@ -21,6 +21,7 @@ from openhands.sdk.logger import get_logger
 from . import prompts, tools as harness_tools
 from .config import HarnessConfig, resolve_config_path
 from .runtime import AgentRuntime
+from .scheduler import Scheduler
 from .store import AgentSpec, Store, new_id, now_iso
 
 logger = get_logger(__name__)
@@ -53,6 +54,11 @@ class Orchestrator:
         # landing on a running cycle enqueues a second orchestrator LLM request
         # while the first one is still holding the conversation.
         self._cycle_lock = threading.Lock()
+        # Starts work the orchestrator has already assigned, on its own tick, so
+        # a staffed card does not wait for another orchestrator turn (and
+        # another trip through a saturated endpoint) before anything happens.
+        self.scheduler = Scheduler(config, store, runtime)
+        self._scheduler_notes: list[tuple[str | None, str]] = []
         # Recent cycle durations, and the interval the loop is currently using.
         self._cycle_durations: deque[float] = deque(maxlen=12)
         self._last_skip_event_at: float | None = None
@@ -663,10 +669,23 @@ class Orchestrator:
         finally:
             self._cycle_lock.release()
 
+    def _run_scheduler(self) -> list[tuple[str | None, str]]:
+        try:
+            return self.scheduler.sweep()
+        except Exception:  # noqa: BLE001 - dispatch is not worth killing a tick
+            logger.exception("Scheduler sweep failed")
+            return []
+
     def _note_cycle_skip(self, why: str) -> None:
         started = int(self.store.meta.get("cycle_started_at") or time.time())
         self.store.meta["cycle_skips"] = int(
             self.store.meta.get("cycle_skips", 0)) + 1
+        # How long the in-flight cycle has been holding the loop, and why the
+        # new one was refused. The dashboard turns this into an alert: a loop
+        # that refuses cycle after cycle is the "nothing is moving" symptom, and
+        # a bare skip counter does not say what is blocking it.
+        self.store.meta["cycle_stuck_seconds"] = int(time.time() - started)
+        self.store.meta["cycle_skip_reason"] = why
         # Coalesced: a long cycle makes the loop retry many times, and one
         # event per retry buries the feed in identical noise. The counter
         # still increments every time.
@@ -712,6 +731,9 @@ class Orchestrator:
         attention_map = self.detect()
         for project_id, notes in self._config_attention().items():
             attention_map.setdefault(project_id, []).extend(notes)
+        for project_id, note in self._scheduler_notes:
+            if project_id:
+                attention_map.setdefault(project_id, []).append(note)
         reports: list[CycleReport] = []
 
         for project in self.store.visible_projects():
@@ -738,6 +760,12 @@ class Orchestrator:
         now = int(time.time())
         meta = self.store.meta
         started = meta.get("cycle_started_at")
+        # A cycle that ran ends the stall: leaving the skip counters set keeps
+        # the alert up after the problem has cleared.
+        if int(meta.get("cycle_skips", 0)):
+            meta["cycle_skips"] = 0
+            meta["cycle_stuck_seconds"] = 0
+            meta["cycle_skip_reason"] = None
         meta["cycle_count"] = int(meta.get("cycle_count", 0)) + 1
         meta["cycle_status"] = status
         meta["cycle_duration"] = (now - int(started)) if started else 0
@@ -918,6 +946,12 @@ class Orchestrator:
             self.store.meta["cycle_started_at"] = int(started)
             self.store.meta["cycle_status"] = "running"
             self.store.flush()
+            # Before the cycle, and regardless of whether one is allowed to
+            # run: this is the part of orchestration that needs no model, so it
+            # must not be gated on an orchestrator slot. A cycle that keeps
+            # getting skipped because one orchestrator prompt is stuck should
+            # still start work that is already staffed and unblocked.
+            self._scheduler_notes = self._run_scheduler()
             reports = None
             try:
                 reports = self.run_cycle()

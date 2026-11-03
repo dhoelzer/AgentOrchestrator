@@ -30,11 +30,19 @@ class FakeUpstream:
 
     def __init__(self, name: str, port: int, *, latency: float = 0.0,
                  tokens: int = 8, fail: tuple[int, str] | None = None,
-                 stream_latency: float = 0.0,
+                 stream_latency: float = 0.0, stall: float = 0.0,
+                 reject_stream: bool = False,
                  known_models: set[str] | None = None):
         self.name, self.port = name, port
         self.latency, self.tokens, self.fail = latency, tokens, fail
         self.stream_latency = stream_latency
+        # Emit headers and one chunk, then go silent without closing the body:
+        # a half-open stream, which is what a model that died mid-generation
+        # looks like from the client side.
+        self.stall = stall
+        # Some OpenAI-compatible gateways refuse stream=true outright. A 4xx on
+        # the option must not be read as a dead endpoint.
+        self.reject_stream = reject_stream
         # When set, the endpoint only answers for these exact model names and
         # 404s otherwise - how Ollama behaves, since it looks the string up in
         # its own model list rather than ignoring it.
@@ -91,6 +99,15 @@ class FakeUpstream:
                     return
                 if outer.latency:
                     time.sleep(outer.latency)
+                if outer.reject_stream and body.get("stream"):
+                    payload = json.dumps(
+                        {"error": "streaming is not supported here"}).encode()
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 if body.get("stream"):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -102,14 +119,34 @@ class FakeUpstream:
                         self.wfile.write(b"%X\r\n" % len(line) + line + b"\r\n")
                         self.wfile.flush()
 
+                    # Content is split across chunks so a reassembling proxy is
+                    # exercised for real, and the trailing usage chunk is only
+                    # sent when the caller asked for one - which is what a real
+                    # OpenAI-compatible endpoint does.
                     emit({"id": "x", "object": "chat.completion.chunk",
+                          "model": body.get("model"),
                           "choices": [{"index": 0,
-                                       "delta": {"content": "hi"},
+                                       "delta": {"role": "assistant",
+                                                 "content": "hi"},
                                        "finish_reason": None}]})
                     if outer.stream_latency:
                         time.sleep(outer.stream_latency)
+                    if outer.stall:
+                        time.sleep(outer.stall)
+                        return
                     emit({"id": "x", "object": "chat.completion.chunk",
-                          "choices": [], "finish_reason": "stop"})
+                          "choices": [{"index": 0,
+                                       "delta": {"content": "-reply"},
+                                       "finish_reason": None}]})
+                    emit({"id": "x", "object": "chat.completion.chunk",
+                          "choices": [{"index": 0, "delta": {},
+                                       "finish_reason": "stop"}]})
+                    if body.get("stream_options", {}).get("include_usage"):
+                        emit({"id": "x", "object": "chat.completion.chunk",
+                              "choices": [],
+                              "usage": {"prompt_tokens": 11,
+                                        "completion_tokens": outer.tokens,
+                                        "total_tokens": 11 + outer.tokens}})
                     done = b"data: [DONE]\n\n"
                     self.wfile.write(b"%X\r\n" % len(done) + done + b"\r\n")
                     # A chunked body is not finished until the zero-length chunk
@@ -220,9 +257,15 @@ def test_endpoint_extra_body_reaches_the_wire():
     print("endpoint extra_body ok")
 
 
-def test_router_deadline_follows_the_widened_timeout():
+def test_router_deadline_follows_the_widened_timeout_up_to_a_ceiling():
     """Adaptive widening lives in the store; the router must not cap upstream
-    below the deadline the agent's own client is already waiting for."""
+    below the deadline the agent's own client is already waiting for.
+
+    But it must cap it eventually: an unbounded deadline lets one half-open
+    upstream socket hold an endpoint slot for as long as the widening has
+    drifted, which is how a harness ends up with an idle endpoint and nothing
+    running.
+    """
     up = FakeUpstream("a", 8926)
     cfg = HarnessConfig(); cfg.data_dir = tempfile.mkdtemp()
     cfg.llm = LLMConfig(name="a", base_url="http://127.0.0.1:8926/v1", model="m")
@@ -230,12 +273,127 @@ def test_router_deadline_follows_the_widened_timeout():
     store = Store(cfg.data_dir)
     r = make_router(cfg, store); r.start()
     assert r.upstream_timeout == 300, r.upstream_timeout
-    store.meta["llm_timeout"] = 1200
-    assert r.upstream_timeout == 1200, r.upstream_timeout
-    cfg.llm.request_timeout = 1800
-    assert r.upstream_timeout == 1800, r.upstream_timeout
+    store.meta["llm_timeout"] = 600
+    assert r.upstream_timeout == 600, r.upstream_timeout
+    cfg.llm.request_timeout = 800
+    assert r.upstream_timeout == 800, r.upstream_timeout
+    # Past the ceiling the widening stops applying, however high it drifts.
+    store.meta["llm_timeout"] = 3600
+    assert r.upstream_timeout == cfg.router_max_call_timeout, r.upstream_timeout
+    cfg.router_max_call_timeout = 1500
+    assert r.upstream_timeout == 1500, r.upstream_timeout
     r.stop(); up.stop()
-    print("router deadline follows widening ok")
+    print("router deadline follows widening up to the ceiling ok")
+
+
+def test_non_streaming_caller_gets_streamed_upstream_reassembled():
+    """The router asks the upstream to stream even when the caller did not, so a
+    dead endpoint shows up as a gap between chunks instead of as silence. The
+    caller still has to receive a single well-formed chat.completion body."""
+    a = FakeUpstream("a", 8931, tokens=5)
+    cfg = HarnessConfig(); cfg.data_dir = tempfile.mkdtemp()
+    cfg.llm = LLMConfig(name="a", base_url="http://127.0.0.1:8931/v1", model="m")
+    r = make_router(cfg, Store(cfg.data_dir)); r.start()
+    resp = httpx.post(r.base_url + "/chat/completions",
+                      json={"model": "x",
+                            "messages": [{"role": "user", "content": "hi"}]},
+                      timeout=30)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["object"] == "chat.completion", body
+    # Split across chunks upstream, whole again on the way out.
+    assert body["choices"][0]["message"]["content"] == "hi-reply", body
+    assert body["choices"][0]["finish_reason"] == "stop", body
+    # The router asked for a stream on the upstream's behalf.
+    assert a.requests[-1]["stream"] is True, a.requests[-1]
+    assert a.requests[-1]["stream_options"]["include_usage"] is True
+    # Usage survived the reassembly, so cost and throughput stay accurate.
+    assert body["usage"]["completion_tokens"] == 5, body
+    r.stop(); a.stop()
+    print("forced-stream reassembly ok")
+
+
+def test_stalled_stream_is_aborted_and_the_slot_reclaimed():
+    """The stuck-harness signature: a request sits in 'awaiting', the endpoint
+    looks idle, and nothing else moves.
+
+    A half-open upstream (headers and one chunk, then silence, no error) is
+    indistinguishable from a slow generation unless the router bounds the gap
+    between chunks. Without that bound the request holds an endpoint slot for
+    the whole call ceiling and every other request queues behind it.
+    """
+    dead = FakeUpstream("dead", 8932, stall=6.0)
+    cfg = HarnessConfig(); cfg.data_dir = tempfile.mkdtemp()
+    cfg.llm = LLMConfig(name="dead", base_url="http://127.0.0.1:8932/v1",
+                        model="m")
+    cfg.llm.request_timeout = 300
+    cfg.router_max_call_timeout = 300
+    cfg.router_stall_timeout = 1
+    store = Store(cfg.data_dir)
+    r = make_router(cfg, store); r.start()
+    started = time.monotonic()
+    resp = httpx.post(r.base_url + "/chat/completions",
+                      json={"model": "x",
+                            "messages": [{"role": "user", "content": "hi"}]},
+                      timeout=30)
+    waited = time.monotonic() - started
+    assert resp.status_code >= 500, resp.text
+    # Aborted on the stall window, not on the 300s call ceiling.
+    assert waited < 5.0, waited
+    # The slot came back: a reclaimed slot is the whole point.
+    srv = r.status()["servers"][0]
+    assert srv["in_flight"] == 0, srv
+    assert srv["requests_failed"] >= 1, srv
+    r.stop(); dead.stop()
+    print("stalled stream aborted, slot reclaimed ok")
+
+
+def test_slow_but_live_stream_is_not_aborted():
+    """The stall window must not punish a model that is merely slow.
+
+    A local 30B model can pause for a while between tokens; killing those turns
+    the stall detector into a self-inflicted outage.
+    """
+    slow = FakeUpstream("slow", 8933, stream_latency=0.6, tokens=3)
+    cfg = HarnessConfig(); cfg.data_dir = tempfile.mkdtemp()
+    cfg.llm = LLMConfig(name="slow", base_url="http://127.0.0.1:8933/v1",
+                        model="m")
+    cfg.router_stall_timeout = 3
+    cfg.router_max_call_timeout = 30
+    r = make_router(cfg, Store(cfg.data_dir)); r.start()
+    resp = httpx.post(r.base_url + "/chat/completions",
+                      json={"model": "x",
+                            "messages": [{"role": "user", "content": "hi"}]},
+                      timeout=30)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["choices"][0]["message"]["content"] == "hi-reply"
+    r.stop(); slow.stop()
+    print("slow live stream survives the stall window ok")
+
+
+
+def test_stream_refusing_endpoint_falls_back_to_a_plain_call():
+    """An endpoint that rejects stream=true is a 4xx on the option, not a dead
+    endpoint. Parking it would take a healthy server out of the fleet, and with
+    a single configured endpoint that means the harness has no LLM at all."""
+    a = FakeUpstream("refuse", 8936, reject_stream=True)
+    cfg = HarnessConfig(); cfg.data_dir = tempfile.mkdtemp()
+    cfg.llm = LLMConfig(name="refuse", base_url="http://127.0.0.1:8936/v1",
+                        model="m")
+    r = make_router(cfg, Store(cfg.data_dir)); r.start()
+    resp = httpx.post(r.base_url + "/chat/completions",
+                      json={"model": "x",
+                            "messages": [{"role": "user", "content": "hi"}]},
+                      timeout=30)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["choices"][0]["message"]["content"] == "refuse-reply"
+    # It tried streaming first, then retried without it.
+    assert a.requests[0].get("stream") is True, a.requests
+    assert not a.requests[-1].get("stream"), a.requests
+    srv = r.status()["servers"][0]
+    assert srv["reachable"] and not srv["cooling_down"], srv
+    r.stop(); a.stop()
+    print("stream-refusing endpoint falls back ok")
 
 
 def test_ollama_endpoint_does_not_receive_reasoning_effort():
@@ -377,7 +535,10 @@ def test_router_streams_sse_through():
                       timeout=30) as resp:
         assert resp.status_code == 200
         lines = [l for l in resp.iter_lines() if l.startswith("data:")]
-    assert len(lines) == 3, lines          # delta + finish + [DONE]
+    # A caller that asked for a stream gets the upstream's chunks verbatim,
+    # including [DONE] - the router must not re-frame or drop any of them.
+    assert len(lines) == 4, lines          # 2 deltas + finish + [DONE]
+    assert lines[-1] == "data: [DONE]"
     assert a.requests[-1]["model"] == "openai/prim"
     r.stop(); a.stop()
     print("streaming relay ok")

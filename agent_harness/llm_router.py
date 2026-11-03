@@ -24,6 +24,7 @@ headers per upstream — it does not re-serialize prompts.
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import socket
 import threading
@@ -53,6 +54,8 @@ H_ATTR_KIND = "x-harness-kind"
 H_ATTR_PROJECT = "x-harness-project"
 H_ATTR_TASK = "x-harness-task"
 H_ATTR_REQ = "x-harness-request"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -237,7 +240,18 @@ class LLMRouter:
         """
         configured = int(getattr(self.config.llm, "request_timeout", 300) or 300)
         widened = int(self.store.meta.get("llm_timeout") or 0)
-        return max(1, configured, widened)
+        # Clamped, not just maxed. Adaptive widening legitimately needs to grow
+        # past a small configured timeout when a big briefing takes minutes to
+        # prefill, but it must never be able to hold an endpoint slot for an
+        # hour: a half-open upstream socket produces no bytes and no error, so
+        # an unbounded deadline strands the slot and every queued request
+        # behind it.
+        # The ceiling bounds *automatic* growth. A larger request_timeout the
+        # user wrote into config.json is a deliberate choice and is honoured:
+        # the runaway was widening drifting past what anyone asked for, not the
+        # configured value itself.
+        ceiling = max(1, int(self.config.router_max_call_timeout), configured)
+        return max(1, min(ceiling, max(configured, widened)))
 
     # ---------------- lifecycle ----------------
 
@@ -524,7 +538,8 @@ class LLMRouter:
             self._pending.put(req)
             return
 
-    def _forward(self, req: RouterRequest, srv: LLMServerConfig) -> str:
+    def _forward(self, req: RouterRequest, srv: LLMServerConfig,
+                 force_stream: bool | None = None) -> str:
         """Send to one endpoint. Returns 'sent' or an error string."""
         name = srv.name
         url = srv.chat_completions_url()
@@ -549,15 +564,44 @@ class LLMRouter:
             body["reasoning_effort"] = srv.reasoning_effort
         for key in srv.body_keys_to_drop():
             body.pop(key, None)
-        timeout = self.upstream_timeout
+        ceiling = self.upstream_timeout
+        # The SDK asks for a complete JSON body (stream defaults to false), and
+        # for a non-streaming call nothing arrives until the reply is finished -
+        # so a slow-but-alive prefill and a half-open socket are indistinguishable
+        # from here, and the only deadline that can separate them is the call
+        # ceiling. Asking the upstream to stream changes that: output starts
+        # arriving as it is generated, so any long gap means the call is dead and
+        # its slot can be reclaimed. The caller still gets the single JSON body it
+        # asked for, reassembled here.
+        #
+        # Reassembling also restores failover a live relay cannot have: while the
+        # bytes are still buffered here, nothing has gone back to the caller, so a
+        # stalled request can be retried elsewhere.
+        force_stream = (not body.get("stream")) if force_stream is None \
+            else force_stream
+        if force_stream:
+            body = {**body, "stream": True,
+                    "stream_options": {"include_usage": True}}
+            read_timeout = max(1, min(int(self.config.router_stall_timeout),
+                                      ceiling))
+        else:
+            read_timeout = ceiling
 
         try:
             with self._http.stream(
                 "POST", url, json=body, headers=headers,
-                timeout=httpx.Timeout(timeout, connect=10.0),
+                timeout=httpx.Timeout(read_timeout, connect=10.0),
             ) as upstream:
                 if upstream.status_code >= 400:
                     detail = upstream.read().decode(errors="replace")[:400]
+                    if force_stream and upstream.status_code < 500:
+                        # An endpoint that refuses stream=true is a 4xx on the
+                        # option, not a dead endpoint. Fall back to the plain
+                        # call rather than parking a healthy server.
+                        logger.info("endpoint %s refused stream=true (%s); "
+                                    "retrying without it", name, detail[:120])
+                        return self._forward(req, self.server_config(name),
+                                             force_stream=False)
                     self._mark_failure(name, upstream.status_code, detail)
                     # Relay the upstream status verbatim so the caller's client
                     # raises its own correct error type (429 -> rate limit, etc).
@@ -566,7 +610,10 @@ class LLMRouter:
                     return "sent"
                 ctype = upstream.headers.get("content-type", "application/json")
                 if "text/event-stream" in ctype:
-                    self._relay_stream(req, name, upstream)
+                    if force_stream:
+                        self._collect_stream(req, name, upstream)
+                    else:
+                        self._relay_stream(req, name, upstream)
                 else:
                     payload = upstream.read()
                     self._record_json(req, name, payload)
@@ -576,6 +623,143 @@ class LLMRouter:
             detail = f"{type(exc).__name__}: {exc}"
             self._mark_failure(name, None, detail)
             return detail
+
+    def _collect_stream(self, req: RouterRequest, name: str,
+                        upstream: httpx.Response) -> None:
+        """Read a forced stream and answer the caller with one JSON body.
+
+        The caller asked for a non-streaming completion, so it must receive a
+        `chat.completion` object; the stream is only the transport we chose so a
+        dead endpoint becomes visible as a gap between chunks instead of as an
+        unexplained silence. Nothing is written to the caller until the whole
+        reply is in hand, which is also what lets a stalled request fail over.
+
+        Tool-call arguments arrive as fragments keyed by index, so they are
+        accumulated per index rather than appended in arrival order: an endpoint
+        that interleaves two calls would otherwise splice their JSON together.
+        """
+        started = time.monotonic()
+        parts: dict[int, dict] = {}
+        order: list[int] = []
+        usage: dict[str, Any] = {}
+        meta: dict[str, Any] = {}
+        chunks = 0
+
+        for line in upstream.iter_lines():
+            if not line:
+                continue
+            if req.first_token_at is None:
+                req.first_token_at = time.monotonic()
+                req.status = "generating"
+                with self._lock:
+                    srv = self._servers.get(name)
+                    if srv is not None:
+                        srv.reachable = True
+                        srv.last_ok_at = time.time()
+                        srv.last_error = None
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            chunks += 1
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if parsed.get("usage"):
+                usage = parsed["usage"]
+            for key in ("id", "model", "created", "system_fingerprint"):
+                if parsed.get(key) is not None:
+                    meta.setdefault(key, parsed[key])
+            for choice in parsed.get("choices") or []:
+                idx = choice.get("index", 0)
+                slot = parts.get(idx)
+                if slot is None:
+                    slot = parts[idx] = {"content": [], "tool_calls": {},
+                                         "call_order": [], "finish": None,
+                                         "role": "assistant"}
+                    order.append(idx)
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    slot["content"].append(delta["content"])
+                if delta.get("reasoning_content"):
+                    slot.setdefault("reasoning", []).append(
+                        delta["reasoning_content"])
+                for call in delta.get("tool_calls") or []:
+                    ci = call.get("index", 0)
+                    if ci not in slot["tool_calls"]:
+                        slot["tool_calls"][ci] = {"id": call.get("id"),
+                                                 "name": [], "args": []}
+                        slot["call_order"].append(ci)
+                    acc = slot["tool_calls"][ci]
+                    if call.get("id"):
+                        acc["id"] = call["id"]
+                    fn = call.get("function") or {}
+                    if fn.get("name"):
+                        acc["name"].append(fn["name"])
+                    if fn.get("arguments"):
+                        acc["args"].append(fn["arguments"])
+                if choice.get("finish_reason"):
+                    slot["finish"] = choice["finish_reason"]
+
+        choices = []
+        for idx in order:
+            slot = parts[idx]
+            message: dict[str, Any] = {"role": slot["role"]}
+            content = "".join(slot["content"])
+            # OpenAI omits content entirely (or sends null) when the reply is
+            # only tool calls; sending "" alongside tool_calls is what some
+            # clients read as an empty answer.
+            if content:
+                message["content"] = content
+            calls = []
+            for ci in slot["call_order"]:
+                acc = slot["tool_calls"][ci]
+                calls.append({
+                    "id": acc["id"] or f"call_{idx}_{ci}",
+                    "type": "function",
+                    "function": {"name": "".join(acc["name"]),
+                                 "arguments": "".join(acc["args"])},
+                })
+            if calls:
+                message["tool_calls"] = calls
+            choices.append({"index": idx, "message": message,
+                            "finish_reason": slot["finish"]
+                            or ("tool_calls" if calls else "stop"),
+                            "logprobs": None})
+
+        body = {
+            "id": meta.get("id") or f"chatcmpl-{req.id}",
+            "object": "chat.completion",
+            "created": meta.get("created") or int(time.time()),
+            "model": meta.get("model") or req.body.get("model") or "",
+            "choices": choices,
+        }
+        if usage:
+            body["usage"] = usage
+
+        payload_bytes = json.dumps(body).encode()
+        # Measured from when the request went out, not from the first token:
+        # prefill is real wall-clock time the caller waits, and throughput
+        # ranking exists to estimate that. Timing from the first chunk would
+        # make an endpoint that is slow to start look like the fastest one in
+        # the fleet.
+        elapsed = time.monotonic() - (req.sent_mono or started)
+        completion = int(usage.get("completion_tokens") or chunks)
+        self._record_tokens(name, int(usage.get("prompt_tokens") or 0),
+                            completion, elapsed)
+        req.completion_tokens = completion
+        req.prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        req.status = "completed"
+        req.finished_at = time.time()
+        self.served += 1
+        with self._lock:
+            srv = self._servers.get(name)
+            if srv is not None:
+                srv.requests_ok += 1
+                srv.consecutive_failures = 0
+        self._respond(req, 200, payload_bytes, "application/json")
 
     def _relay_stream(self, req: RouterRequest, name: str,
                       upstream: httpx.Response) -> None:

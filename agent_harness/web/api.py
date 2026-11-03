@@ -790,6 +790,26 @@ def _alerts(store: Store, runtime=None) -> list[dict]:
                        "No agent can run until one is back.",
         })
 
+    # A loop that keeps refusing cycles is the "nothing is moving" symptom, and
+    # without this the only clue is a counter nobody reads. The reason matters:
+    # a cycle refused because an orchestrator prompt has been sitting for many
+    # minutes is a different problem from a loop that is simply busy, and the
+    # scheduler keeps starting already-staffed work in the meantime, so the
+    # user should be told which it is.
+    skips = int(store.meta.get("cycle_skips", 0))
+    stuck_for = int(store.meta.get("cycle_stuck_seconds", 0))
+    if skips >= 3 and stuck_for >= 120:
+        alerts.append({
+            "level": "warn", "project_id": None,
+            "key": f"cycle_stuck:{skips}:{store.meta.get('cycle_started_at', 0)}",
+            "message": (
+                f"Orchestrator cycles have been refused {skips} times; the "
+                f"current orchestrator prompt has been waiting "
+                f"{stuck_for}s ({store.meta.get('cycle_skip_reason') or 'unknown'}). "
+                "Work that is already staffed still starts on its own; new "
+                "planning is what is blocked."),
+        })
+
     acked = store.meta.get("alert_acks", {})
     for a in alerts:
         # The key survives alongside the id: the ack endpoint needs it to tell

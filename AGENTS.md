@@ -559,3 +559,59 @@ the task-detail handler with no task id.
   `_run_guarded`, so stubbing it bypasses the code under test.
 - Test stubs for `_run_guarded` take `**_kw`: `server_name` is keyword-only
   specifically so existing 4-positional stubs keep working.
+
+## Scheduling: decision vs. consequence
+
+The orchestrator (LLM) decides *who owns a card*. The scheduler
+(`agent_harness/scheduler.py`, no LLM) performs the *consequence* — starting a
+card that already has an agent attached, a reviewer for a card sitting in
+`review`, and a `rework` card whose feedback is already recorded.
+
+This split is what keeps a harness with one stuck LLM call from freezing:
+`run_cycle()` refuses to stack behind a running cycle (correct — a queued cycle
+would act on a stale briefing), but the scheduler sweep runs on every tick
+regardless, so staffed work still starts while the orchestrator is blocked on
+its own prompt.
+
+Rules the scheduler must keep:
+- Never staff a card. No `assigned_agent_id` → leave it for the orchestrator.
+- Never re-dispatch a card blocked with `blocked_cause == "llm"`, or an agent
+  with `llm_failures >= 1`. That is the user's problem, not a retry candidate.
+- A `review` card is reviewed once: skip it once `review_verdict` is set or
+  `review_rounds > 0`, because the reviewer's own run does not move its card.
+- A `backlog` card is dispatchable *only* if it already has an agent. Normally
+  `reconcile()` promotes it, but `reconcile()` runs inside a cycle, so a loop
+  that keeps refusing cycles would otherwise never promote anything.
+- Started dispatches are reported to the next briefing as `SCHEDULER:` notes so
+  the orchestrator does not `run_agent` the same card twice in one cycle.
+
+## LLM timeouts: three different numbers
+
+- `llm.request_timeout` — what the user configured. If they set 3600, honour it;
+  widening is not what made it 3600, and nothing writes this field back to
+  config.json.
+- `llm.max_request_timeout` — ceiling on *automatic* widening. The effective
+  ceiling is `max(max_request_timeout, request_timeout)` so an explicit setting
+  is never silently overridden.
+- `router_max_call_timeout` — hard ceiling on one upstream call, so a wedged
+  request cannot hold an endpoint slot forever.
+- `router_stall_timeout` — how long one upstream call may produce no output at
+  all. This is the one that detects a dead endpoint; httpx has a single
+  inter-read timeout, so it covers both prefill and inter-token gaps and must be
+  set above realistic prefill for the model in use.
+
+An empty completion (endpoint answered cleanly, model said nothing) must **not**
+widen the timeout — that is how a harness drifts to a 3600s deadline that then
+holds a slot for an hour. Widening is for transport faults only, and
+`decay_llm_timeout()` walks it back after clean runs.
+
+## Router: upstream calls are always streamed internally
+
+The SDK asks for a JSON body, and for a non-streaming call nothing arrives until
+the reply is complete — so a slow prefill and a half-open socket are
+indistinguishable. The router therefore forces `stream: true` upstream and
+reassembles the SSE into the JSON body the caller asked for. Two reasons:
+a long gap becomes detectable, and failover stays possible (nothing has been
+sent to the caller yet, so a stalled attempt can be retried on another endpoint).
+Endpoints that reject `stream: true` with a 4xx fall back to a plain call rather
+than being parked.

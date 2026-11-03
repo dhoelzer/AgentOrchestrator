@@ -279,9 +279,15 @@ class AgentRuntime:
         self._llm_lock = threading.RLock()
         self._llms: dict[str, list] = {}
         # A widened timeout is kept in the store so a restart does not go back
-        # to a value the endpoint already proved too small.
-        self.llm_timeout = int(store.meta.get(
-            "llm_timeout", config.llm.request_timeout) or config.llm.request_timeout)
+        # to a value the endpoint already proved too small - but it is clamped
+        # on the way in. An unbounded persisted value means one bad afternoon
+        # permanently lets every later request hang for an hour, which is how a
+        # harness ends up idle with a live endpoint.
+        self.llm_timeout = self._bounded_timeout(int(store.meta.get(
+            "llm_timeout", config.llm.request_timeout)
+            or config.llm.request_timeout))
+        # Clean runs since the last timeout, which drives the decay back down.
+        self._clean_runs = 0
         self.llm_timeouts_widened = int(store.meta.get("llm_timeouts_widened", 0))
         self.llm_empty_responses = int(store.meta.get("llm_empty_responses", 0))
         self.llm_transient_errors = int(store.meta.get("llm_transient_errors", 0))
@@ -494,11 +500,22 @@ class AgentRuntime:
 
     # ---------- live LLM tuning ----------
 
+    def _bounded_timeout(self, seconds: int) -> int:
+        """Clamp a timeout into the configured band.
+
+        The upper bound matters as much as the lower one: widening is for "this
+        model is slow but alive", and an unbounded value turns a dead endpoint
+        into hours of dead time per request.
+        """
+        cfg = self.config.llm
+        # The ceiling bounds automatic growth; an explicitly configured
+        # request_timeout above it is the user's choice and is honoured.
+        ceiling = max(cfg.max_request_timeout, cfg.request_timeout)
+        return int(max(cfg.min_request_timeout, min(int(seconds), ceiling)))
+
     def set_llm_timeout(self, seconds: int) -> int:
         """Apply a new request timeout to every live agent LLM."""
-        cfg = self.config.llm
-        bounded = int(max(cfg.min_request_timeout,
-                          min(seconds, cfg.max_request_timeout)))
+        bounded = self._bounded_timeout(seconds)
         with self._llm_lock:
             self.llm_timeout = bounded
             for agent_id, llms in list(self._llms.items()):
@@ -509,9 +526,47 @@ class AgentRuntime:
                     except Exception:  # noqa: BLE001 - LLM torn down under us
                         logger.debug("Dropping stale LLM for %s", agent_id)
         self.llm_timeouts_widened += 1
+        self._clean_runs = 0
         self._persist_llm_health()
         logger.warning("LLM request timeout adjusted to %ss", bounded)
         return bounded
+
+    def decay_llm_timeout(self) -> int:
+        """Shrink the timeout back toward the configured value.
+
+        Widening without a way back is one-way damage: a handful of timeouts on
+        a bad afternoon leave every subsequent request allowed to hang for the
+        widened duration, and the value survives restarts in store.meta. Called
+        after a run that reached the model cleanly.
+        """
+        cfg = self.config.llm
+        with self._llm_lock:
+            current = self.llm_timeout
+        target = self._bounded_timeout(cfg.request_timeout)
+        if current <= target:
+            self._clean_runs = 0
+            return current
+        self._clean_runs += 1
+        if self._clean_runs < max(1, cfg.timeout_decay_after_runs):
+            return current
+        self._clean_runs = 0
+        # Halve toward the target rather than snapping to it: if the endpoint is
+        # only intermittently slow, a single good run should not undo a widening
+        # the next slow one needed.
+        grown = self._bounded_timeout(max(target, current // 2))
+        with self._llm_lock:
+            if grown < current:
+                self.llm_timeout = grown
+                for llms in list(self._llms.values()):
+                    for llm in llms:
+                        try:
+                            llm.timeout = grown
+                            llm.stream_idle_timeout = float(grown)
+                        except Exception:  # noqa: BLE001
+                            pass
+                self._persist_llm_health()
+                logger.info("LLM request timeout decayed to %ss", grown)
+        return grown
 
     def widen_llm_timeout(self, reason: str) -> int:
         """Grow the timeout geometrically after a slow/unreachable endpoint."""
@@ -730,17 +785,34 @@ class AgentRuntime:
         retries = 0
         health: list[str] = []
         retryable = True
+        # Whether the previous attempt failed to reach the model at all, which
+        # is what decides if the assignment has to be sent again.
+        last_attempt_errored = True
 
         for attempt in range(attempts):
             error = None
             try:
-                # A retry resubmits the *same* prompt. Telling the agent about
-                # the transport failure ("the model returned nothing", "the
-                # request timed out") makes it react to a problem that is not
-                # its own - it apologises, re-plans, or burns turns on an
-                # endpoint it cannot fix. The prompt that failed is simply sent
-                # again, unchanged.
-                conv.send_message(message)
+                # The agent must never be told about a transport failure ("the
+                # model returned nothing", "the request timed out"): it reacts
+                # to a problem that is not its own - apologises, re-plans, or
+                # burns turns on an endpoint it cannot fix.
+                #
+                #   first attempt          -> the assignment
+                #   retry after an error   -> the assignment again, verbatim: the
+                #     request may never have reached the model, so the agent has
+                #     not seen it.
+                #   retry after an empty   -> a short nudge, not the assignment.
+                #     The model received the whole briefing and answered with
+                #     nothing; re-appending it is pure cost, since the
+                #     conversation already holds it and the resend doubles the
+                #     prefill of a prompt that runs to hundreds of thousands of
+                #     tokens on a local model.
+                if attempt == 0 or last_attempt_errored:
+                    conv.send_message(message)
+                else:
+                    conv.send_message(
+                        "Continue the task described above, starting with the "
+                        "next step you were about to take.")
                 conv.run()
             except TRANSIENT_LLM_ERRORS as exc:
                 error = f"{type(exc).__name__}: {exc}"
@@ -765,6 +837,8 @@ class AgentRuntime:
             turns_now = max(before_turns, TurnCounter.count(conv))
             spec.turns_used = turns_now
 
+            last_attempt_errored = error is not None
+
             if error is None and turns_now > before_turns:
                 break  # the endpoint answered and the agent made progress
             if not retryable or attempt + 1 >= attempts:
@@ -781,13 +855,16 @@ class AgentRuntime:
                     attempt + 1, attempts,
                 )
             retries += 1
-            if cfg.adaptive_timeout:
-                self.widen_llm_timeout("no_progress")
+            # Deliberately NOT widened here. An empty completion means the
+            # endpoint answered cleanly and the model chose to say nothing - the
+            # opposite of a timeout. Growing the deadline for that is backwards:
+            # it lets every later request hang longer to fix a fault that
+            # produced a response in seconds. Only real timeouts widen.
             self.store.add_event(
                 "llm_retry",
                 f"Retrying {spec.role} (attempt {attempt + 2}/{attempts}) after "
                 f"{'no output' if error is None else error}; "
-                f"timeout now {self.llm_timeout}s.",
+                f"timeout stays {self.llm_timeout}s.",
                 project_id=spec.project_id, agent_id=spec.id, task_id=spec.task_id,
             )
             self.store.flush()
@@ -836,6 +913,10 @@ class AgentRuntime:
         else:
             spec.llm_failures = 0
             spec.llm_failure_error = None
+            # The endpoint reached the model, so whatever made the timeout grow
+            # is not currently true. Let the deadline fall back instead of
+            # staying widened for the life of the process.
+            self.decay_llm_timeout()
         spec.touch()
         self.store.upsert_agent(spec)
 

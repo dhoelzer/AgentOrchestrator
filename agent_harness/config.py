@@ -215,9 +215,18 @@ class LLMConfig(LLMServerConfig):
     # timeout on each timeout and retries empty replies.
     adaptive_timeout: bool = Field(default=True)
     min_request_timeout: int = Field(default=60)
-    max_request_timeout: int = Field(default=3600)
+    # Ceiling for the adaptive widening. Deliberately modest: widening is for
+    # "this model is slow but alive", and a value this high turns a dead
+    # endpoint into an hour of dead time per request. The router also caps any
+    # single call at router_max_call_timeout regardless.
+    max_request_timeout: int = Field(default=900)
     timeout_growth: float = Field(default=2.0)
     empty_response_retries: int = Field(default=2)
+    # Consecutive clean runs after which the widened timeout starts shrinking
+    # back toward request_timeout. Without this the widening is one-way and
+    # permanent: one bad afternoon leaves every later request allowed to hang
+    # for the widened duration, and the value survives a restart via store.meta.
+    timeout_decay_after_runs: int = Field(default=5)
 
     def build_llm(self, usage_id: str, timeout: int | None = None) -> LLM:
         """Build an SDK LLM bound to this endpoint.
@@ -272,6 +281,11 @@ class HarnessConfig(BaseModel):
     max_sub_agent_depth: int = Field(default=3)
     max_children_per_agent: int = Field(default=6)
     review_attempts_before_escalation: int = Field(default=3)
+    # Start already-staffed cards without asking the LLM. The orchestrator
+    # decides *which* agent owns a card; once it has, launching that agent is a
+    # mechanical step that needs no judgement, and making it wait for another
+    # orchestrator turn is what leaves an idle endpoint with nothing running.
+    auto_dispatch: bool = Field(default=True)
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8090)
 
@@ -296,6 +310,24 @@ class HarnessConfig(BaseModel):
     # How long a request may sit unassigned before the router gives up with a
     # clean error instead of holding the agent's connection open forever.
     router_queue_timeout: int = Field(default=600)
+    # Hard ceiling on one upstream call, independent of adaptive widening.
+    # Widening exists because a big briefing legitimately takes a long time to
+    # prefill on a local model; it must never be able to hold an endpoint slot
+    # for an hour. A half-open socket (Ollama reloading a 30B model, or a
+    # generation that died without closing the connection) produces no bytes and
+    # no error, so without a ceiling the slot is never reclaimed and everything
+    # else queues behind it forever.
+    router_max_call_timeout: int = Field(default=900)
+    # How long one upstream call may go without producing *any* output - before
+    # the first token or between tokens. This is what detects a dead endpoint:
+    # a half-open socket yields no bytes and no error, so without it the request
+    # holds an endpoint slot until the call ceiling expires.
+    #
+    # One value covers both gaps because httpx has a single inter-read timeout;
+    # it is set above realistic prefill time (a large briefing on a local 30B
+    # model can take minutes to emit its first token) and well below the call
+    # ceiling, so a stalled call is reclaimed in minutes rather than an hour.
+    router_stall_timeout: int = Field(default=300)
     llm_probe_seconds: int = Field(default=20)
     # Agents run unattended, so tool calls are never gated on a human.
     confirm_tools: bool = Field(default=False)
@@ -378,6 +410,8 @@ class HarnessConfig(BaseModel):
             ("HARNESS_ORCHESTRATOR_TURN_LIMIT", "orchestrator_turn_limit"),
             ("HARNESS_MAX_PARALLEL_WORKERS", "max_parallel_workers"),
             ("HARNESS_MAX_SUB_AGENT_DEPTH", "max_sub_agent_depth"),
+            ("HARNESS_ROUTER_MAX_CALL_TIMEOUT", "router_max_call_timeout"),
+            ("HARNESS_ROUTER_STALL_TIMEOUT", "router_stall_timeout"),
             ("HARNESS_PORT", "port"),
         ):
             if env.get(key):
