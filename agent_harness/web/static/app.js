@@ -750,7 +750,7 @@ const SETTING_KEYS = [
   "llm.model", "llm.base_url", "llm.api_key", "llm.request_timeout",
   "llm.max_request_timeout", "llm.empty_response_retries", "tick_seconds",
   "sub_agent_turn_limit", "max_parallel_workers", "llm_queue_depth",
-  "llm_server_concurrency",
+  "llm_server_concurrency", "router_stall_timeout", "router_max_call_timeout",
   "max_sub_agent_depth", "llm.input_cost_per_token",
   "llm.output_cost_per_token",
 ];

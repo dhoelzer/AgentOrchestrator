@@ -349,6 +349,8 @@
     <label>Parallel workers<input name="max_parallel_workers" type="number" min="1"></label>
     <label>LLM queue depth<input name="llm_queue_depth" type="number" min="0"></label>
     <label>Requests per LLM<input name="llm_server_concurrency" type="number" min="1"></label>
+    <label>Router stall timeout (s)<input name="router_stall_timeout" type="number" min="1"></label>
+    <label>Router call ceiling (s)<input name="router_max_call_timeout" type="number" min="1"></label>
     <label>Max sub-agent depth<input name="max_sub_agent_depth" type="number" min="1"></label>
     <label>Input $/token<input name="llm.input_cost_per_token" type="number" step="any" min="0"></label>
     <label>Output $/token<input name="llm.output_cost_per_token" type="number" step="any" min="0"></label>

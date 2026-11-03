@@ -579,6 +579,35 @@ def test_queue_depth_is_patchable():
     print("queue depth patchable ok")
 
 
+def test_router_timeouts_are_patchable_at_runtime():
+    """The stall window and call ceiling are the knobs that decide whether a
+    wedged upstream call is reclaimed in minutes or holds a slot for an hour.
+    They have to be tunable while the harness runs: the right value depends on
+    how slow the deployed model's prefill is, and you only learn that in situ.
+
+    The router reads both per call, so a patch applies to the next request with
+    no restart and no conversation reset.
+    """
+    _, cfg, store, rt, orch = _orchestrator_with_config_file()
+    client = TestClient(build_api(cfg, store, orch))
+    res = client.post("/api/config",
+                      json={"router_stall_timeout": 45,
+                            "router_max_call_timeout": 600})
+    assert res.status_code == 200, res.text
+    assert cfg.router_stall_timeout == 45, cfg.router_stall_timeout
+    assert cfg.router_max_call_timeout == 600, cfg.router_max_call_timeout
+
+    got = client.get("/api/config").json()["config"]
+    assert got["router_stall_timeout"] == 45, got
+    assert got["router_max_call_timeout"] == 600, got
+
+    # auto_dispatch gates the scheduler, so it belongs in the same list.
+    res = client.post("/api/config", json={"auto_dispatch": False})
+    assert res.status_code == 200, res.text
+    assert cfg.auto_dispatch is False, cfg.auto_dispatch
+    print("router timeouts and auto_dispatch patchable ok")
+
+
 def test_old_config_without_servers_still_loads():
     """A config.json written before multi-server support must keep working."""
     tmp = tempfile.mkdtemp()

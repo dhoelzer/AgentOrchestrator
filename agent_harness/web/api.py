@@ -908,6 +908,11 @@ _PATCHABLE = {
     "llm_queue_depth": ("pool", int),
     "llm_server_concurrency": ("router", int),
     "router_selection": ("router", str),
+    # Read per upstream call, so a patch takes effect on the next request with
+    # no restart and no conversation being touched.
+    "router_stall_timeout": ("router", int),
+    "router_max_call_timeout": ("router", int),
+    "auto_dispatch": ("runtime", bool),
     "llm_servers": ("servers", list),
     "max_sub_agent_depth": ("runtime", int),
     "max_children_per_agent": ("runtime", int),
