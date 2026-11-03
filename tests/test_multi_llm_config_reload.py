@@ -1,4 +1,4 @@
-"""Multi-server LLM config, round-robin load balancing, and live config reload.
+"""Multi-server LLM config, the LLM router, and live config reload.
 
 Run: python3 tests/test_multi_llm_config_reload.py
 
@@ -20,6 +20,7 @@ sys.path.insert(0, ".")
 from fastapi.testclient import TestClient
 
 from agent_harness.config import HarnessConfig, LLMServerConfig
+from agent_harness.llm_router import make_router
 from agent_harness.orchestrator import Orchestrator
 from agent_harness.runtime import AgentRuntime, RunOutcome
 from agent_harness.store import AgentSpec, Store
@@ -35,14 +36,16 @@ def _outcome(turns=1) -> RunOutcome:
                       tokens=0, cost_usd=0.0)
 
 
-def _runtime(**overrides) -> tuple[HarnessConfig, Store, AgentRuntime]:
+def _runtime(with_router: bool = False,
+             **overrides) -> tuple[HarnessConfig, Store, AgentRuntime]:
     tmp = tempfile.mkdtemp()
     cfg = HarnessConfig()
     cfg.data_dir = tmp
     for k, v in overrides.items():
         setattr(cfg, k, v)
     store = Store(tmp)
-    return cfg, store, AgentRuntime(cfg, store)
+    router = make_router(cfg, store) if with_router else None
+    return cfg, store, AgentRuntime(cfg, store, router=router)
 
 
 def _spec(store: Store, role: str = "worker", **kw) -> AgentSpec:
@@ -66,9 +69,10 @@ def test_pool_is_larger_than_the_gate():
     """The bug: pool == gate meant a dispatched run always had a free slot, so
     the backlog hid in the thread pool and the queue strip stayed empty."""
     cfg, _, rt = _runtime(max_parallel_workers=1, llm_queue_depth=4)
-    assert rt.gate.limit == 1
-    assert rt._pool._max_workers == 5, rt._pool._max_workers
-    print("pool 5 vs gate 1 ok")
+    # 1 worker slot + 1 reserved for the orchestrator.
+    assert rt.gate.limit == 2
+    assert rt._pool._max_workers == 2 + 4, rt._pool._max_workers
+    print("pool 6 vs gate 2 ok")
 
 
 def test_saturated_gate_shows_waiting_agents_as_queued():
@@ -91,9 +95,11 @@ def test_saturated_gate_shows_waiting_agents_as_queued():
     assert len(q) == 3, f"only {len(q)} visible; backlog is hiding in the pool"
     executing = [e for e in q if e["status"] == "executing"]
     queued = [e for e in q if e["status"] == "queued"]
-    assert len(executing) == 1, "gate limit is 1, so exactly one may be executing"
-    assert len(queued) == 2, "the two blocked runs must show as queued"
-    assert rt.gate.active == 1
+    assert len(executing) == rt.gate.limit, \
+        f"gate limit is {rt.gate.limit}, so that many may execute"
+    assert len(queued) == len(specs) - rt.gate.limit, \
+        "the runs beyond the gate must show as queued"
+    assert rt.gate.active == rt.gate.limit
     hold.set()
     print("queued lane fills under backpressure ok")
 
@@ -101,8 +107,9 @@ def test_saturated_gate_shows_waiting_agents_as_queued():
 def test_capacity_report_for_scheduling():
     _, store, rt = _runtime(max_parallel_workers=2, llm_queue_depth=3)
     cap = rt.capacity()
-    assert cap["llm_slots"] == 2 and cap["slots_free"] == 2
-    assert cap["queued"] == 0 and cap["pool_size"] == 5
+    assert cap["worker_slots"] == 2 and cap["slots_free"] == 2
+    assert cap["llm_slots"] == 3, "one slot is reserved for the orchestrator"
+    assert cap["queued"] == 0 and cap["pool_size"] == 3 + 3
     assert cap["llm_servers"] == ["primary"]
     print("capacity report ok")
 
@@ -110,15 +117,26 @@ def test_capacity_report_for_scheduling():
 # ---------- server config: openai + ollama style ----------
 
 def test_model_key_is_sent_verbatim_per_server():
-    """Each server names the literal model key for its request body."""
+    """Two different strings, and conflating them breaks Ollama.
+
+    `wire_model()` is what goes in the request body's `model` key: the literal
+    name the endpoint knows, because every endpoint is spoken to over the OpenAI
+    protocol and Ollama matches that string against its own model list.
+    `route()` is a litellm model string used only when an SDK LLM is built to
+    address an endpoint directly; prefixing the wire key makes Ollama 404.
+    """
     openai_srv = LLMServerConfig(model="openai/qwen", base_url="http://gw/v1")
-    ollama_srv = LLMServerConfig(model="qwen2.5:7b", provider="ollama_chat",
+    ollama_srv = LLMServerConfig(model="qwen3:30b", provider="ollama_chat",
                                  base_url="http://a:11434/v1")
+    # Wire: verbatim, no prefix, for every provider.
+    assert openai_srv.wire_model() == "openai/qwen"
+    assert ollama_srv.wire_model() == "qwen3:30b"
+    assert LLMServerConfig(model="gpt-5", provider="openai").wire_model() == "gpt-5"
+    # Route: provider-prefixed, for the direct-SDK fallback only.
     assert openai_srv.route() == "openai/qwen"
-    assert ollama_srv.route() == "ollama_chat/qwen2.5:7b"
-    # An unprefixed model on an openai server still gets a usable route.
+    assert ollama_srv.route() == "ollama_chat/qwen3:30b"
     assert LLMServerConfig(model="gpt-5", provider="openai").route() == "openai/gpt-5"
-    assert ollama_srv.build_kwargs("u")["model"] == "ollama_chat/qwen2.5:7b"
+    assert ollama_srv.build_kwargs("u")["model"] == "ollama_chat/qwen3:30b"
     assert ollama_srv.build_kwargs("u")["base_url"] == "http://a:11434/v1"
     print("per-server model key ok")
 
@@ -186,76 +204,89 @@ def test_env_can_define_servers():
     print("HARNESS_LLM_SERVERS ok")
 
 
-# ---------- round-robin load balancing ----------
+# ---------- the router owns endpoint choice ----------
 
-def test_requests_round_robin_across_servers():
-    _, store, rt = _runtime()
-    rt.config.llm_servers = _servers()
-    picks = [rt.rotator.pick()[0].name for _ in range(7)]
-    assert picks == ["primary", "openai-gw", "ollama-a", "primary",
-                     "openai-gw", "ollama-a", "primary"], picks
-    print("round-robin spread ok")
-
-
-def test_each_run_is_bound_to_the_rotated_server():
-    cfg, store, rt = _runtime()
-    cfg.llm_servers = _servers()
-    spec = _spec(store)
-    seen: list[str] = []
-
-    def fake(spec_, tools, message, turn_limit, *, server_name=None):
-        seen.append(server_name)
-        return _outcome()
-
-    rt._run_guarded = fake
-    for _ in range(3):
-        rt.run(spec, [], "go")
-    assert seen == ["primary", "openai-gw", "ollama-a"], seen
-    # The queue card carries the server so the UI can show it.
-    print("run bound to rotated server ok")
+def test_agents_are_built_against_the_router_not_an_endpoint():
+    """The core contract: an agent's LLM points at the router."""
+    cfg, store, rt = _runtime(with_router=True,
+                              llm_servers=_servers())
+    spec = _spec(store, id="agent-route")
+    agent = rt.build_agent(spec, [])
+    assert agent.llm.base_url == rt.router.base_url, agent.llm.base_url
+    assert agent.llm.base_url.endswith("/v1")
+    assert agent.condenser.llm.base_url == rt.router.base_url
+    # The model is a placeholder: only the router knows which endpoint answers.
+    assert agent.llm.model == "openai/harness-routed"
+    # Attribution headers are what make the router's cards meaningful.
+    hdrs = agent.llm.extra_headers
+    assert hdrs["x-harness-agent"] == "agent-route"
+    assert hdrs["x-harness-project"] == "p1"
+    print("agents point at the router ok")
 
 
-def test_queue_entry_exposes_server_and_failover():
-    _, store, rt = _runtime()
-    rt.config.llm_servers = _servers()
-    entry = rt._enqueue_llm(_spec(store), "prompt", "worker")
+def test_queue_entry_carries_no_server_until_dispatch():
+    """Nothing is pre-assigned: the endpoint is chosen when it is free."""
+    _, store, rt = _runtime(llm_servers=_servers())
+    rt._enqueue_llm(_spec(store), "prompt", "worker")
     snap = rt.llm_queue()[0]
-    assert snap["server"] == "primary"
-    assert snap["skipped_servers"] is False
-    print("queue entry carries server ok")
+    assert "server" not in snap or snap.get("server") is None
+    print("queue entry carries no pre-assigned server ok")
 
 
-def test_dead_server_is_skipped_then_recovers():
-    _, store, rt = _runtime()
-    rt.config.llm_servers = _servers()
-    rt.rotator.mark_failure("openai-gw", 60)
-    picks = [rt.rotator.pick()[0].name for _ in range(6)]
+def _pick_and_release(rt) -> str | None:
+    """Take the endpoint the router would use next, then free it again.
+
+    Assignment has to update last_assigned the way the dispatcher does: the
+    tie-break between equally-free endpoints is "least recently assigned".
+    """
+    with rt.router._lock:
+        srv = rt.router._free_server_locked(time.monotonic())
+        if srv is None:
+            return None
+        srv.in_flight += 1
+        srv.last_assigned = time.monotonic()
+        name = srv.name
+    rt.router._release(name)
+    return name
+
+
+def test_router_spreads_requests_across_endpoints():
+    """Equally-free endpoints are used in turn, not all piled on one."""
+    cfg, store, rt = _runtime(with_router=True, llm_servers=_servers())
+    rt.router.sync_servers()
+    picks = [_pick_and_release(rt) for _ in range(7)]
+    assert set(picks) == {"primary", "openai-gw", "ollama-a"}, picks
+    print("router spread ok:", picks)
+
+
+def test_router_parks_a_failing_endpoint_then_recovers():
+    cfg, store, rt = _runtime(with_router=True, llm_servers=_servers())
+    rt.router.sync_servers()
+    rt.router._mark_failure("openai-gw", 500, "upstream refused")
+    picks = {n for n in (_pick_and_release(rt) for _ in range(6)) if n}
     assert "openai-gw" not in picks, picks
-    assert "primary" in picks and "ollama-a" in picks
-    status = {s["name"]: s for s in rt.rotator.status()}
+    status = {s["name"]: s for s in rt.router.status()["servers"]}
     assert status["openai-gw"]["cooling_down"] is True
     assert status["primary"]["cooling_down"] is False
-    rt.rotator.mark_success("openai-gw")
-    assert "openai-gw" in [rt.rotator.pick()[0].name for _ in range(3)]
-    print("dead server skipped, then restored ok")
+    rt.router._note_probe("openai-gw", True, None)
+    picks2 = {n for n in (_pick_and_release(rt) for _ in range(6)) if n}
+    assert "openai-gw" in picks2, picks2
+    print("router parks a failing endpoint, then restores it ok")
 
 
-def test_all_servers_down_still_gets_the_primary():
-    """A dead fleet must surface as a normal transient error, not 'no LLM'."""
-    _, store, rt = _runtime()
-    rt.config.llm_servers = _servers()
-    for name in ("primary", "openai-gw", "ollama-a"):
-        rt.rotator.mark_failure(name, 60)
-    srv, skipped = rt.rotator.pick()
-    assert srv.name == "primary" and skipped is True
-    print("all-down fallback ok")
+def test_router_sends_every_configured_server_including_primary():
+    cfg, store, rt = _runtime(with_router=True, llm_servers=_servers())
+    rt.router.sync_servers()
+    names = [s["name"] for s in rt.router.status()["servers"]]
+    assert names == ["primary", "openai-gw", "ollama-a"], names
+    print("primary always in the router ok")
 
 
     class FakeConv:
         """Stand-in for a Conversation: real retry/health code, no network.
 
-        Stubbing at the conversation (not _run_guarded) keeps the code under
-        test - the transient-error handler that parks a server - on the path.
+        Stubbing at the conversation keeps the runtime's own retry and timeout
+        logic on the path; endpoint health is no longer the runtime's job.
         """
 
         def __init__(self, raiser):
@@ -281,78 +312,37 @@ def test_all_servers_down_still_gets_the_primary():
 
     def _run_with_error(rt, store, raiser):
         spec = _spec(store)
-        rt.open_conversation = lambda spec_, tools, server=None: FakeConv(raiser)
+        rt.open_conversation = lambda spec_, tools: FakeConv(raiser)
         return rt.run(spec, [], "go")
 
-    def test_connection_fault_parks_the_server_it_hit():
+    def test_connection_fault_widens_the_timeout_without_touching_endpoints():
+        """Endpoint parking moved to the router; the runtime keeps the timeout."""
         import openai
-        cfg, store, rt = _runtime()
-        cfg.llm_servers = _servers()
+        cfg, store, rt = _runtime(llm_servers=_servers())
         cfg.llm.empty_response_retries = 0
 
         def boom():
             raise openai.APIConnectionError(request=None)
 
-        outcome = _run_with_error(rt, store, boom)  # lands on primary
-        assert "server:primary:down" in (outcome.llm_health or ""), outcome.llm_health
-        status = {s["name"]: s for s in rt.rotator.status()}
-        assert status["primary"]["cooling_down"] is True, status
-        assert status["primary"]["consecutive_failures"] == 1
-        assert rt.rotator.pick()[0].name != "primary", "must rotate away from the fault"
-        print("connection fault parks its server ok")
+        outcome = _run_with_error(rt, store, boom)
+        assert "transient:APIConnectionError" in (outcome.llm_health or ""), \
+            outcome.llm_health
+        assert rt.llm_timeout > cfg.llm.min_request_timeout, "timeout must widen"
+        print("connection fault widens timeout, endpoints left to the router ok")
 
-    def test_rate_limit_does_not_park_the_server():
-        """A 429 means 'slow down', not 'endpoint is down' - no cooldown."""
+    def test_rate_limit_does_not_widen_the_timeout():
+        """A 429 means 'slow down', not 'the endpoint is slow or down'."""
         import openai
-        cfg, store, rt = _runtime()
-        cfg.llm_servers = _servers()
+        cfg, store, rt = _runtime(llm_servers=_servers())
         cfg.llm.empty_response_retries = 0
+        before = rt.llm_timeout
 
         def limited():
             raise openai.RateLimitError(message="slow down", response=None, body=None)
 
         _run_with_error(rt, store, limited)
-        assert all(not s["cooling_down"] for s in rt.rotator.status())
-        print("rate limit does not park ok")
-
-
-
-def test_rotation_cursor_survives_a_restart():
-    tmp = tempfile.mkdtemp()
-    cfg = HarnessConfig(); cfg.data_dir = tmp; cfg.llm_servers = _servers()
-    store = Store(tmp)
-    rt1 = AgentRuntime(cfg, store)
-    rt1.rotator.pick(); rt1.rotator.pick(); rt1.rotator.persist()
-    rt2 = AgentRuntime(cfg, Store(tmp))
-    assert rt2.rotator.pick()[0].name == "ollama-a", "cursor lost across restart"
-    print("rotation cursor persisted ok")
-
-
-def test_agent_llm_is_built_from_its_server():
-    _, store, rt = _runtime()
-    rt.config.llm_servers = _servers()
-    spec = _spec(store, id="agent-x")
-    agent = rt.build_agent(spec, [], "ollama-a")
-    assert agent.llm.model == "ollama_chat/qwen2.5:7b"
-    assert agent.llm.base_url == "http://a:11434/v1"
-    assert agent.llm.usage_id == "agent-x@ollama-a", "metrics must be per server"
-    assert agent.condenser.llm.model == "ollama_chat/qwen2.5:7b"
-    print("agent built from its server ok")
-
-
-def test_switching_servers_repoints_a_live_conversation():
-    _, store, rt = _runtime()
-    rt.config.llm_servers = _servers()
-    spec = _spec(store, id="agent-y")
-    rt.open_conversation(spec, [], "primary")
-    assert rt._conversations["agent-y"].agent.llm.base_url == rt.config.llm.base_url
-    rt._bind_server(spec, "openai-gw")
-    conv = rt._conversations["agent-y"]
-    assert conv.agent.llm.base_url == "http://gw:8080/v1/"
-    assert conv.agent.llm.usage_id == "agent-y@openai-gw"
-    # Timeout retuning must still reach the swapped-in LLM.
-    assert any(llm is conv.agent.llm for llm in rt._llms["agent-y"])
-    print("live conversation re-pointed ok")
+        assert rt.llm_timeout == before
+        print("rate limit does not widen timeout ok")
 
 
 # ---------- live config reload at the start of a tick ----------
@@ -370,7 +360,8 @@ def _orchestrator_with_config_file() -> tuple[Path, HarnessConfig, Store,
     cfg_path.write_text(cfg.model_dump_json(indent=2))
     loaded = HarnessConfig.load(cfg_path)
     store = Store(tmp)
-    rt = AgentRuntime(loaded, store)
+    router = make_router(loaded, store)
+    rt = AgentRuntime(loaded, store, router=router)
     orch = Orchestrator(loaded, store, rt, config_path=str(cfg_path))
     return cfg_path, loaded, store, rt, orch
 
@@ -393,9 +384,12 @@ def test_added_server_and_more_slots_are_applied():
     time.sleep(0.01)
 
     notes = orch.reload_config_if_changed()
-    assert rt.gate.limit == 5, "gate must follow the new parallel limit"
-    assert rt._pool._max_workers == 5 + rt.config.llm_queue_depth
-    assert [s.name for s in rt.rotator.servers()] == [
+    # max_parallel_workers counts WORKER slots; the gate reserves one more for
+    # the orchestrator so orchestrator cycles never consume worker capacity.
+    assert rt.gate.limit == 5 + 1, "gate must follow the new parallel limit"
+    assert rt.capacity()["worker_slots"] == 5, rt.capacity()
+    assert rt._pool._max_workers == (5 + 1) + rt.config.llm_queue_depth
+    assert [x["name"] for x in rt.router.status()["servers"]] == [
         "primary", "ollama-a", "ollama-b"]
     assert any("5" in n and "more agents can run" in n for n in notes), notes
     assert any("ollama-b" in n for n in notes), notes
@@ -410,7 +404,7 @@ def test_reduced_slots_drain_rather_than_kill():
     cfg_path.write_text(json.dumps(raw, indent=2))
     time.sleep(0.01)
     notes = orch.reload_config_if_changed()
-    assert rt.gate.limit == 1
+    assert rt.gate.limit == 1 + 1
     assert any("drain" in n for n in notes), notes
     # The pool ceiling is grow-only: surplus threads idle, the gate does the
     # bounding, so in-flight runs are never interrupted.
@@ -425,8 +419,10 @@ def test_removed_server_stops_being_scheduled():
     cfg_path.write_text(json.dumps(raw, indent=2))
     time.sleep(0.01)
     notes = orch.reload_config_if_changed()
-    assert [s.name for s in rt.rotator.servers()] == ["primary"]
-    assert "ollama-a" not in [rt.rotator.pick()[0].name for _ in range(5)]
+    names = [x["name"] for x in rt.router.status()["servers"]]
+    assert names == ["primary"], names
+    picks = {n for n in (_pick_and_release(rt) for _ in range(5)) if n}
+    assert "ollama-a" not in picks, picks
     assert any("removed ollama-a" in n for n in notes), notes
     print("removed server unscheduled ok")
 
@@ -443,13 +439,20 @@ def test_reconfigured_server_under_a_kept_name_is_caught():
     print("reconfigured server caught ok")
 
 
-def test_idle_agents_move_off_a_removed_server_running_ones_drain():
+def test_server_changes_leave_conversations_pointing_at_the_router():
+    """No rebinding step exists any more.
+
+    The old design had to move conversations onto a live endpoint, and had to
+    leave mid-run ones alone to drain. Agents never hold an endpoint now, so a
+    server change lands in the router and every conversation is already correct.
+    """
     cfg_path, _, store, rt, orch = _orchestrator_with_config_file()
     idle = store.upsert_agent(_spec(store, id="idle-1"))
     busy = store.upsert_agent(_spec(store, id="busy-1"))
-    rt.open_conversation(idle, [], "ollama-a")
-    rt.open_conversation(busy, [], "ollama-a")
+    rt.open_conversation(idle, [])
+    rt.open_conversation(busy, [])
     rt._mark_inflight("busy-1")
+    before = {a: rt._conversations[a].agent.llm.base_url for a in ("idle-1", "busy-1")}
 
     raw = json.loads(cfg_path.read_text())
     raw["llm_servers"] = []
@@ -457,16 +460,12 @@ def test_idle_agents_move_off_a_removed_server_running_ones_drain():
     time.sleep(0.01)
     notes = orch.reload_config_if_changed()
 
-    assert rt._conversations["idle-1"].agent.llm.usage_id == "idle-1@primary"
-    assert rt._conversations["busy-1"].agent.llm.usage_id == "busy-1@ollama-a", (
-        "a mid-run agent must finish on the endpoint it started with")
-    assert any("1 idle agent" in n for n in notes), notes
-    assert any("1 running agent" in n for n in notes), notes
-
-    rt._unmark_inflight("busy-1")
-    assert rt.rebind_stale_servers() == (1, 0)
-    assert rt._conversations["busy-1"].agent.llm.usage_id == "busy-1@primary"
-    print("idle rebound / running drain ok")
+    assert [x["name"] for x in rt.router.status()["servers"]] == ["primary"]
+    for agent_id, url in before.items():
+        assert rt._conversations[agent_id].agent.llm.base_url == url
+        assert url == rt.router.base_url, "must still address the router"
+    assert not any("idle agent" in n for n in notes), notes
+    print("server change needs no rebinding ok")
 
 
 def test_broken_config_keeps_the_previous_settings():
@@ -474,14 +473,14 @@ def test_broken_config_keeps_the_previous_settings():
     cfg_path.write_text("{ not valid json")
     time.sleep(0.01)
     assert orch.reload_config_if_changed() == []
-    assert rt.gate.limit == 2, "a bad edit must not change live settings"
-    assert [s.name for s in rt.rotator.servers()] == ["primary", "ollama-a"]
+    assert rt.gate.limit == 3, "a bad edit must not change live settings"
+    assert [x["name"] for x in rt.router.status()["servers"]] == ["primary", "ollama-a"]
     assert any(e.kind == "config_reload_failed" for e in store.recent_events)
     # And the loop keeps working: the next good edit still applies.
     cfg_path.write_text(json.dumps({"max_parallel_workers": 4}))
     time.sleep(0.01)
     orch.reload_config_if_changed()
-    assert rt.gate.limit == 4
+    assert rt.gate.limit == 4 + 1
     print("bad config survives ok")
 
 
@@ -516,7 +515,8 @@ def test_config_change_reaches_the_orchestrator_briefing():
     text = briefings[0]
     assert "CONFIG CHANGED" in text, text[-800:]
     assert "CAPACITY NOW" in text
-    assert "6 of 6 LLM slots free" in text
+    # The edit raised max_parallel_workers to 6, and none of it is busy.
+    assert "6 of 6 worker slots free" in text, text[-800:]
     print("config change reaches the briefing ok")
 
 
@@ -526,7 +526,7 @@ def test_api_patch_does_not_reload_its_own_write():
     client = TestClient(app)
     out = client.post("/api/config", json={"max_parallel_workers": 3})
     assert out.status_code == 200, out.text
-    assert rt.gate.limit == 3
+    assert rt.gate.limit == 3 + 1
     assert orch.reload_config_if_changed() == [], (
         "the API's own write must not look like an external edit")
     print("API write not reloaded as external ok")
@@ -546,7 +546,7 @@ def test_api_can_configure_servers_and_reports_health():
          "base_url": "http://b:11434/v1", "model": "qwen2.5:14b"},
     ], "persist": str(cfg_path)})
     assert out.status_code == 200, out.text
-    assert [s.name for s in rt.rotator.servers()] == ["primary", "ollama-b"]
+    assert [x["name"] for x in rt.router.status()["servers"]] == ["primary", "ollama-b"]
     # Persisted, and reloadable from disk.
     on_disk = json.loads(cfg_path.read_text())
     assert on_disk["llm_servers"][0]["name"] == "ollama-b"
@@ -564,7 +564,7 @@ def test_api_rejects_bad_server_lists():
                 [{"provider": "not-a-provider"}]):
         res = client.post("/api/config", json={"llm_servers": bad})
         assert res.status_code == 400, (bad, res.status_code, res.text)
-    assert [s.name for s in rt.rotator.servers()] == ["primary", "ollama-a"]
+    assert [x["name"] for x in rt.router.status()["servers"]] == ["primary", "ollama-a"]
     print("bad server lists rejected ok")
 
 
@@ -575,7 +575,7 @@ def test_queue_depth_is_patchable():
     res = client.post("/api/config", json={"llm_queue_depth": 20})
     assert res.status_code == 200, res.text
     assert rt.config.llm_queue_depth == 20
-    assert rt._pool._max_workers == rt.config.max_parallel_workers + 20
+    assert rt._pool._max_workers == rt.gate.limit + 20
     print("queue depth patchable ok")
 
 
@@ -604,9 +604,15 @@ def test_ui_wires_servers_and_queue_server():
     assert 'data-srvdel' in js, "remove-server control missing"
     assert "id=\"serverRows\"" in html and "id=\"addServer\"" in html
     assert "llm_queue_depth" in html, "queue depth control missing"
-    assert "qserver" in js and ".qcard .qserver" in html, "server on queue card"
+    # The router strip: request cards plus one card per endpoint.
+    assert "function renderRouter" in js, "router strip missing"
+    assert 'data-req=' in js and "renderRouter(state.router" in js
+    assert ".rcard" in html and ".scard" in html, "router card styles"
+    # A Test button per server row, so a new LLM is proven before it is saved.
+    assert "data-srvtest" in js and "/api/llm/router/test" in js
+    assert "llm_server_concurrency" in html, "per-endpoint concurrency control"
     # The header pill must show the fleet without opening Settings.
-    assert "llm_fleet" in js and "cooling_down" in js
+    assert "llm_router" in js and "cooling_down" in js
     print("server UI contract ok")
 
 
@@ -614,9 +620,13 @@ def test_state_exposes_fleet_and_capacity():
     _, cfg, store, rt, orch = _orchestrator_with_config_file()
     client = TestClient(build_api(cfg, store, orch))
     meta = client.get("/api/state").json()["meta"]
-    assert [s["name"] for s in meta["llm_fleet"]] == ["primary", "ollama-a"]
-    assert meta["llm_fleet"][1]["provider"] == "ollama_chat"
-    assert meta["capacity"]["llm_slots"] == 2
+    router = meta["llm_router"]
+    assert [s["name"] for s in router["servers"]] == ["primary", "ollama-a"]
+    assert set(router) >= {"requests", "recent", "servers", "counts"}, router.keys()
+    assert router["counts"]["servers"] == 2
+    # 2 worker slots + 1 reserved for the orchestrator.
+    assert meta["capacity"]["llm_slots"] == 3
+    assert meta["capacity"]["worker_slots"] == 2
     assert meta["capacity"]["slots_free"] == 2
     print("state exposes fleet + capacity ok")
 

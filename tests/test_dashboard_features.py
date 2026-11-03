@@ -429,6 +429,45 @@ def test_cycle_metadata_advances_even_when_cycles_fail():
               f"status={meta['cycle_status']})")
 
 
+def test_skipped_cycles_do_not_collapse_the_tick_or_spam_events():
+    """A long cycle must not make the loop spin at the floor and flood events.
+
+    The tuner sees the wall time of each cycle. A skipped cycle costs ~0s, so
+    feeding it in drives the interval to the floor, which makes the loop retry
+    (and skip again) every floor-length tick until the real cycle finishes.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = make(tmp)
+        cfg.tick_seconds = 2
+        cfg.min_tick_seconds = 1
+        cfg.max_tick_seconds = 120
+        cfg.dynamic_tick = True
+
+        # A cycle started from outside the loop (e.g. POST /api/tick) holds the
+        # lock; the loop then attempts one cycle per tick and skips each one.
+        orch._cycle_lock.acquire()
+        try:
+            orch._stop = threading.Event()
+            t = threading.Thread(target=orch.run_forever, daemon=True)
+            t.start()
+            time.sleep(6.0)
+            orch.stop()
+            t.join(timeout=3)
+        finally:
+            orch._cycle_lock.release()
+
+        skips = int(store.meta.get("cycle_skips", 0))
+        assert skips >= 1, "a 3s cycle on a 2s tick must skip at least once"
+        assert orch.effective_tick >= 2.0, (
+            f"skipped cycles collapsed the tick to {orch.effective_tick}s; "
+            "they must not be fed to the tuner")
+        events = [e for e in store.recent_events if e.kind == "cycle_skipped"]
+        assert len(events) < skips, (
+            f"{len(events)} skip events for {skips} skips: they must coalesce")
+        print(f"skip handling ok (skips={skips}, events={len(events)}, "
+              f"tick={orch.effective_tick:.1f}s)")
+
+
 def test_cycle_metadata_records_successes_and_duration():
     with tempfile.TemporaryDirectory() as tmp:
         cfg, store, runtime, orch = make(tmp)
@@ -603,8 +642,12 @@ def test_delivery_alert_does_not_resurface_on_unrelated_touches():
         print("delivery alert stability ok")
 
 
-def test_tree_keeps_retired_subagents_under_their_parent():
-    """Retiring prunes the parent's child list; the tree must still show the agent."""
+def test_tree_links_children_by_parent_id_not_the_child_list():
+    """Pruning a parent's child_agent_ids must not detach it from the tree.
+
+    The delegation limit counts child_agent_ids, so retiring frees a slot by
+    pruning it; the tree is built from parent_agent_id and is unaffected.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         cfg, store, runtime, orch = seed(tmp)
         pid = list(store.projects)[0]
@@ -631,6 +674,157 @@ def test_tree_keeps_retired_subagents_under_their_parent():
         (worker_node,) = [c for c in root["children"] if c["role"] == "backend-dev"]
         assert [c["role"] for c in worker_node["children"]] == ["reviewer"]
         print("tree keeps retired subagents ok")
+
+
+def test_done_cards_are_ordered_newest_first_and_stamped():
+    """The Done column must be newest-first so the UI can keep only recent ones."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = make(tmp)
+        conv = FakeConv()
+        CreateProjectExecutor()(CreateProjectAction(
+            name="Widget", goal="ship", constraints=""), conv)
+        pid = list(store.projects)[0]
+        ids = []
+        for i in range(3):
+            CreateTaskExecutor()(CreateTaskAction(
+                project_id=pid, title=f"T{i}", objective="x", expertise="backend",
+                acceptance_criteria=["works"], deliverables=[]), conv)
+            t = [x for x in store.tasks.values() if x.title == f"T{i}"][0]
+            ids.append(t.id)
+            t.column = "done"
+            store.upsert_task(t)
+            time.sleep(1.1)          # ISO timestamps are second-granular
+
+        done = store.board(pid)["done"]
+        assert [t.id for t in done] == list(reversed(ids)), [t.id for t in done]
+        assert all(t.finished_at for t in done), [t.finished_at for t in done]
+
+        # Rework clears the stamp, so a re-completed card sorts by its new finish.
+        t = store.tasks[ids[0]]
+        t.column = "rework"
+        store.upsert_task(t)
+        assert store.tasks[ids[0]].finished_at is None
+        t.column = "done"
+        store.upsert_task(t)
+        assert store.board(pid)["done"][0].id == ids[0]
+        print("done ordering ok")
+
+
+def test_finished_subagents_are_archived_out_of_the_hierarchy():
+    """A specialist whose card is done leaves the tree but keeps its history."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = seed(tmp)
+        pid = list(store.projects)[0]
+        worker = [a for a in store.project_agents(pid) if a.role == "backend-dev"][0]
+        task = next(t for t in store.tasks.values() if t.project_id == pid)
+        task.assigned_agent_id = worker.id
+        worker.task_id = task.id
+        store.upsert_task(task)
+        store.upsert_agent(worker)
+        task.column = "done"
+        store.upsert_task(task)
+
+        lines = orch.sweep_finished_agents()
+        assert lines, "the finished worker should have been archived"
+        assert store.agents[worker.id].archived_at is not None
+        # Kept, not deleted: cost and transcript stay queryable.
+        assert worker.id in store.agents
+
+        app = build_api(cfg, store, orch)
+        client = TestClient(app)
+        proj = [x for x in client.get("/api/state").json()["projects"]
+                if x["id"] == pid][0]
+        (root,) = proj["tree"]
+        assert root["role"] == "orchestrator"
+        assert [c["role"] for c in root["children"]] == ["reviewer"], root["children"]
+        print("finished subagent archived ok")
+
+
+def test_archived_agent_is_reactivated_when_reused():
+    """Assigning work to an archived specialist puts it back on the tree."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = seed(tmp)
+        pid = list(store.projects)[0]
+        conv = FakeConv()
+        worker = [a for a in store.project_agents(pid) if a.role == "backend-dev"][0]
+        task = next(t for t in store.tasks.values() if t.project_id == pid)
+        task.assigned_agent_id = worker.id
+        worker.task_id = task.id
+        store.upsert_task(task)
+        store.upsert_agent(worker)
+        task.column = "done"
+        store.upsert_task(task)
+        orch.sweep_finished_agents()
+        assert store.agents[worker.id].archived_at is not None
+
+        # A new card needs the same expertise: reuse rather than clone.
+        CreateTaskExecutor()(CreateTaskAction(
+            project_id=pid, title="Polish it", objective="y", expertise="backend",
+            acceptance_criteria=["works"], deliverables=["artifact.py"]), conv)
+        fresh = [t for t in store.tasks.values() if t.title == "Polish it"][0]
+        AssignTaskExecutor()(AssignTaskAction(
+            task_id=fresh.id, agent_id=worker.id), conv)
+
+        assert store.agents[worker.id].archived_at is None, \
+            "reassigning an archived agent must bring it back"
+        app = build_api(cfg, store, orch)
+        client = TestClient(app)
+        proj = [x for x in client.get("/api/state").json()["projects"]
+                if x["id"] == pid][0]
+        (root,) = proj["tree"]
+        assert "backend-dev" in [c["role"] for c in root["children"]], root["children"]
+        print("archived agent reactivated ok")
+
+
+def test_sweep_keeps_agents_that_might_be_needed_again():
+    """Only genuinely finished agents leave the hierarchy."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = seed(tmp)
+        pid = list(store.projects)[0]
+        worker = [a for a in store.project_agents(pid) if a.role == "backend-dev"][0]
+        reviewer = [a for a in store.project_agents(pid) if a.role == "reviewer"][0]
+        task = next(t for t in store.tasks.values() if t.project_id == pid)
+        task.assigned_agent_id = worker.id
+        worker.task_id = task.id
+        store.upsert_task(task)
+        store.upsert_agent(worker)
+
+        # Card still open: nothing to archive.
+        assert orch.sweep_finished_agents() == []
+        assert store.agents[worker.id].archived_at is None
+
+        task.column = "done"
+        store.upsert_task(task)
+
+        # A live child keeps its parent on the tree even once its own card is
+        # done: the subtree is still doing work.
+        reviewer.parent_agent_id = worker.id
+        reviewer.child_agent_ids = []
+        worker.child_agent_ids = [reviewer.id]
+        store.upsert_agent(worker)
+        store.upsert_agent(reviewer)
+        orch.sweep_finished_agents()
+        assert store.agents[worker.id].archived_at is None, \
+            "a parent with a live child must stay"
+
+        # Reviewer of record on an open card stays too.
+        reviewer.child_agent_ids = []
+        reviewer.task_id = task.id
+        task.column = "review"
+        task.reviewer_agent_id = reviewer.id
+        store.upsert_task(task)
+        store.upsert_agent(reviewer)
+        orch.sweep_finished_agents()
+        assert store.agents[reviewer.id].archived_at is None, \
+            "the reviewer of an open card must stay"
+
+        # Once the card closes, both are finished and leave.
+        task.column = "done"
+        store.upsert_task(task)
+        orch.sweep_finished_agents()
+        archived = {a.id for a in store.agents.values() if a.archived_at}
+        assert {worker.id, reviewer.id} <= archived, archived
+        print("sweep selectivity ok")
 
 
 def test_removing_a_project_never_touches_the_shared_orchestrator():
@@ -1076,13 +1270,18 @@ def main() -> None:
     test_removed_projects_do_not_count_toward_total_cost()
     test_cycle_metadata_advances_even_when_cycles_fail()
     test_cycle_metadata_records_successes_and_duration()
+    test_skipped_cycles_do_not_collapse_the_tick_or_spam_events()
     test_cycle_pill_reports_running_state()
     test_stale_flag_set_when_loop_has_not_completed_lately()
     test_alerts_have_stable_ids_and_can_be_acknowledged()
     test_ack_is_per_occurrence_not_per_alert_type()
     test_ack_all_clears_every_alert_and_can_be_reset()
     test_delivery_alert_does_not_resurface_on_unrelated_touches()
-    test_tree_keeps_retired_subagents_under_their_parent()
+    test_tree_links_children_by_parent_id_not_the_child_list()
+    test_done_cards_are_ordered_newest_first_and_stamped()
+    test_finished_subagents_are_archived_out_of_the_hierarchy()
+    test_archived_agent_is_reactivated_when_reused()
+    test_sweep_keeps_agents_that_might_be_needed_again()
     test_removing_a_project_never_touches_the_shared_orchestrator()
     test_removal_frees_delegation_slots_in_every_mode()
     test_removal_keeps_cost_history_after_agents_are_deleted()

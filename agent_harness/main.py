@@ -17,6 +17,7 @@ os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 import uvicorn
 
 from .config import HarnessConfig, resolve_config_path
+from .llm_router import make_router
 from .orchestrator import Orchestrator
 from .runtime import AgentRuntime
 from .store import Store
@@ -65,17 +66,32 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    # A library import can install a root WARNING handler before we get here,
+    # which makes basicConfig a no-op and silently drops every info() line -
+    # including the router URL an operator needs to see at startup.
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for handler in root.handlers:
+        if handler.level > logging.INFO:
+            handler.setLevel(logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("litellm").setLevel(logging.WARNING)
 
     register_harness_tools()
 
     store = Store(config.data_dir)
-    runtime = AgentRuntime(config, store)
+    # Started before any agent exists: every LLM request in the harness, from
+    # every agent and every condenser, is addressed to this service.
+    router = make_router(config, store)
+    router.start()
+    runtime = AgentRuntime(config, store, router=router)
     orchestrator = Orchestrator(config, store, runtime,
                        config_path=resolve_config_path(args.config))
 
     logger.info("Orchestrator harness v%s", version_string())
+    logger.info("LLM router: %s (endpoints: %s)", router.base_url,
+                ", ".join(f"{s['name']}@{s['base_url']}"
+                          for s in router.status()["servers"]))
     logger.info("LLM: model=%s base_url=%s", config.llm.model, config.llm.base_url)
     logger.info("Sub-agent turn limit: %s | tick: %ss",
                 config.sub_agent_turn_limit, config.tick_seconds)
@@ -88,9 +104,12 @@ def main(argv: list[str] | None = None) -> int:
     store.flush()
 
     if args.once:
-        reports = orchestrator.run_cycle()
-        for r in reports:
-            logger.info("cycle %s -> %s", r.project_id, r.orchestrator_status)
+        try:
+            reports = orchestrator.run_cycle() or []
+            for r in reports:
+                logger.info("cycle %s -> %s", r.project_id, r.orchestrator_status)
+        finally:
+            router.stop()
         store.flush()
         return 0
 
@@ -121,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         orchestrator.stop()
         loop_thread.join(timeout=10)
+        router.stop()
         store.flush()
     return 0
 

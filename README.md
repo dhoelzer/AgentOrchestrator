@@ -93,7 +93,10 @@ CLI overrides: `--base-url`, `--model`, `--api-key`, `--tick`, `--port`, `--conf
 | `orchestrator_turn_limit` | 60 | Turn budget granted per orchestrator cycle |
 | `max_parallel_workers` | 3 | Sub-agents that may run concurrently |
 | `llm_queue_depth` | 8 | Extra dispatched runs that wait visibly for a slot |
-| `llm_servers` | `[]` | Additional LLM endpoints to round-robin across |
+| `llm_servers` | `[]` | Additional LLM endpoints the router may use |
+| `llm_server_concurrency` | 2 | Simultaneous requests per endpoint |
+| `router_host` / `router_port` | `127.0.0.1` / `0` | Internal router bind (`0` = OS-chosen port) |
+| `router_queue_timeout` | 600 | Seconds a request may wait for a free endpoint |
 | `max_sub_agent_depth` | 3 | How deep sub-agents may nest |
 | `max_children_per_agent` | 6 | Fan-out limit per agent |
 | `review_attempts_before_escalation` | 3 | Failed reviews before escalation |
@@ -126,15 +129,34 @@ can be given `qwen2.5:7b` while the primary uses `openai/qwen`:
 }
 ```
 
-`provider` picks the request route: `openai` prefixes an unprefixed model with
-`openai/`, while `ollama` / `ollama_chat` send the model key verbatim. The
-primary `llm` block is always server #1 in the rotation, so a config with no
-`llm_servers` behaves exactly as before.
+`model` is the exact string that endpoint expects, and it is sent verbatim:
+Ollama looks the value up in its own model list, so `qwen3:30b` works and a
+provider-prefixed key is rejected. `provider` is used for the direct-SDK
+fallback and to decide which request fields the endpoint cannot accept -
+`ollama` / `ollama_chat` get `reasoning_effort` removed, because Ollama maps it
+onto its own `think` option and rejects values it does not support. Set
+`reasoning_effort` on a server to send it deliberately, or `drop_body_keys` to
+name the fields to remove. `extra_body` is merged into every request sent to
+that endpoint. The primary `llm` block is always server #1 in the rotation, so a
+config with no `llm_servers` behaves exactly as before.
 
-Runs are assigned round-robin across live servers. A server that throws a
-connection fault is parked for a cooldown and skipped until it answers again; a
-429 does not park it. If every server is down, the primary is used so the
-failure surfaces as a normal transient error.
+Every LLM call in the harness - the orchestrator, every sub-agent, and every
+condenser - is addressed to an internal router service rather than to an
+endpoint. The router formats the request, attaches that endpoint's auth headers,
+rewrites the model key for the endpoint it picked, and tracks health and
+throughput.
+
+Nothing is pre-assigned: a request waits in the queue with no endpoint attached
+and is dispatched to **whichever endpoint frees up first**, up to
+`llm_server_concurrency` requests at a time per endpoint. A fast endpoint
+therefore takes more of the load than a slow one.
+
+A connection fault is absorbed by the router, which re-queues the request onto
+the next free endpoint. An HTTP error status is passed back to the caller
+untouched so its client can handle it (a 429 stays a 429), but the endpoint is
+parked for a cooldown and skipped until it answers again; a 429 does not park it.
+Use the **Test** button on any server row to send a prompt straight to that
+endpoint - including one you have not saved yet - before trusting it with work.
 
 Set them from the environment as JSON instead:
 

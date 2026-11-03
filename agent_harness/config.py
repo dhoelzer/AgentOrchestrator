@@ -59,6 +59,15 @@ class LLMServerConfig(BaseModel):
     # Extra keys merged into the request body, e.g. Ollama's
     # {"num_ctx": 32768, "keep_alive": "10m"}.
     extra_body: dict[str, Any] = Field(default_factory=dict)
+    # Body keys this endpoint must NOT receive. The SDK adds
+    # `reasoning_effort: "high"` to every request whether or not the endpoint
+    # implements it; Ollama's OpenAI layer maps it onto its own `think` option
+    # and answers 400 "think value \"high\" is not supported for this model".
+    # None means decide from the provider - see `body_keys_to_drop`.
+    drop_body_keys: list[str] | None = Field(default=None)
+    # Extra HTTP headers this endpoint requires on every request, e.g. a
+    # gateway's `X-Project-Slug`. The router attaches these; agents never do.
+    headers: dict[str, str] = Field(default_factory=dict)
 
     # USD per token, used for cost accounting. Defaults price the preconfigured
     # Qwen endpoint ($2/M input, $15/M output); litellm cannot price an unknown
@@ -66,13 +75,71 @@ class LLMServerConfig(BaseModel):
     input_cost_per_token: float | None = Field(default=0.000002)
     output_cost_per_token: float | None = Field(default=0.000015)
 
-    def resolved_api_key(self) -> str:
+    def resolved_api_key(self, use_env: bool = True) -> str:
+        """The key to send to this endpoint.
+
+        ``use_env=False`` is for a server definition that has not been saved
+        yet (a test prompt against a URL someone just typed): the harness-wide
+        key must not be silently sent to an endpoint nobody has vetted.
+        """
         if self.api_key_env:
-            return os.environ.get(self.api_key_env) or self.api_key
+            return (os.environ.get(self.api_key_env) or self.api_key) if use_env \
+                else self.api_key
+        if not use_env:
+            return self.api_key
         return os.environ.get("HARNESS_LLM_API_KEY") or self.api_key
+
+    def resolved_headers(self) -> dict[str, str]:
+        """Headers the router must send to this endpoint, beyond the standard ones."""
+        return dict(self.headers)
+
+    def url_for(self, suffix: str) -> str:
+        """Absolute URL for an OpenAI-style path fragment.
+
+        Mirrors how the OpenAI client resolves paths: the base URL already
+        carries the `/v1` prefix, so `/chat/completions` is appended to it.
+        """
+        return self.base_url.rstrip("/") + "/" + suffix.lstrip("/")
+
+    def chat_completions_url(self) -> str:
+        return self.url_for("/chat/completions")
+
+    def wire_model(self) -> str:
+        """The literal value for the request body's ``model`` key.
+
+        Every endpoint in the fleet is spoken to over the OpenAI chat
+        completions protocol, so the body must carry the model name the
+        endpoint itself knows - ``qwen3:30b`` for Ollama, ``openai/qwen`` for
+        the llama.cpp-style primary. Never add a provider prefix here: Ollama
+        matches the string against its own model list and 404s with
+        ``model 'ollama_chat/qwen3:30b' not found``.
+        """
+        return self.model
+
+    def body_keys_to_drop(self) -> list[str]:
+        """Body keys the router must strip before addressing this endpoint.
+
+        Following the OpenAI API standard is not the same as accepting every
+        OpenAI extension: the SDK puts ``reasoning_effort: "high"`` in every
+        request, and Ollama's OpenAI layer maps that onto its own ``think``
+        option, which only understands ``high``/``low`` for models it marks as
+        reasoning-capable - so it answers 400. Omitting the key is what the
+        standard allows; the endpoint then reasons however it is built to.
+        """
+        if self.drop_body_keys is not None:
+            return list(self.drop_body_keys)
+        # An explicitly configured reasoning_effort means the operator wants it
+        # on the wire for this endpoint, so it is not auto-dropped.
+        if self.provider in ("ollama", "ollama_chat") and not self.reasoning_effort:
+            return ["reasoning_effort"]
+        return []
 
     def route(self) -> str:
         """litellm model string: the provider prefix plus the server's model key.
+
+        Only for building an SDK ``LLM`` that talks to an endpoint *directly*
+        (the no-router fallback): litellm picks its client off this string.
+        It is never a wire value - see ``wire_model``.
 
         An already-prefixed model (``openai/qwen``) is left alone, so existing
         configs keep working unchanged.
@@ -92,6 +159,7 @@ class LLMServerConfig(BaseModel):
             self.max_input_tokens, self.max_output_tokens,
             self.input_cost_per_token, self.output_cost_per_token,
             self.reasoning_effort, sorted(self.extra_body.items()),
+            sorted(self.body_keys_to_drop()),
         ], sort_keys=True)
 
     def build_kwargs(self, usage_id: str, timeout: int | None = None,
@@ -177,8 +245,24 @@ class HarnessConfig(BaseModel):
     data_dir: str = Field(default=str(DEFAULT_DATA_DIR))
     projects_dir: str = Field(default=str(DEFAULT_DATA_DIR / "projects"))
     tick_seconds: int = Field(default=60)
+    # The scheduler interval is a guess about how long a cycle takes. A fixed
+    # value is wrong in both directions: too short and cycles pile up behind
+    # each other (an orchestrator queued while it is still running), too long
+    # and idle capacity goes unused. The loop therefore re-derives the interval
+    # from measured cycle duration, aiming to keep the loop this busy.
+    dynamic_tick: bool = Field(default=True)
+    min_tick_seconds: int = Field(default=10)
+    max_tick_seconds: int = Field(default=600)
+    # Fraction of the interval a cycle should occupy. 0.5 means "let a cycle
+    # take about half the tick", so a 40s cycle settles at an 80s interval and
+    # a 5s cycle at the floor.
+    tick_duty_cycle: float = Field(default=0.5)
     sub_agent_turn_limit: int = Field(default=100)
     orchestrator_turn_limit: int = Field(default=60)
+    # How many *worker* agents may hold the LLM at once. The orchestrator is
+    # deliberately not counted: it holds a slot for the whole of a cycle while
+    # it decides what to dispatch, so counting it here silently costs one
+    # worker slot and caps real concurrency at max_parallel_workers - 1.
     max_parallel_workers: int = Field(default=3)
     # How many runs may be waiting on a concurrency slot at once. This must
     # exceed max_parallel_workers: with a pool the same size as the gate, a
@@ -190,6 +274,29 @@ class HarnessConfig(BaseModel):
     review_attempts_before_escalation: int = Field(default=3)
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8090)
+
+    # ---- LLM router ----
+    # Every LLM request in the harness goes through the router, which owns
+    # endpoint choice, request formatting, headers, and load balancing.
+    router_host: str = Field(default="127.0.0.1")
+    # 0 lets the OS pick a free loopback port, so a second stack on the same
+    # host never collides with the first.
+    router_port: int = Field(default=0)
+    # How many requests one endpoint may serve at once. The router hands the
+    # oldest pending request to whichever endpoint has a free slot first, so
+    # this is the real bound on upstream concurrency.
+    llm_server_concurrency: int = Field(default=2)
+    # How the router chooses among endpoints that all have a free slot.
+    # "throughput" sends work to the fastest endpoint it has measured, which
+    # minimises wall-clock time when the fleet is mixed (a 60 tok/s gateway and
+    # a 5 tok/s local model are not interchangeable). "round_robin" spreads
+    # requests evenly regardless of speed, which is what you want when the
+    # endpoints are equally fast and you are sharing load rather than racing.
+    router_selection: str = Field(default="throughput")
+    # How long a request may sit unassigned before the router gives up with a
+    # clean error instead of holding the agent's connection open forever.
+    router_queue_timeout: int = Field(default=600)
+    llm_probe_seconds: int = Field(default=20)
     # Agents run unattended, so tool calls are never gated on a human.
     confirm_tools: bool = Field(default=False)
     # Restrict worker/executor tool execution to each project's workspace.
@@ -211,9 +318,9 @@ class HarnessConfig(BaseModel):
         needs no special case anywhere else.
         """
         out: list[LLMServerConfig] = [self.llm]
-        seen = {(self.llm.base_url, self.llm.route())}
+        seen = {(self.llm.base_url, self.llm.wire_model())}
         for srv in self.llm_servers:
-            key = (srv.base_url, srv.route())
+            key = (srv.base_url, srv.wire_model())
             if key in seen:
                 continue  # same endpoint listed twice would skew the rotation
             seen.add(key)

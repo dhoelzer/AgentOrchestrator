@@ -258,7 +258,7 @@ def budget_exhausted_briefing(agent: dict, task: dict | None) -> str:
 
 
 def cycle_briefing(project: dict, board: dict, agents: list[dict],
-                   attention: list[dict]) -> str:
+                   attention: list[dict], archived: list[dict] | None = None) -> str:
     """The per-cycle briefing the orchestrator receives from the scheduler."""
     counts = {col: len(items) for col, items in board.items()}
     payload = {
@@ -305,6 +305,11 @@ def cycle_briefing(project: dict, board: dict, agents: list[dict],
     return (
         "ORCHESTRATOR CYCLE - act on this board now.\n\n"
         + json.dumps(payload, indent=2)
+        + ("\n\n## Archived specialists (not on the tree, still resumable)\n"
+           + json.dumps(archived, indent=2)
+           + "\nIf one already has the expertise a ready card needs, `resume_agent` "
+             "it instead of creating a clone."
+           if archived else "")
         + "\n\n## Needs your attention\n"
         + ("\n".join(f"- {a}" for a in attention) if attention else "- nothing flagged")
         + "\n\nTake the next concrete actions with your tools, then call `report_cycle`."

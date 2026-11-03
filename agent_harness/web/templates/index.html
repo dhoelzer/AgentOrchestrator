@@ -34,6 +34,9 @@
   .alert .row { display:flex; align-items:center; gap:10px; }
   .alert .msg { flex:1; }
   .alert button { padding:3px 10px; font-size:12px; }
+  button.more { display:block; width:100%; margin-top:6px; padding:6px;
+    font-size:12px; color:var(--dim); }
+  #archivedBtn.active { border-color:var(--accent); color:var(--accent); }
   .alerts-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
   .alerts-head h4 { margin:0; font-size:12px; text-transform:uppercase;
     letter-spacing:.05em; color:var(--dim); }
@@ -98,6 +101,8 @@
   .light.on { background:var(--ok); box-shadow:0 0 6px var(--ok);
     animation:pulse 1.4s ease-in-out infinite; }
   .light.off { background:#3a3f4b; border:1px solid var(--line); }
+  .light.warn { background:var(--warn); box-shadow:0 0 6px var(--warn); }
+  .light.bad { background:var(--err); box-shadow:0 0 6px var(--err); }
   @keyframes pulse { 50% { opacity:.45; } }
 
   /* LLM action queue: newest queued action at the left, the one the model has
@@ -126,6 +131,48 @@
     overflow:hidden; text-overflow:ellipsis; max-width:190px; }
   .qmeta { font-size:10px; color:var(--dim); font-variant-numeric:tabular-nums; }
   .queue-empty { font-size:11px; margin:6px 0; }
+  /* LLM router: one card per request the router is holding (queued, sent and
+     awaiting, or actively generating), with one card per configured endpoint
+     pinned to the far right. */
+  .rtwrap { margin:6px 0 4px; }
+  .rtbar { display:flex; gap:10px; align-items:stretch; flex-wrap:wrap;
+    border:1px solid var(--line); border-radius:10px; padding:8px 10px;
+    background:rgba(255,255,255,.02); }
+  .rtlane { display:flex; align-items:center; gap:8px; min-width:0; flex:1 1 auto; }
+  .rtlane.srv { flex:0 0 auto; }
+  .rtlane.srv .rrow { border-left:1px solid var(--line); padding-left:10px; }
+  .rtlabel { font-size:10px; text-transform:uppercase; letter-spacing:.06em;
+    color:var(--dim); flex:0 0 auto; }
+  .rrow { display:flex; gap:6px; align-items:stretch; overflow-x:auto;
+    max-width:100%; scrollbar-width:thin; }
+  .rcard { display:flex; flex-direction:column; gap:2px; cursor:pointer;
+    border:1px solid var(--line); border-radius:8px; padding:5px 8px;
+    background:var(--panel); min-width:126px; flex:0 0 auto; }
+  .rcard:hover { border-color:var(--accent); }
+  .rcard.awaiting { border-color:#d7a54a; }
+  .rcard.generating { border-color:var(--ok);
+    box-shadow:0 0 8px rgba(63,178,127,.35); }
+  .rcard.failed { border-color:var(--err); }
+  .rcard.completed { opacity:.62; }
+  .rtstat { font-size:9px; text-transform:uppercase; letter-spacing:.05em;
+    color:var(--dim); }
+  .rcard.awaiting .rtstat { color:#d7a54a; }
+  .rcard.generating .rtstat { color:var(--ok); }
+  .rcard.failed .rtstat { color:var(--err); }
+  .rtwho { font-size:12px; font-weight:600; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; max-width:190px; }
+  .rtmeta { font-size:10px; color:var(--dim); font-variant-numeric:tabular-nums; }
+  .scard { display:flex; flex-direction:column; gap:2px;
+    border:1px solid var(--line); border-radius:8px; padding:5px 8px;
+    background:var(--panel); min-width:132px; flex:0 0 auto; }
+  .scard.down { border-color:var(--err); }
+  .scard.cooling { border-color:#d7a54a; }
+  .shead { display:flex; align-items:center; gap:6px; }
+  .sname { font-size:12px; font-weight:600; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; max-width:120px; }
+  .srate { font-size:11px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .stok { font-size:10px; color:var(--dim); font-variant-numeric:tabular-nums; }
+  .rt-empty { font-size:11px; margin:6px 0; }
 
   /* Project-level user input: the box that feeds the orchestrator new scope. */
   .msgbar { margin:10px 0 0; display:flex; flex-direction:column; gap:6px; }
@@ -165,7 +212,15 @@
   form.settings input { background:var(--bg); color:var(--text); border:1px solid var(--line);
     border-radius:8px; padding:8px 10px; font:inherit; }
   .serverrows { display:flex; flex-direction:column; gap:8px; margin:10px 0; }
-  .serverrow { display:grid; grid-template-columns:1fr 1.2fr 2fr 1.6fr 1.2fr auto;
+  .testprompt { margin-top:12px; border-top:1px solid var(--line); padding-top:10px; }
+  .testprompt select, .testprompt input { background:var(--bg); color:var(--text);
+    border:1px solid var(--line); border-radius:8px; padding:7px 9px; font:inherit; }
+  .testprompt select { margin-left:6px; }
+  .testprompt input { width:100%; }
+  .testout { margin:8px 0 0; padding:8px 10px; background:var(--bg);
+    border:1px solid var(--line); border-radius:8px; font-size:11px;
+    white-space:pre-wrap; word-break:break-word; max-height:180px; overflow:auto; }
+  .serverrow { display:grid; grid-template-columns:1fr 1.1fr 1.9fr 1.5fr 1.1fr auto auto;
     gap:8px; align-items:center; }
   .serverrow input, .serverrow select { background:var(--bg); color:var(--text);
     border:1px solid var(--line); border-radius:8px; padding:7px 9px; font:inherit; }
@@ -212,6 +267,7 @@
   <span class="pill" id="llmPill">llm: <b>—</b></span>
   <span class="pill cost" id="costPill">cost: <b>$0.00</b></span>
   <span class="spacer"></span>
+  <button id="archivedBtn" title="Finished specialists are archived off the hierarchy so the tree shows who is working. Show them here.">Archived: hidden</button>
   <button id="tickBtn">Run cycle now</button>
   <button id="settingsBtn">Settings</button>
 </header>
@@ -288,14 +344,27 @@
     <label>Sub-agent turn limit<input name="sub_agent_turn_limit" type="number" min="1"></label>
     <label>Parallel workers<input name="max_parallel_workers" type="number" min="1"></label>
     <label>LLM queue depth<input name="llm_queue_depth" type="number" min="0"></label>
+    <label>Requests per LLM<input name="llm_server_concurrency" type="number" min="1"></label>
     <label>Max sub-agent depth<input name="max_sub_agent_depth" type="number" min="1"></label>
     <label>Input $/token<input name="llm.input_cost_per_token" type="number" step="any" min="0"></label>
     <label>Output $/token<input name="llm.output_cost_per_token" type="number" step="any" min="0"></label>
   </form>
-  <h4>LLM servers <span class="muted">(requests round-robin across these)</span></h4>
+  <h4>LLM servers <span class="muted">(the router sends each request to whichever
+  of these is free first)</span></h4>
   <div id="serverHealth" class="serverhealth"></div>
   <div id="serverRows" class="serverrows"></div>
-  <div class="sec"><button class="ghost" id="addServer" type="button">Add server</button></div>
+  <div class="sec"><button class="ghost" id="addServer" type="button">Add server</button>
+  <button class="ghost" id="probeServers" type="button">Re-check reachability</button></div>
+  <div class="testprompt">
+    <label class="muted" style="font-size:12px">Test prompt
+      <select id="testServer"></select>
+      <input id="testPrompt" placeholder="Reply with exactly the word READY"
+             style="margin-top:6px">
+    </label>
+    <div class="sec"><button id="runTest" type="button">Send test prompt</button>
+      <span class="muted" id="testMsg"></span></div>
+    <pre id="testOut" class="testout" hidden></pre>
+  </div>
   <div class="sec"><button class="primary" id="settingsSave" type="button">Apply</button>
   <span class="muted" id="settingsMsg"></span></div>
 </div></dialog>

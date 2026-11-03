@@ -14,6 +14,7 @@ import time
 sys.path.insert(0, ".")
 
 from agent_harness.config import HarnessConfig
+from agent_harness.llm_router import make_router
 from agent_harness.orchestrator import Orchestrator
 from agent_harness.runtime import AgentRuntime
 from agent_harness.store import Store
@@ -33,7 +34,9 @@ def main() -> int:
     cfg.ensure_dirs()
 
     store = Store(cfg.data_dir)
-    runtime = AgentRuntime(cfg, store)
+    router = make_router(cfg, store)
+    router.start()
+    runtime = AgentRuntime(cfg, store, router=router)
     register_harness_tools()
     orch = Orchestrator(cfg, store, runtime)
 
@@ -106,7 +109,20 @@ def main() -> int:
     assert "user_message" not in kinds or True
     print("user input consumed by the orchestrator ok")
 
+    # Every LLM call in the run had to go through the router: agents hold no
+    # endpoint of their own, so a zero counter means something bypassed it.
+    stats = router.status()
+    served = stats["counts"]["served"]
+    tokens = sum(s["total_tokens"] for s in stats["servers"])
+    print(f"router: {served} requests served, {tokens} completion tokens, "
+          + ", ".join(f"{s['name']}={s['requests_ok']}ok/{s['requests_failed']}fail"
+                      for s in stats["servers"]))
+    assert served > 0, "no LLM request went through the router"
+    assert tokens > 0, "the router recorded no tokens"
+    assert stats["recent"], "router kept no per-request records"
+
     runtime.close_all()
+    router.stop()
     return 0
 
 

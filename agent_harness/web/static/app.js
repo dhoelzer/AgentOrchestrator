@@ -3,7 +3,8 @@ const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-const state = { data: null, openProjects: new Set(), tab: "board", queues: {} };
+const state = { data: null, openProjects: new Set(), tab: "board", queues: {},
+                router: null, showArchived: false, showAllDone: false };
 
 const money = (v) => "$" + (Number(v || 0)).toFixed(4).replace(/0+$/, "").replace(/\.$/, ".00");
 
@@ -31,6 +32,13 @@ function turnsClass(used, limit) {
 }
 
 function renderHeader(d) {
+  const ab = $("#archivedBtn");
+  if (ab) {
+    const hidden = (d.projects || []).reduce((n, x) => n + (x.archived_agents || 0), 0);
+    ab.textContent = "Archived: " + (state.showArchived ? "shown" : "hidden")
+      + (hidden ? ` (${hidden})` : "");
+    ab.classList.toggle("active", state.showArchived);
+  }
   const ver = d.meta.harness_version || "unknown";
   const stored = d.meta.harness_version_stored;
   $("#versionPill").textContent = "v" + ver;
@@ -77,22 +85,125 @@ function renderHeader(d) {
     `Removed projects keep their spend in the activity feed.`;
   const llm = d.meta.llm || {};
   const unhealthy = (llm.empty_responses || 0) + (llm.transient_errors || 0) > 0;
-  const fleet = d.meta.llm_fleet || [];
+  const router = d.meta.llm_router || {};
+  const fleet = router.servers || [];
   const cap = d.meta.capacity || {};
-  const down = fleet.filter((s) => s.cooling_down);
+  const rc = router.counts || {};
+  const down = fleet.filter((s) => s.reachable === false || s.cooling_down);
   $("#llmPill").innerHTML =
     `llm: <b>${llm.timeout ?? "?"}s timeout</b>` +
-    (fleet.length > 1 ? ` · <b>${fleet.length - down.length}/${fleet.length}</b> servers` : "") +
+    ` · <b>${fleet.length - down.length}/${fleet.length}</b> llms` +
+    (rc.queued ? ` · <b>${rc.queued}</b> req queued` : "") +
     (unhealthy
       ? ` · <b>${(llm.empty_responses || 0) + (llm.transient_errors || 0)}</b> retried`
       : "");
   $("#llmPill").classList.toggle("warn", unhealthy || down.length > 0);
   $("#llmPill").title =
-    `Endpoints in rotation (round-robin):\n` +
-    fleet.map((s) => `  ${s.name} · ${s.model} @ ${s.base_url}` +
+    `LLM router: agents only produce a prompt; the router picks the endpoint.\n` +
+    `Selection: ${(cap.router_selection || "throughput")} - ` +
+    (cap.router_selection === "round_robin"
+      ? "endpoints share the load evenly.\n\n"
+      : "among endpoints with a free slot, the one that should answer soonest "
+        + "wins, so a fast endpoint takes more of the load.\n\n") +
+    fleet.map((s) => `  ${s.name} · ${s.model} @ ${s.base_url}\n` +
+      `    reachable=${s.reachable === null ? "unprobed" : s.reachable}` +
+      ` · ${s.tokens_per_second ?? "?"} tok/s · ${s.total_tokens ?? 0} tokens` +
+      ` · ${s.in_flight ?? 0} in flight` +
       (s.cooling_down ? ` · cooling ${s.cooldown_seconds}s` : "")).join("\n") +
-    `\nSlots: ${cap.slots_in_use ?? 0}/${cap.llm_slots ?? 0} in use` +
-    `, ${cap.queued ?? 0} queued`;
+    `\nWorker slots: ${cap.workers_active ?? 0}/${cap.worker_slots ?? 0} working` +
+    ` (${cap.slots_free ?? 0} free; the orchestrator holds one slot of its own)` +
+    `\nRouter requests: ${rc.queued ?? 0} queued,` +
+    ` ${(rc.awaiting ?? 0) + (rc.generating ?? 0)} sent`;
+}
+
+/* The LLM router: one card per request it is holding.
+   `queued`   -> waiting for any endpoint to free up (no endpoint chosen yet)
+   `awaiting` -> sent; waiting on the model to start answering
+   `generating` -> tokens are actively arriving
+   Endpoint cards are pinned to the far right, one per configured LLM. */
+function renderRouter(rt, projectId) {
+  const all = (rt && rt.requests) || [];
+  const allRecent = (rt && rt.recent) || [];
+  const servers = (rt && rt.servers) || [];
+  const counts = (rt && rt.counts) || {};
+  // Request cards are scoped to the project the strip sits under; the endpoint
+  // cards on the right are the whole fleet, since the router is shared.
+  const mine = (r) =>
+    !projectId || r.project_id === projectId || r.project_id === null;
+  const reqs = all.filter(mine);
+  const recent = allRecent.filter(mine);
+  const STATUS = { queued: "queued", awaiting: "awaiting",
+                   generating: "generating", failed: "failed" };
+  const card = (r) => `<div class="rcard ${esc(r.status)}" data-req="${esc(r.id)}"
+      title="${esc(r.agent_role || "?")} · ${esc(r.kind || "?")} · ${
+        r.status === "queued"
+          ? `waiting ${r.queued_seconds}s for any LLM to free up`
+          : `on ${esc(r.server || "?")} for ${r.running_seconds ?? 0}s`}">
+    <span class="rtstat">${esc(STATUS[r.status] || r.status)}${
+      r.failed_over ? " · failed over" : ""}</span>
+    <span class="rtwho">${esc(r.agent_role || r.agent_id || "request")}</span>
+    <span class="rtmeta">${r.status === "queued"
+        ? `waiting ${r.queued_seconds}s`
+        : `${esc(r.server || "?")} · ${r.running_seconds ?? 0}s`} · ${
+        r.prompt_chars} chars${
+        r.completion_tokens ? ` · ${r.completion_tokens} tok` : ""}</span>
+  </div>`;
+  const scard = (s) => {
+    const bad = s.reachable === false;
+    const cls = bad ? "down" : (s.cooling_down ? "cooling" : "");
+    const dot = bad ? "bad" : (s.cooling_down ? "warn" : "on");
+    return `<div class="scard ${cls}" title="${esc(s.base_url)} · model key ${
+        esc(s.model)}\n${s.requests_ok ?? 0} ok / ${s.requests_failed ?? 0} failed` +
+      `${s.last_error ? `\nlast error: ${esc(s.last_error)}` : ""}\n` +
+      `${s.prompt_tokens ?? 0} input + ${s.total_tokens ?? 0} output tokens over ${
+        s.generation_seconds ?? 0}s of generation">
+      <span class="shead"><span class="light ${dot}"></span>
+        <span class="sname">${esc(s.name)}</span></span>
+      <span class="srate">${s.tokens_per_second ?? "—"} tok/s</span>
+      <span class="stok">${fmtTokens(s.total_tokens)} tokens · ${
+        s.in_flight ?? 0} in flight${
+        s.cooling_down ? ` · cooling ${s.cooldown_seconds}s` : ""}</span>
+    </div>`;
+  };
+  const pending = reqs.filter((r) => r.status === "queued").reverse();
+  const sent = reqs.filter((r) => r.status !== "queued");
+  const finished = recent.slice(-4).reverse();
+  return `<div class="rtbar">
+    <div class="rtlane">
+      <span class="rtlabel">router queued</span>
+      <div class="rrow">${pending.map(card).join("")
+        || '<span class="muted">none</span>'}</div>
+    </div>
+    <div class="rtlane">
+      <span class="rtlabel">sent / generating</span>
+      <div class="rrow">${sent.map(card).join("")
+        || '<span class="muted">idle</span>'}</div>
+    </div>
+    ${finished.length ? `<div class="rtlane"><span class="rtlabel">just done</span>
+      <div class="rrow">${finished.map((r) =>
+        `<div class="rcard ${esc(r.status)}" data-req="${esc(r.id)}"
+           title="${esc(r.error || `answered by ${r.server || "?"}`)}">
+           <span class="rtstat">${esc(r.status)}</span>
+           <span class="rtwho">${esc(r.agent_role || "request")}</span>
+           <span class="rtmeta">${r.completion_tokens ?? 0} tok · ${
+             r.running_seconds ?? 0}s</span></div>`).join("")}</div></div>` : ""}
+    <div class="rtlane srv">
+      <span class="rtlabel">llms</span>
+      <div class="rrow">${servers.map(scard).join("")
+        || '<span class="muted">none configured</span>'}</div>
+    </div>
+  </div>
+  <div class="muted" style="font-size:10px;margin-top:3px">
+    ${counts.queued ?? 0} waiting on an endpoint · ${(counts.awaiting ?? 0) + (counts.generating ?? 0)} sent
+    · ${counts.server_slots_in_use ?? 0}/${counts.server_slots ?? 0} endpoint slots busy
+    · ${counts.served ?? 0} served since start</div>`;
+}
+
+function fmtTokens(n) {
+  if (n === null || n === undefined) return "—";
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+  if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+  return String(n);
 }
 
 function renderAlerts(d) {
@@ -157,6 +268,7 @@ function renderTree(nodes) {
         ${n.task_id ? `<span class="tag">task ${esc(n.task_id)}</span>` : ""}
         ${n.tokens ? `<span class="kv">${(n.tokens / 1000).toFixed(1)}k tok</span>` : ""}
         <span class="kv cost" title="${n.shared ? "Shared orchestrator spend — counted as harness overhead, not in this project's total" : ""}">${money(n.cost_usd)}${n.shared ? " (shared)" : ""}</span>
+        ${n.archived ? `<span class="tag" title="Finished and off the live hierarchy; assign it work again to bring it back">archived</span>` : ""}
       </div>
       ${kids}
     </div>`;
@@ -198,8 +310,6 @@ function renderQueue(queue) {
     <span class="qmeta">${e.status === "executing"
       ? `running ${e.running_seconds ?? 0}s`
       : `queued ${e.waiting_seconds}s`} · ${e.prompt_chars} chars</span>
-    ${e.server ? `<span class="qserver">${esc(e.server)}${
-        e.skipped_servers ? " · failover" : ""}</span>` : ""}
   </div>`;
   return `<div class="queue">
     <div class="qlane">
@@ -229,12 +339,25 @@ async function showQueuePrompt(entryId) {
   $("#detail").showModal();
 }
 
+// A long-running project accumulates done cards without bound, and they all
+// look alike. Keep the most recent visible and fold the rest behind a toggle.
+const DONE_VISIBLE = 10;
+
 function renderBoard(p) {
   return `<div class="kanban">${p.columns_order
     .map((col) => {
       const items = p.board[col] || [];
+      const overflow = col === "done" && items.length > DONE_VISIBLE;
+      const shown = overflow && !state.showAllDone
+        ? items.slice(0, DONE_VISIBLE) : items;
+      const more = overflow
+        ? `<button class="more" data-more-done="1">${
+            state.showAllDone ? "Collapse done"
+              : `Show ${items.length - DONE_VISIBLE} earlier of ${items.length} done`
+          }</button>`
+        : "";
       return `<div class="col"><h4><span>${col}</span><span>${items.length}</span></h4>
-        ${items.map(taskCard).join("")}</div>`;
+        ${shown.map(taskCard).join("")}${more}</div>`;
     })
     .join("")}</div>`;
 }
@@ -281,6 +404,10 @@ function renderProjects(d) {
           </div>
           ${renderMessageBar(p)}
           <div id="queue-${p.id}" class="qwrap">${renderQueue(state.queues[p.id])}</div>
+          <div id="router-${p.id}" class="rtwrap">${renderRouter(state.router, p.id)}</div>
+          ${p.archived_agents ? `<div class="kv" style="margin:6px 0">
+            ${p.archived_agents} archived specialist(s) hidden from the hierarchy —
+            use the "Archived" button in the header to show them.</div>` : ""}
           <div class="grid2">
             <div>${state.tab === "board" ? renderBoard(p) : renderTree(p.tree)}</div>
             <div>
@@ -308,7 +435,7 @@ function renderFeed(d) {
 }
 
 async function refresh() {
-  const res = await fetch("/api/state");
+  const res = await fetch("/api/state?show_archived=" + (state.showArchived ? "1" : "0"));
   const d = await res.json();
   state.data = d;
   // Seed the queue from the state payload so the strip is right on first paint;
@@ -320,6 +447,7 @@ async function refresh() {
       (e) => e.project_id === p.id || e.project_id === null);
     if (!state.openProjects.has(p.id) && p.status !== "delivered") state.openProjects.add(p.id);
   });
+  state.router = d.meta.llm_router || null;
   renderHeader(d);
   renderAlerts(d);
   renderProjects(d);
@@ -426,6 +554,24 @@ document.addEventListener("click", async (e) => {
     syncServerList();
     serverList.push({ name: "", provider: "ollama_chat", base_url: "", model: "" });
     $("#serverRows").innerHTML = serverList.map(serverRow).join("");
+    populateTestServers();
+    return;
+  }
+  const rowTest = t.closest && t.closest("[data-srvtest]");
+  if (rowTest) {
+    await runTestPrompt(Number(rowTest.dataset.srvtest));
+    return;
+  }
+  if (t.id === "probeServers") {
+    $("#testMsg").textContent = "re-checking reachability…";
+    const res = await fetch("/api/llm/router/probe", { method: "POST" });
+    const body = await res.json();
+    $("#testMsg").textContent = (body.servers || [])
+      .map((x) => `${x.name}: ${x.reachable ? "reachable" : "unreachable"}`).join(" · ");
+    return;
+  }
+  if (t.id === "runTest") {
+    await runTestPrompt();
     return;
   }
   if (t.dataset.srvdel !== undefined) {
@@ -447,6 +593,11 @@ document.addEventListener("click", async (e) => {
   const queueCard = t.closest && t.closest("[data-queue]");
   if (queueCard) {
     await showQueuePrompt(queueCard.dataset.queue);
+    return;
+  }
+  const reqCard = t.closest && t.closest("[data-req]");
+  if (reqCard) {
+    await showRouterPrompt(reqCard.dataset.req);
     return;
   }
   if (t.dataset.ack) {
@@ -517,6 +668,16 @@ document.addEventListener("click", async (e) => {
     refresh();
     return;
   }
+  if (t.dataset.moreDone) {
+    state.showAllDone = !state.showAllDone;
+    renderProjects(state.data);
+    return;
+  }
+  if (t.id === "archivedBtn") {
+    state.showArchived = !state.showArchived;
+    refresh();
+    return;
+  }
   if (t.dataset.tab) {
     state.tab = t.dataset.tab;
     renderProjects(state.data);
@@ -576,6 +737,7 @@ const SETTING_KEYS = [
   "llm.model", "llm.base_url", "llm.api_key", "llm.request_timeout",
   "llm.max_request_timeout", "llm.empty_response_retries", "tick_seconds",
   "sub_agent_turn_limit", "max_parallel_workers", "llm_queue_depth",
+  "llm_server_concurrency",
   "max_sub_agent_depth", "llm.input_cost_per_token",
   "llm.output_cost_per_token",
 ];
@@ -596,8 +758,96 @@ function serverRow(srv, i) {
     ${cell("base_url", "http://host:11434/v1")}
     ${cell("model", "model key sent to the server")}
     ${cell("api_key", "(unchanged)")}
+    <button class="ghost" type="button" data-srvtest="${i}"
+      title="Send one prompt to exactly this endpoint, without saving it">Test</button>
     <button class="ghost" type="button" data-srvdel="${i}">Remove</button>
   </div>`;
+}
+
+function populateTestServers() {
+  const sel = $("#testServer");
+  if (!sel) return;
+  const current = sel.value;
+  // __primary__ is built from the form, so an unsaved primary endpoint can be
+  // tested too. Each server row also has its own Test button.
+  const opts = ["__primary__", ...serverList.filter((x) => x.name).map((x) => x.name)];
+  sel.innerHTML = opts.map((n) => n === "__primary__"
+    ? `<option value="__primary__">(primary endpoint, from the form)</option>`
+    : `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  if (opts.includes(current)) sel.value = current;
+}
+
+async function runTestPrompt(rowIndex) {
+  const msg = $("#testMsg");
+  const out = $("#testOut");
+  const chosen = $("#testServer") ? $("#testServer").value : "__primary__";
+  const prompt = $("#testPrompt") ? $("#testPrompt").value.trim() : "";
+  const form = $("#settingsForm");
+  const payload = { prompt, max_tokens: 64 };
+  if (rowIndex !== undefined) {
+    // The row's own Test button: send to exactly what is typed in that row,
+    // whether or not it has been saved.
+    const row = readRow(rowIndex);
+    if (!row.base_url || !row.model) {
+      msg.textContent = "fill in base URL and model for that row first";
+      return;
+    }
+    payload.server_config = row;
+  } else if (chosen === "__primary__") {
+    payload.server_config = {
+      name: "primary", provider: "openai",
+      base_url: form.elements["llm.base_url"].value.trim(),
+      model: form.elements["llm.model"].value.trim(),
+      api_key: form.elements["llm.api_key"].value.trim(),
+    };
+  } else {
+    payload.server = chosen;
+  }
+  if (!payload.server_config && !payload.server) {
+    msg.textContent = "give the server a name first";
+    return;
+  }
+  msg.textContent = "sending…";
+  out.hidden = true;
+  try {
+    const res = await fetch("/api/llm/router/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      msg.textContent = body.detail || "the test failed";
+      return;
+    }
+    if (body.ok) {
+      msg.textContent = `${body.server}: ok · ${body.seconds}s · `
+        + `${body.completion_tokens ?? 0} tok · ${body.tokens_per_second ?? "?"} tok/s`;
+      out.textContent = `model sent: ${body.model}\n`
+        + `reply: ${body.reply || "(no final answer)"}`
+        + (body.reasoning_preview
+            ? `\nreasoning: ${body.reasoning_preview}` : "")
+        + (body.note ? `\n\n${body.note}` : "");
+    } else {
+      msg.textContent = `${body.server}: failed`;
+      out.textContent = `error: ${body.error}`
+        + (body.status ? ` (HTTP ${body.status})` : "");
+    }
+    out.hidden = false;
+  } catch (err) {
+    msg.textContent = "request to the harness failed: " + err;
+  }
+}
+
+function readRow(i) {
+  // One row's currently typed values, so a brand-new endpoint can be tested
+  // before it is saved.
+  const out = { ...(serverList[i] || {}) };
+  for (const el of document.querySelectorAll(
+      `[data-srv="${i}"][data-field]`)) {
+    out[el.dataset.field] = el.value.trim();
+  }
+  return out;
 }
 
 function syncServerList() {
@@ -634,6 +884,7 @@ async function openSettings() {
     input.value = key === "llm.api_key" ? "" : (flat[key] ?? "");
   }
   renderServers(d.config, d.llm_servers);
+  populateTestServers();
   $("#settingsMsg").textContent = "";
   $("#settings").showModal();
 }
@@ -686,8 +937,36 @@ async function saveSettings() {
 refresh();
 /* The queue is live runtime state, so it is polled faster than the board and
    patched into its own container rather than re-rendering the whole page. */
+async function showRouterPrompt(requestId) {
+  const res = await fetch(`/api/llm/router/requests/${encodeURIComponent(requestId)}`);
+  const body = await res.json();
+  if (!res.ok) {
+    // Requests are pruned shortly after they finish, so a click can arrive just
+    // after the card it came from disappears.
+    $("#detailBody").innerHTML = `<h3>Request already cleared</h3>
+      <div class="muted">${esc(body.detail || "That request is no longer in the router.")}</div>`;
+  } else {
+    $("#detailBody").innerHTML = `<h3>Prompt held by the LLM router</h3>
+      <div class="muted">${esc(body.id)}</div>
+      <div class="sec"><h5>Prompt</h5><pre>${esc(body.prompt)}</pre></div>`;
+  }
+  $("#detail").showModal();
+}
+
 async function refreshQueues() {
   const projects = (state.data && state.data.projects) || [];
+  // One router snapshot per poll: it is a single shared service, so every
+  // project's strip reads from the same object.
+  try {
+    const res = await fetch("/api/llm/router");
+    if (res.ok) {
+      state.router = await res.json();
+      projects.forEach((p) => {
+        const host = document.getElementById(`router-${p.id}`);
+        if (host) host.innerHTML = renderRouter(state.router, p.id);
+      });
+    }
+  } catch { /* harness mid-restart; next tick retries */ }
   await Promise.all(projects.map(async (p) => {
     try {
       const res = await fetch(`/api/projects/${p.id}/queue`);

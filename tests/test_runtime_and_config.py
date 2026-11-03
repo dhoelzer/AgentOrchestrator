@@ -279,7 +279,8 @@ def test_live_config_patch_and_persistence():
         assert cfg.llm.base_url == "http://other-host:1234/v1"
         assert cfg.llm.model == "openai/other-model"
         assert runtime.llm_timeout == 900, runtime.llm_timeout
-        assert runtime.gate.limit == 5
+        # 5 worker slots + 1 reserved for the orchestrator.
+        assert runtime.gate.limit == 5 + 1
         assert cfg.sub_agent_turn_limit == 250
         assert cfg.llm.input_cost_per_token == 0.000001
         assert "llm.base_url" in keys

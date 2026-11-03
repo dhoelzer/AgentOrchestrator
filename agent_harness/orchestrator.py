@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from openhands.sdk import Tool
@@ -47,6 +48,15 @@ class Orchestrator:
         # API (or by another process) is noticed on the next tick.
         self._config_fp = self._file_fingerprint()
         self._stop = threading.Event()
+        # Only one cycle may run at a time. The scheduler loop is sequential,
+        # but /api/tick starts a cycle from the web thread, and a manual tick
+        # landing on a running cycle enqueues a second orchestrator LLM request
+        # while the first one is still holding the conversation.
+        self._cycle_lock = threading.Lock()
+        # Recent cycle durations, and the interval the loop is currently using.
+        self._cycle_durations: deque[float] = deque(maxlen=12)
+        self._last_skip_event_at: float | None = None
+        self.effective_tick = float(max(1, config.tick_seconds))
         self.config_notes: list[str] = []
         harness_tools.init_context(config, store, runtime)
         self.spec = self._load_or_create_spec()
@@ -122,6 +132,8 @@ class Orchestrator:
             "max_sub_agent_depth": cfg.max_sub_agent_depth,
             "max_children_per_agent": cfg.max_children_per_agent,
             "request_timeout": cfg.llm.request_timeout,
+            "server_concurrency": cfg.llm_server_concurrency,
+            "router_selection": cfg.router_selection,
             "servers": {s.name: s.fingerprint() for s in cfg.servers()},
         }
 
@@ -132,23 +144,35 @@ class Orchestrator:
 
         if cfg.max_parallel_workers != before["max_parallel_workers"]:
             old, new = before["max_parallel_workers"], cfg.max_parallel_workers
-            self.runtime.gate.set_limit(new)
+            self.runtime.set_worker_slots(new)
             if new > old:
                 notes.append(
-                    f"parallel LLM slots {old} -> {new}: {new - old} more agents "
+                    f"worker slots {old} -> {new}: {new - old} more agents "
                     "can run at once, so schedule more of the ready work now")
             else:
                 notes.append(
-                    f"parallel LLM slots {old} -> {new}: running agents are left "
+                    f"worker slots {old} -> {new}: running agents are left "
                     f"to drain down; do not start more than {new} at a time")
 
         if (cfg.max_parallel_workers != before["max_parallel_workers"]
                 or cfg.llm_queue_depth != before["llm_queue_depth"]):
             self.runtime.sync_pool_size()
 
+        if cfg.router_selection != before["router_selection"]:
+            notes.append(
+                "endpoint selection %s -> %s: the router now picks endpoints by %s"
+                % (before["router_selection"], cfg.router_selection,
+                   "their measured token rate"
+                   if cfg.router_selection == "throughput" else "load alone"))
+
         if cfg.llm.request_timeout != before["request_timeout"]:
             self.runtime.set_llm_timeout(cfg.llm.request_timeout)
             notes.append(f"LLM request timeout -> {cfg.llm.request_timeout}s")
+
+        if cfg.llm_server_concurrency != before["server_concurrency"]:
+            notes.append(
+                f"requests per LLM endpoint "
+                f"{before['server_concurrency']} -> {cfg.llm_server_concurrency}")
 
         after = {s.name: s.fingerprint() for s in cfg.servers()}
         added = sorted(set(after) - set(before["servers"]))
@@ -161,13 +185,12 @@ class Orchestrator:
                 + (f" (added {', '.join(added)})" if added else "")
                 + (f" (removed {', '.join(removed)})" if removed else "")
                 + (f" (reconfigured {', '.join(changed)})" if changed else ""))
-            rebound, draining = self.runtime.rebind_stale_servers()
-            if rebound:
-                notes.append(f"{rebound} idle agent(s) moved onto live endpoints")
-            if draining:
-                notes.append(
-                    f"{draining} running agent(s) left on their current endpoint "
-                    "to finish; they switch on their next run")
+            # The router is the only thing that talks to an endpoint, so a
+            # server change is applied there and nowhere else: no conversation
+            # has to be re-pointed, because none of them hold an endpoint.
+            if self.runtime.router is not None:
+                self.runtime.router.sync_servers()
+                self.runtime.router.probe_all()
             self.store.meta["llm_servers_active"] = list(after)
 
         for attr, label in (("tick_seconds", "tick"),
@@ -530,7 +553,110 @@ class Orchestrator:
             self.store.flush()
         return lines
 
-    def run_cycle(self) -> list[CycleReport]:
+    def sweep_finished_agents(self) -> list[str]:
+        """Archive sub-agents whose work is finished out of the live hierarchy.
+
+        A specialist that has done its job stays in the tree forever otherwise,
+        so a long-running project ends up with a wall of finished agents that
+        hides the ones actually doing work. Archiving (not deleting) keeps cost,
+        tokens, and the transcript queryable and leaves the agent available to
+        `resume_agent`, while freeing the parent's delegation slot.
+
+        An agent is only archived when it is genuinely finished with the
+        project: it was retired, or the task it was assigned to is done; it is
+        not running, it has no live children, and it is not the reviewer of
+        record on a card that is still open. A specialist created but not yet
+        used also stays - it exists for work that is still coming.
+        """
+        # Archiving a child can finish its parent, so repeat until the tree
+        # settles; otherwise a depth-3 subtree takes one tick per level to
+        # clear out.
+        lines: list[str] = []
+        for _ in range(10):
+            made = self._archive_finished_once()
+            if not made:
+                break
+            lines.extend(made)
+        if lines:
+            self.store.flush()
+        return lines
+
+    def _archive_finished_once(self) -> list[str]:
+        lines: list[str] = []
+        inflight = self.runtime.inflight
+        for agent in list(self.store.agents.values()):
+            if agent.role == "orchestrator" or agent.archived_at is not None:
+                continue
+            if agent.id in inflight or agent.child_agent_ids:
+                continue
+            if agent.status not in ("done", "idle"):
+                continue
+
+            # An agent the orchestrator created but has not used yet stays on
+            # the tree: it was created for work that is still coming.
+            if agent.task_id is None and agent.status != "done":
+                continue
+            task = self.store.tasks.get(agent.task_id or "")
+            if task is not None and task.column != "done":
+                continue
+            if any(t.reviewer_agent_id == agent.id and t.column != "done"
+                   for t in self.store.tasks.values()):
+                continue
+            reason = ("retired after finishing its work" if agent.status == "done"
+                      else "assigned task is done")
+
+            agent.archived_at = now_iso()
+            agent.retirement_reason = reason
+            agent.touch()
+            if agent.parent_agent_id and agent.parent_agent_id in self.store.agents:
+                parent = self.store.agents[agent.parent_agent_id]
+                parent.child_agent_ids = [
+                    c for c in parent.child_agent_ids if c != agent.id]
+                self.store.upsert_agent(parent)
+            self.store.add_event(
+                "agent_archived",
+                f"Archived {agent.role} ({agent.id}) from the hierarchy: {reason}.",
+                project_id=agent.project_id, agent_id=agent.id)
+            lines.append(f"Archived {agent.role} ({agent.id}): {reason}.")
+        return lines
+
+    def run_cycle(self, block: bool = False) -> list[CycleReport] | None:
+        """Run one scheduler cycle, unless one is already in progress.
+
+        Returns None when the cycle was skipped because another cycle held the
+        loop. Overlapping cycles are never safe: they would interleave writes to
+        the same task and agent records, and the second one's orchestrator LLM
+        request would queue behind a request from the very conversation it is
+        trying to continue.
+        """
+        if block:
+            self._cycle_lock.acquire()
+        elif not self._cycle_lock.acquire(blocking=False):
+            started = int(self.store.meta.get("cycle_started_at") or time.time())
+            self.store.meta["cycle_skips"] = int(
+                self.store.meta.get("cycle_skips", 0)) + 1
+            # Coalesced: a long cycle makes the loop retry many times, and one
+            # event per retry buries the feed in identical noise. The counter
+            # still increments every time.
+            last = self._last_skip_event_at
+            if last is None or time.time() - last >= 60:
+                self._last_skip_event_at = time.time()
+                self.store.add_event(
+                    "cycle_skipped",
+                    f"Cycle skipped: another cycle was still running "
+                    f"(started {int(time.time() - started)}s ago).")
+            logger.info("Skipping cycle: one is already running")
+            return None
+        try:
+            return self._run_cycle()
+        finally:
+            self._cycle_lock.release()
+
+    def cycle_running(self) -> bool:
+        """True while a cycle holds the loop."""
+        return self._cycle_lock.locked()
+
+    def _run_cycle(self) -> list[CycleReport]:
         """One scheduler tick: reload config, sweep, reconcile, detect, act."""
         # First thing every tick: settings may have been edited through the UI
         # or by hand, and the whole point is that the harness adapts without a
@@ -538,6 +664,7 @@ class Orchestrator:
         # the orchestrator to use it (or hold back).
         self.config_notes = self.reload_config_if_changed()
         self.sweep_orphans()
+        self.sweep_finished_agents()
         self.reconcile()
         attention_map = self.detect()
         for project_id, notes in self._config_attention().items():
@@ -588,8 +715,9 @@ class Orchestrator:
         lines = [f"CONFIG CHANGED (applied this tick): {n}" for n in notes]
         cap = self.runtime.capacity()
         lines.append(
-            f"CAPACITY NOW: {cap['slots_free']} of {cap['llm_slots']} LLM slots "
-            f"free, {cap['queued']} action(s) already queued, "
+            f"CAPACITY NOW: {cap['slots_free']} of {cap['worker_slots']} worker "
+            f"slots free ({cap['workers_active']} working), {cap['queued']} "
+            f"action(s) already queued, "
             f"{len(cap['llm_servers'])} LLM server(s) in rotation "
             f"({', '.join(cap['llm_servers'])}).")
         if cap["slots_free"] > 0:
@@ -602,12 +730,18 @@ class Orchestrator:
         board = {col: [self._task_to_dict(t) for t in items]
                  for col, items in self.store.board(project.id).items()}
         agents = [self._agent_to_dict(a) for a in self.store.project_agents(project.id)]
+        archived = [
+            {"id": a.id, "role": a.role, "specialty": a.specialty,
+             "turns": f"{a.turns_used}/{a.turn_limit}", "why": a.retirement_reason}
+            for a in self.store.project_agents(project.id, include_archived=True)
+            if a.archived_at is not None
+        ]
         briefing = prompts.cycle_briefing(
             {"id": project.id, "name": project.name, "goal": project.goal,
              "constraints": project.constraints, "workspace": project.workspace,
              "status": project.status,
              "user_messages": project.user_messages},
-            board, agents, attention,
+            board, agents, attention, archived=archived,
         )
 
         # Refresh the orchestrator's per-cycle budget; its conversation persists.
@@ -684,7 +818,51 @@ class Orchestrator:
     def stop(self) -> None:
         self._stop.set()
 
+    def _next_tick(self, elapsed: float) -> float:
+        """Re-derive the scheduler interval from how long the last cycle took.
+
+        A fixed interval cannot be right: a cycle that runs long makes the loop
+        fall behind (and a manual tick then queues an orchestrator request on
+        top of a conversation that is still busy), while a cycle that finishes
+        quickly leaves the harness idle for the rest of the interval. The
+        measured duration is turned into an interval that keeps the loop about
+        `tick_duty_cycle` busy, bounded by min/max_tick_seconds.
+
+        An empty cycle costs no LLM call - detect() found nothing to act on and
+        the orchestrator was never asked - so letting the interval fall to the
+        floor when the harness is idle is what makes new work get picked up
+        promptly. The deque keeps the slowest recent cycle, so one expensive
+        cycle holds the interval wide for several ticks rather than collapsing
+        after a run of cheap ones.
+        """
+        cfg = self.config
+        # min_tick_seconds bounds how aggressively the auto-tuner speeds up; it
+        # must not override an explicitly configured faster tick, so the floor
+        # is the smaller of the two.
+        floor = max(1, min(cfg.min_tick_seconds, cfg.tick_seconds))
+        ceiling = max(floor, cfg.max_tick_seconds)
+        if not cfg.dynamic_tick:
+            return float(max(floor, min(cfg.tick_seconds, ceiling)))
+
+        self._cycle_durations.append(max(0.05, elapsed))
+        # Keep the longest recent cycle in the average: one slow cycle is a
+        # better signal of the real cost than several empty ones.
+        # deque has no slice syntax; list() first.
+        recent = max(list(self._cycle_durations)[-6:])
+        target = recent / max(0.05, min(1.0, cfg.tick_duty_cycle))
+        current = self.effective_tick
+        # Asymmetric: grow quickly when falling behind, shrink slowly so a
+        # burst of cheap cycles does not make the loop spin.
+        if target > current:
+            new = target
+        else:
+            new = current + (target - current) * 0.35
+        new = float(max(floor, min(ceiling, new)))
+        self.effective_tick = new
+        return new
+
     def run_forever(self) -> None:
+        self.effective_tick = float(max(1, self.config.tick_seconds))
         logger.info("Orchestrator loop starting (tick=%ss)", self.config.tick_seconds)
         self.store.add_event("loop_started",
                              f"Orchestrator loop started (tick {self.config.tick_seconds}s).")
@@ -695,9 +873,10 @@ class Orchestrator:
             self.store.meta["cycle_started_at"] = int(started)
             self.store.meta["cycle_status"] = "running"
             self.store.flush()
+            reports = None
             try:
                 reports = self.run_cycle()
-                for r in reports:
+                for r in (reports or []):
                     logger.info("cycle %s: %d attention items, status=%s",
                                 r.project_id, len(r.attention), r.orchestrator_status)
             except Exception as exc:  # noqa: BLE001 - the loop must survive
@@ -705,6 +884,13 @@ class Orchestrator:
                 self.store.add_event("loop_error", f"Cycle failed: {type(exc).__name__}: {exc}")
                 self._record_cycle_end("failed")
             elapsed = time.time() - started
-            wait = max(1.0, self.config.tick_seconds - elapsed)
-            self._stop.wait(wait)
+            # A skipped cycle costs ~0s. Feeding that to the tuner collapses the
+            # interval to the floor, which then makes the loop retry (and skip)
+            # every floor-length tick while one long cycle is in flight.
+            wait = self._next_tick(elapsed) if reports is not None \
+                else self.effective_tick
+            self.store.meta["effective_tick"] = round(wait, 1)
+            self.store.meta["last_cycle_seconds"] = round(elapsed, 1)
+            self.store.flush()
+            self._stop.wait(max(1.0, wait))
         self.runtime.close_all()

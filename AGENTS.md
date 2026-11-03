@@ -290,8 +290,35 @@ the drain is missing or the new code leaves something in `inflight` forever.
   (it greps `app.js`/`index.html`). If you rename `active` or the `.light` classes,
   that test fails on purpose — update it deliberately.
 
+## Agent archival (finished specialists leave the hierarchy)
+
+- `AgentSpec.archived_at` marks a specialist that finished its work. It is
+  **archived, not deleted**: cost, tokens, and transcript stay queryable, and
+  assigning it a new card (`_reactivate()` in `tools.py`) puts it back on the
+  live tree instead of cloning a fresh specialist for the same expertise.
+- `Orchestrator.sweep_finished_agents()` runs every tick. It archives an agent
+  only when it is genuinely finished: retired, or its assigned card is `done`;
+  not in flight; no live children; not the reviewer of record on an open card;
+  and not a specialist created but not yet used (that exists for work still
+  coming). An agent linked to no card at all is left alone unless it is `done`.
+- The sweep **cascades**: it repeats until a pass archives nothing, because
+  archiving the last child is what makes its parent finish. Without the loop a
+  depth-3 subtree takes one tick per level to clear.
+- `Store.project_agents(pid, include_archived=...)` is the single filter point.
+  The live tree hides archived agents; `/api/state?show_archived=1` and the
+  header "Archived" toggle reveal them, and each project reports
+  `archived_agents` so the UI can say how many are hidden.
+- Rationale: otherwise a long-running project accumulates a wall of finished
+  agents that hides the few actually working.
+
 ## Done-column cards
 
+- `TaskSpec.finished_at` is stamped inside `Store.upsert_task()` on the
+  transition *into* `done` and cleared on any move out of it, so rework gets a
+  fresh stamp. Do not stamp it at the individual move sites — there are a dozen.
+- `Store.board()` returns the `done` column **newest-first** so the UI can keep
+  just the recent ones. `app.js` shows `DONE_VISIBLE = 10` with a
+  "Show N earlier of M done" / "Collapse done" toggle (`state.showAllDone`).
 - Done cards render **title only** (no expertise/turns/cost meta) plus their light.
   Rationale: a landed card has no live counters worth scanning, and the column is
   usually the busiest one. Detail view still has everything; the card stays clickable.
@@ -357,9 +384,23 @@ the drain is missing or the new code leaves something in `inflight` forever.
   the gate limit, every dispatched run immediately gets a pool thread and then
   blocks *inside the pool's own `_work_queue`*, where nothing can see it — the
   dashboard's `queued` lane stays empty no matter how much work is waiting.
-- Fix: pool ceiling = `max_parallel_workers + llm_queue_depth`. The surplus
-  threads sit on the gate and are visible as `status == "queued"`. The gate, not
-  the pool, is what bounds real LLM concurrency.
+- Fix: pool ceiling = `gate.limit + llm_queue_depth`. The surplus threads sit on
+  the gate and are visible as `status == "queued"`. The gate, not the pool, is
+  what bounds real LLM concurrency.
+- `max_parallel_workers` counts **worker** slots only. The gate limit is
+  `max_parallel_workers + 1`: the extra slot is reserved for the orchestrator,
+  which holds one for the whole cycle while it decides what to dispatch.
+  Counting the orchestrator in the config value silently costs a worker slot and
+  caps real concurrency at `max_parallel_workers - 1`.
+- Because of that, anything that reads or writes the limit must go through
+  `AgentRuntime.set_worker_slots()` / `capacity()["worker_slots"]`, never
+  `gate.limit` directly. The API once reported `gate.limit` as
+  `max_parallel_workers`, so each settings round-trip drifted the limit by one.
+  `/api/config` now reports `max_parallel_workers` (config truth) and
+  `llm_slots` (gate truth) as separate fields.
+- `capacity()["worker_slots"]` excludes the reserved slot whether or not the
+  orchestrator currently holds it — otherwise the number the orchestrator plans
+  against changes mid-cycle.
 - Pool resizing is **grow-only**: a CPython worker thread only exits on the
   shutdown sentinel and never re-checks `_max_workers`, so lowering the ceiling
   cannot reclaim live threads. Surplus threads parked on the queue are harmless.
@@ -369,21 +410,61 @@ the drain is missing or the new code leaves something in `inflight` forever.
 - `HarnessConfig.servers()` returns `llm` first, then `llm_servers`, deduped by
   `(base_url, route())`. Primary-first means a config with no `llm_servers`
   needs no special case anywhere.
-- `LLMServerConfig.model` is the **literal model key** for that endpoint.
-  `route()` applies the provider prefix: `openai` → `openai/<model>`, while
-  `ollama` / `ollama_chat` pass the key through verbatim (`qwen2.5:7b`).
-  `extra_body` → `litellm_extra_body` for Ollama knobs (`num_ctx`, `keep_alive`).
-- `LLMRotator` round-robins on a shared cursor so the spread is even across all
-  agents/projects. `usage_id` is `<agent_id>@<server>` — that separates token
-  metrics per endpoint *and* lets the SDK reuse an LLM it already registered.
-- Cooldown: a `TIMEOUT_LIKE_ERRORS` fault parks the server for
-  `min(max(30, llm_timeout), 600)`s. A 429 does **not** park it (that means
-  slow down, not down). If every server is cooling, `pick()` returns the primary
-  so the failure surfaces as a normal transient error rather than "no LLM".
-- Because the SDK caches one LLM per conversation, load balancing only actually
-  happens via `Conversation.switch_llm()` — see `AgentRuntime._bind_server()`.
-  After switching, re-track `conv.agent.llm` and `conv.agent.condenser.llm` in
-  `_llms[agent_id]`, or adaptive timeout retuning silently stops applying.
+- `LLMServerConfig.model` is the **literal model key** for that endpoint, and
+  two different strings are derived from it. Do not conflate them:
+  * `wire_model()` → the value of `model` in the request body. Always verbatim
+    (`qwen3:30b`), because every endpoint is addressed over the OpenAI chat
+    completions protocol and Ollama matches that string against its own model
+    list: a prefixed key is a hard 404, `model 'ollama_chat/qwen3:30b' not found`.
+  * `route()` → a litellm model string (`ollama_chat/qwen3:30b`), used only when
+    an SDK `LLM` addresses an endpoint **directly** (the no-router fallback),
+    where litellm picks its client off the prefix. Never a wire value.
+  `extra_body` is merged into the body the router forwards, and into
+  `litellm_extra_body` for the direct path (Ollama knobs: `num_ctx`, `keep_alive`).
+- Every LLM request goes through `LLMRouter` (`agent_harness/llm_router.py`), a
+  continually running internal HTTP service on a loopback port the OS picks
+  (`router_port: 0`). Agents never address an endpoint directly: `build_agent`
+  points `llm.base_url` at `router.base_url` for both the agent and its
+  condenser. There is no rotator and no per-conversation server binding.
+- The agent's model string is the placeholder `openai/harness-routed`. It MUST
+  keep the `openai/` prefix: litellm resolves the provider from the model string
+  before it opens a connection, so an unprefixed name fails locally with
+  "LLM Provider NOT provided" and the request never reaches the router. The
+  router rewrites `body["model"]` to `srv.wire_model()` per endpoint, merges
+  that endpoint's `extra_body`, and strips keys the endpoint cannot accept
+  (`body_keys_to_drop()`). The SDK adds `reasoning_effort: "high"` to every
+  request; Ollama's OpenAI layer maps it to its own `think` option and answers
+  400 `think value "high" is not supported for this model`, so it is dropped for
+  `ollama`/`ollama_chat` unless that server sets `reasoning_effort` itself.
+  `drop_body_keys` overrides the rule for any endpoint.
+- Dispatch is availability-based, never pre-assigned. A request sits in the
+  queue with `server: None` until an endpoint is free; the tie-break between
+  equally-idle endpoints is "least recently assigned" (stable, spreads
+  sequential load). Concurrency per endpoint is `llm_server_concurrency`.
+  Because nothing is bound up front, a fast endpoint naturally takes more load
+  than a slow one.
+- Failover split, and why: a **transport** fault (connect/timeout) is absorbed
+  by the router, which re-queues the request for the next free endpoint
+  (`failed_over: true`). An **HTTP status >= 400** is relayed verbatim instead,
+  because the caller's client must see the real code to do its own handling
+  (429 -> litellm rate-limit path). Only the endpoint is parked. Retrying a
+  request that already streamed bytes would corrupt the response, so failover
+  stops once `req.responded` is set.
+- A 429 does not park an endpoint (slow down, not down). 5xx / unreachable does,
+  for `min(max(15, upstream_timeout), 600)`s.
+- Attribution travels in request headers (`x-harness-agent`, `-role`, `-kind`,
+  `-project`, `-task`) so router cards can be scoped to a project. The response
+  carries `x-harness-router: <endpoint>`.
+- Clock discipline: all cooldown/in-flight math uses `time.monotonic()`;
+  `time.time()` is only for display timestamps. Mixing them produced a tok/s
+  rate off by the epoch offset.
+- `test_prompt_config` deliberately bypasses the queue (an operator who just
+  added a server wants an answer about *that* endpoint, not a fleet slot) and
+  accepts a config that is not saved yet. An unsaved definition gets only its
+  own typed key — `resolved_api_key(use_env=False)` — so the harness-wide key is
+  never sent to a URL someone merely typed into a form.
+- The configured primary is always in the router fleet; `servers()` puts `llm`
+  first, so a config with no `llm_servers` needs no special case.
 
 ## Live reconfiguration at the start of every tick
 
@@ -400,10 +481,11 @@ the drain is missing or the new code leaves something in `inflight` forever.
   spurious `config_reloaded` every tick.
 - Shrinking `max_parallel_workers` drains: the gate limit drops for new runs, but
   in-flight agents are never interrupted.
-- `rebind_stale_servers()` catches both a removed server and a server that kept
-  its name but changed endpoint (compare `LLMServerConfig.fingerprint()`). Idle
-  conversations are switched to a live server; conversations whose agent is
-  `inflight` are left alone and switch on their next run.
+- Server changes are pushed into the router with `router.sync_servers()`; no
+  conversation is touched, because none of them holds an endpoint. This removed
+  `rebind_stale_servers()` entirely, along with the idle-vs-inflight drain
+  distinction. `server_concurrency` is part of the config fingerprint, so
+  changing it alone still triggers a reload.
 - A malformed config.json must not stop the loop: keep the previous settings,
   emit `config_reload_failed`, carry on.
 - Config changes reach the model as `CONFIG CHANGED` / `CAPACITY NOW` lines in

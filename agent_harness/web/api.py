@@ -61,7 +61,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         }
 
     @app.get("/api/state")
-    def state() -> dict:
+    def state(show_archived: bool = False) -> dict:
         projects = []
         for project in store.visible_projects():
             active = orchestrator.runtime.inflight
@@ -86,7 +86,12 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                 "cost_usd": store.project_cost(project.id),
                 "board": board,
                 "counts": store.column_counts(project.id),
-                "tree": _agent_tree(store, project.id, active=active),
+                "tree": _agent_tree(store, project.id, active=active,
+                                    include_archived=show_archived),
+                "archived_agents": sum(
+                    1 for a in store.project_agents(project.id,
+                                                     include_archived=True)
+                    if a.archived_at is not None),
                 # Queued user input the orchestrator has not acted on yet, so
                 # the UI can show a request as 'pending' until a cycle consumes it.
                 "user_messages": project.user_messages,
@@ -106,9 +111,11 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                      "last_tick": store.meta.get("last_tick"),
                      "inflight": sorted(orchestrator.runtime.inflight),
                      "llm": _llm_health(orchestrator),
-                     "llm_fleet": orchestrator.runtime.rotator.status(),
+                     # Everything the router strip needs: pending/queued LLM
+                     # requests and one entry per configured endpoint.
+                     "llm_router": _router_state(orchestrator),
                      "capacity": orchestrator.runtime.capacity(),
-                     "cycle": _cycle_status(store, config.tick_seconds)},
+                     "cycle": _cycle_status(store, orchestrator)},
             "total_cost_usd": store.harness_cost(),
             "project_cost_usd": sum(store.project_cost(p.id)
                                     for p in store.visible_projects()),
@@ -206,7 +213,10 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                                 "Confirmation failed: send the project name as 'confirm'.")
 
         # The orchestrator is shared across projects: never close or block on it.
-        project_agents = [a for a in store.project_agents(project_id)
+        # Archived agents are included: removal has to account for their
+        # conversation logs and cost even though the hierarchy hides them.
+        project_agents = [a for a in store.project_agents(project_id,
+                                                          include_archived=True)
                           if a.role != "orchestrator"]
 
         running = sorted(a.id for a in project_agents
@@ -219,7 +229,8 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         # transcript can live under this project's dir (its project_id is the
         # last project it touched). Handle each agent's dir individually so the
         # orchestrator's is never moved or deleted out from under a live loop.
-        doomed_agents = [a for a in store.project_agents(project_id)
+        doomed_agents = [a for a in store.project_agents(project_id,
+                                                          include_archived=True)
                          if a.role != "orchestrator"]
         _, log_note = orchestrator.runtime.handle_agent_logs(
             doomed_agents,
@@ -245,6 +256,62 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         return {"id": project_id, "mode": mode, "detail": detail,
                 "agents_removed": len(doomed_agents)}
 
+    @app.get("/api/llm/router")
+    def router_state() -> dict:
+        """Live router view: queued/sent LLM requests and per-endpoint health."""
+        return _router_state(orchestrator)
+
+    @app.get("/api/llm/router/requests/{request_id}")
+    def router_request(request_id: str) -> dict:
+        prompt = orchestrator.runtime.router.request_prompt(request_id) \
+            if orchestrator.runtime.router else None
+        if prompt is None:
+            raise HTTPException(404, "That request is no longer in the router.")
+        return {"id": request_id, "prompt": prompt}
+
+    @app.post("/api/llm/router/test")
+    def router_test(body: dict) -> dict:
+        """Send one prompt straight to a named endpoint and report the result.
+
+        Used by the "Test prompt" button when adding an LLM, so a new endpoint
+        can be proven before it ever receives real agent work.
+        """
+        router = orchestrator.runtime.router
+        if router is None:
+            raise HTTPException(503, "The LLM router is not running.")
+        prompt = (body.get("prompt") or "").strip() or (
+            "Reply with exactly the word READY and nothing else.")
+        try:
+            max_tokens = int(body.get("max_tokens") or 64)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "max_tokens must be a number") from exc
+        max_tokens = max(1, min(max_tokens, 512))
+        # An inline definition lets a new endpoint be proven before it is saved
+        # into the config and starts receiving real agent work.
+        inline = body.get("server_config")
+        if inline:
+            server = _validate_server(inline)
+            result = router.test_prompt_config(server, prompt, max_tokens)
+        else:
+            server_name = (body.get("server") or "").strip()
+            if not server_name:
+                raise HTTPException(400, "A server name or server_config is required.")
+            result = router.test_prompt(server_name, prompt, max_tokens)
+        store.add_event(
+            "llm_test_prompt",
+            f"Test prompt to LLM '{result.get('server')}': "
+            + ("ok" if result.get("ok") else f"failed ({result.get('error')})"),
+        )
+        store.flush()
+        return result
+
+    @app.post("/api/llm/router/probe")
+    def router_probe() -> dict:
+        router = orchestrator.runtime.router
+        if router is None:
+            raise HTTPException(503, "The LLM router is not running.")
+        return {"servers": router.probe_all()}
+
     @app.get("/api/config")
     def get_config() -> dict:
         # The API key is never echoed to the UI; it is only ever written to.
@@ -254,13 +321,14 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
             srv["api_key"] = "***" if srv.get("api_key") else ""
         return {
             "config": redacted,
-            "llm_servers": orchestrator.runtime.rotator.status(),
+            "llm_servers": _router_state(orchestrator)["servers"],
             "runtime": {
                 "llm_timeout": orchestrator.runtime.llm_timeout,
                 "llm_timeouts_widened": orchestrator.runtime.llm_timeouts_widened,
                 "llm_empty_responses": orchestrator.runtime.llm_empty_responses,
                 "llm_transient_errors": orchestrator.runtime.llm_transient_errors,
-                "max_parallel_workers": orchestrator.runtime.gate.limit,
+                "max_parallel_workers": config.max_parallel_workers,
+                "llm_slots": orchestrator.runtime.gate.limit,
                 "active_llm_slots": orchestrator.runtime.gate.active,
                 "inflight": sorted(orchestrator.runtime.inflight),
             },
@@ -293,7 +361,8 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         return {"changed": dict(changed),
                 "runtime": {
                     "llm_timeout": orchestrator.runtime.llm_timeout,
-                    "max_parallel_workers": orchestrator.runtime.gate.limit,
+                    "max_parallel_workers": config.max_parallel_workers,
+                    "llm_slots": orchestrator.runtime.gate.limit,
                 }}
 
     @app.post("/api/alerts/ack")
@@ -392,9 +461,13 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
 
     @app.post("/api/tick")
     def force_tick() -> dict:
-        """Run one orchestrator cycle in the background, immediately."""
+        """Start one orchestrator cycle now, unless one is already running."""
+        if orchestrator.cycle_running():
+            return {"started": False, "running": True,
+                    "reason": "a cycle is already running; it was not queued "
+                              "behind itself"}
         threading.Thread(target=orchestrator.run_cycle, daemon=True).start()
-        return {"started": True}
+        return {"started": True, "running": True}
 
     @app.get("/api/projects/{project_id}/tasks/{task_id}")
     def task_detail(project_id: str, task_id: str) -> dict:
@@ -508,10 +581,13 @@ def _agent_json(agent, full: bool = False, active: set | None = None) -> dict:
         # The orchestrator is shared across projects, so its spend is harness
         # overhead, not part of any single project's cost.
         "shared": agent.role == "orchestrator",
+        "archived": agent.archived_at is not None,
     }
     if full:
         data.update({
             "mission": agent.mission, "system_prompt": agent.system_prompt,
+        "archived_at": agent.archived_at,
+        "retirement_reason": agent.retirement_reason,
             "last_report": agent.last_report, "last_error": agent.last_error,
             "runs": agent.runs, "cost_usd": agent.cost_usd,
             "conversation_id": agent.conversation_id,
@@ -521,14 +597,19 @@ def _agent_json(agent, full: bool = False, active: set | None = None) -> dict:
 
 
 def _agent_tree(store: Store, project_id: str,
-                active: set | None = None) -> list[dict]:
+                active: set | None = None,
+                include_archived: bool = False) -> list[dict]:
     """Nested agent hierarchy for the project, orchestrator first.
 
     Children come from parent_agent_id, not child_agent_ids: retiring an agent
     prunes the parent's child list to free a delegation slot, but the retired
     agent still belongs in the tree with a status of its own.
+
+    Archived agents - finished specialists the sweep took off the live tree -
+    are hidden unless asked for, so the tree shows who is working rather than
+    every agent a long-running project has ever spawned.
     """
-    agents = store.project_agents(project_id)
+    agents = store.project_agents(project_id, include_archived=include_archived)
     # The orchestrator is global but carries a single project_id, so it is not
     # always in the project's own agent list; graft it in as the root.
     orchestrator = next((a for a in store.agents.values()
@@ -613,17 +694,26 @@ def _alerts(store: Store) -> list[dict]:
     return alerts
 
 
-def _cycle_status(store: Store, tick_seconds: int) -> dict:
-    """How fresh the orchestrator loop is, for the header pill."""
+def _cycle_status(store: Store, orchestrator) -> dict:
+    """How fresh the orchestrator loop is, for the header pill.
+
+    The interval is the one the loop is actually using, not the configured
+    default: with dynamic tick enabled the two diverge, and showing the static
+    value makes a healthy loop look stale (or a lagging one look fine).
+    """
     meta = store.meta
     now = int(time.time())
     attempt = meta.get("last_cycle_attempt_at")
     completed = meta.get("last_cycle_completed_at") or meta.get("last_tick")
     status = meta.get("cycle_status", "idle")
+    tick_seconds = int(round(float(meta.get("effective_tick")
+                                   or orchestrator.effective_tick
+                                   or orchestrator.config.tick_seconds)))
+    running = orchestrator.cycle_running() or status == "running"
     return {
         "status": status,
         "count": int(meta.get("cycle_count", 0)),
-        "running": status == "running",
+        "running": running,
         "started_at": meta.get("cycle_started_at"),
         "last_attempt_at": attempt,
         "last_completed_at": completed,
@@ -631,7 +721,10 @@ def _cycle_status(store: Store, tick_seconds: int) -> dict:
         "duration": meta.get("cycle_duration", 0),
         "loop_started_at": meta.get("loop_started_at"),
         "tick_seconds": tick_seconds,
-        "stale": bool(attempt and status != "running"
+        "configured_tick_seconds": orchestrator.config.tick_seconds,
+        "dynamic_tick": orchestrator.config.dynamic_tick,
+        "skips": int(meta.get("cycle_skips", 0)),
+        "stale": bool(attempt and not running
                       and now - int(attempt) > max(120, tick_seconds * 3)),
     }
 
@@ -679,10 +772,16 @@ def _remove_artifacts(config: HarnessConfig, store: Store, project,
 # config.
 _PATCHABLE = {
     "tick_seconds": ("runtime", int),
+    "dynamic_tick": ("runtime", bool),
+    "min_tick_seconds": ("runtime", int),
+    "max_tick_seconds": ("runtime", int),
+    "tick_duty_cycle": ("runtime", float),
     "sub_agent_turn_limit": ("runtime", int),
     "orchestrator_turn_limit": ("runtime", int),
     "max_parallel_workers": ("gate", int),
     "llm_queue_depth": ("pool", int),
+    "llm_server_concurrency": ("router", int),
+    "router_selection": ("router", str),
     "llm_servers": ("servers", list),
     "max_sub_agent_depth": ("runtime", int),
     "max_children_per_agent": ("runtime", int),
@@ -703,6 +802,18 @@ _PATCHABLE = {
     "llm.input_cost_per_token": ("llm", float),
     "llm.output_cost_per_token": ("llm", float),
 }
+
+
+def _router_state(orchestrator: Orchestrator) -> dict:
+    """Router snapshot, or an empty one when running without a router."""
+    router = orchestrator.runtime.router
+    if router is None:
+        return {"requests": [], "recent": [], "servers": [],
+                "counts": {"queued": 0, "awaiting": 0, "generating": 0,
+                           "served": 0, "retries": 0, "servers": 0,
+                           "server_slots": 0, "server_slots_in_use": 0},
+                "uptime_seconds": 0.0}
+    return router.status()
 
 
 def _apply_config_patch(config: HarnessConfig, orchestrator: Orchestrator,
@@ -733,14 +844,36 @@ def _apply_config_patch(config: HarnessConfig, orchestrator: Orchestrator,
 
     # Applied last: these need the validated values above.
     if any(k == "max_parallel_workers" for k, _ in changed):
-        orchestrator.runtime.gate.set_limit(config.max_parallel_workers)
+        # Re-derive the gate from the worker count; setting the gate directly
+        # would drop the orchestrator's reserved slot.
+        orchestrator.runtime.set_worker_slots(config.max_parallel_workers)
     timeout_patch = next((v for k, v in changed if k == "llm.request_timeout"), None)
     if timeout_patch is not None:
         orchestrator.runtime.set_llm_timeout(int(timeout_patch))
     if any(k in ("max_parallel_workers", "llm_queue_depth") for k, _ in changed):
         orchestrator.runtime.sync_pool_size()
+    # Server list and per-endpoint concurrency take effect in the router, which
+    # is the only thing that talks to an endpoint.
+    router = orchestrator.runtime.router
+    if router is not None and any(
+            k in ("llm_servers", "llm_server_concurrency", "llm.base_url",
+                  "llm.model") for k, _ in changed):
+        router.sync_servers()
+        router.probe_all()
 
     return changed
+
+
+def _validate_server(value: dict):
+    """Validate one posted server definition."""
+    from agent_harness.config import LLMServerConfig
+
+    if not isinstance(value, dict):
+        raise HTTPException(400, "server_config must be an object.")
+    try:
+        return LLMServerConfig.model_validate(value)
+    except Exception as exc:  # noqa: BLE001 - surface pydantic detail to the UI
+        raise HTTPException(400, f"Invalid server_config: {exc}") from exc
 
 
 def _validate_servers(value: list) -> list:

@@ -460,6 +460,7 @@ class AssignTaskExecutor(ToolExecutor):
         # agent attached to it now is a reviewer; it must not take the worker
         # link, which is what drives the card's turn counters.
         if agent.is_reviewer or task.column == "review":
+            _reactivate(c, agent)
             agent.is_reviewer = True
             task.reviewer_agent_id = agent.id
             agent.task_id = task.id
@@ -471,6 +472,7 @@ class AssignTaskExecutor(ToolExecutor):
                 "Run it with run_agent(agent_id='" + agent.id + "', task_id='"
                 + task.id + "', review=true)."
             )
+        _reactivate(c, agent)
         task.assigned_agent_id = agent.id
         task.touch()
         agent.task_id = task.id
@@ -516,6 +518,7 @@ class RunAgentExecutor(ToolExecutor):
         if agent.id in c.runtime.inflight:
             return _err(f"Agent {agent.id} is already running; wait for it next cycle.")
 
+        _reactivate(c, agent)
         if action.review:
             message = prompts.review_assignment_prompt(_task_dict(task))
         else:
@@ -559,7 +562,29 @@ class ResumeAgentExecutor(ToolExecutor):
             return _err(
                 f"Agent {agent.id} has no turns left. Use extend_agent to grant more."
             )
+        _reactivate(c, agent)
+        c.store.flush()
         return _dispatch(agent, task, action.instructions, remaining)
+
+
+def _reactivate(c, agent: AgentSpec) -> None:
+    """Put an archived agent back on the live hierarchy.
+
+    Assigning to or dispatching an archived specialist is an explicit decision
+    to use it again, so it has to reappear on the tree; otherwise the UI shows
+    an agent working while the hierarchy says it is gone.
+    """
+    if agent.archived_at is None:
+        return
+    agent.archived_at = None
+    agent.retirement_reason = None
+    if agent.status == "done":
+        agent.status = "idle"
+    if agent.parent_agent_id and agent.parent_agent_id in c.store.agents:
+        parent = c.store.agents[agent.parent_agent_id]
+        if agent.id not in parent.child_agent_ids:
+            parent.child_agent_ids.append(agent.id)
+            c.store.upsert_agent(parent)
 
 
 def _dispatch(agent: AgentSpec, task: TaskSpec | None, message: str,
@@ -802,6 +827,11 @@ class RetireAgentExecutor(ToolExecutor):
         c.runtime.close(agent.id)
         agent.status = "done"
         agent.task_id = None
+        # Archived rather than deleted: cost, tokens, and the transcript stay
+        # queryable, but the agent leaves the live hierarchy so the tree does
+        # not fill up with finished specialists. resume_agent un-archives it.
+        agent.archived_at = now_iso()
+        agent.retirement_reason = action.reason
         agent.touch()
         if agent.parent_agent_id and agent.parent_agent_id in c.store.agents:
             parent = c.store.agents[agent.parent_agent_id]
@@ -810,7 +840,8 @@ class RetireAgentExecutor(ToolExecutor):
         c.store.add_event("agent_retired", f"Retired {agent.role}: {action.reason}",
                           project_id=agent.project_id, agent_id=agent.id)
         c.store.flush()
-        return _ok(f"Agent {agent.id} retired.")
+        return _ok(f"Agent {agent.id} retired and removed from the hierarchy. "
+                   "Use resume_agent to bring it back.")
 
 
 class ListAgentsAction(Action):

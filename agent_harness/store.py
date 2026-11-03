@@ -161,6 +161,12 @@ class AgentSpec(_Model):
 
     last_report: str | None = None
     last_error: str | None = None
+    # Set when the agent was retired out of the live hierarchy: its work is
+    # finished and it will not be dispatched again. The record is kept (cost,
+    # tokens, transcript) but the tree hides it, so a long-running project does
+    # not accumulate an ever-growing wall of finished specialists.
+    archived_at: str | None = None
+    retirement_reason: str | None = None
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
 
@@ -440,6 +446,14 @@ class Store:
         return project
 
     def upsert_task(self, task: TaskSpec) -> TaskSpec:
+        # finished_at is stamped here rather than at each move site so the
+        # Done column can be ordered by when work actually closed. Cards moved
+        # back out of done (rework) clear it and get a new one on re-entry.
+        if task.column == "done":
+            if task.finished_at is None:
+                task.finished_at = now_iso()
+        else:
+            task.finished_at = None
         with self._lock:
             self.tasks[task.id] = task
         task.touch()
@@ -475,9 +489,12 @@ class Store:
             key=lambda t: t.created_at,
         )
 
-    def project_agents(self, project_id: str) -> list[AgentSpec]:
+    def project_agents(self, project_id: str,
+                       include_archived: bool = False) -> list[AgentSpec]:
         return sorted(
-            (a for a in self.agents.values() if a.project_id == project_id),
+            (a for a in self.agents.values()
+             if a.project_id == project_id
+             and (include_archived or a.archived_at is None)),
             key=lambda a: (a.depth, a.created_at),
         )
 
@@ -485,6 +502,11 @@ class Store:
         board: dict[str, list[TaskSpec]] = {c: [] for c in KANBAN_COLUMNS}
         for t in self.project_tasks(project_id):
             board.setdefault(t.column, []).append(t)
+        # Done cards are newest first: the UI keeps only the most recent ones
+        # visible, so the ordering has to put them at the front.
+        board["done"] = sorted(
+            board.get("done", []),
+            key=lambda t: t.finished_at or t.updated_at, reverse=True)
         return board
 
     def column_counts(self, project_id: str) -> dict[str, int]:
