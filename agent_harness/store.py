@@ -161,6 +161,14 @@ class AgentSpec(_Model):
 
     last_report: str | None = None
     last_error: str | None = None
+    # Consecutive runs that ended in an LLM transport failure (connection,
+    # timeout, rate limit, empty completion) rather than an agent fault. The
+    # harness - not the orchestrator - owns this: it retries the same prompt,
+    # and once the count crosses a threshold it blocks the card and alerts the
+    # user, because an unreachable endpoint is the user's to fix. Reset by any
+    # run that reached the model.
+    llm_failures: int = 0
+    llm_failure_error: str | None = None
     # Set when the agent was retired out of the live hierarchy: its work is
     # finished and it will not be dispatched again. The record is kept (cost,
     # tokens, transcript) but the tree hides it, so a long-running project does

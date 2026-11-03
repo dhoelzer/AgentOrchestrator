@@ -329,6 +329,16 @@ class Orchestrator:
                     note(project.id,
                          f"Task {task.id} '{task.title}' is BLOCKED and the user has "
                          f"supplied direction - apply it and re-dispatch: {queued}")
+                # An LLM outage is not a problem the orchestrator can solve: it
+                # cannot restart an endpoint, and re-dispatching into a dead one
+                # every tick is how a project looks 'stuck'. The harness already
+                # blocked the card and alerted the user, so the instruction here
+                # is to hold unless the endpoint is demonstrably back. A user
+                # directive still wins: it may say the endpoint is fixed.
+                elif task.blocked_cause == "llm" or (
+                        agent is not None and agent.status == "llm_unavailable"):
+                    note(project.id, self._llm_outage_note(task, agent))
+                    continue
                 elif agent and agent.status == "budget_exhausted":
                     note(project.id, prompts.budget_exhausted_briefing(
                         {"id": agent.id, "role": agent.role,
@@ -338,12 +348,6 @@ class Orchestrator:
                         {"id": task.id, "title": task.title,
                          "objective": task.objective},
                     ))
-                elif agent and agent.status == "llm_unavailable":
-                    note(project.id,
-                         f"Task {task.id} '{task.title}' is blocked because the LLM "
-                         f"endpoint returned nothing for {agent.id} ({agent.role}). "
-                         f"Timeout is now {self.runtime.llm_timeout}s - re-dispatch "
-                         "the same agent, or pause the project if the endpoint is down.")
                 elif agent and agent.status == "failed":
                     note(project.id,
                          f"Task {task.id} '{task.title}' is blocked after agent "
@@ -456,6 +460,19 @@ class Orchestrator:
             task.block_strikes += 1
         self.store.upsert_task(task)
         return task.block_strikes
+
+    def _llm_outage_note(self, task, agent) -> str:
+        failures = agent.llm_failures if agent else 0
+        return (
+            f"LLM OUTAGE on task {task.id} '{task.title}' - DO NOT ACT ON IT. "
+            f"The endpoint failed {failures} run(s) in a row"
+            + (f" for {agent.id} ({agent.role}): {agent.llm_failure_error}"
+               if agent else "")
+            + ". The harness already blocked this card and alerted the user; "
+            "an unreachable endpoint is not an agent failure, so do not "
+            "re-dispatch, reconfigure, extend, or re-specify it. Leave it "
+            "blocked - it returns to 'ready' when the user acknowledges the "
+            "alert after fixing the endpoint.")
 
     @staticmethod
     def _recovery_menu(task, agent, strikes: int) -> str:
@@ -620,41 +637,67 @@ class Orchestrator:
             lines.append(f"Archived {agent.role} ({agent.id}): {reason}.")
         return lines
 
-    def run_cycle(self, block: bool = False) -> list[CycleReport] | None:
-        """Run one scheduler cycle, unless one is already in progress.
+    def run_cycle(self) -> list[CycleReport] | None:
+        """Run one scheduler cycle, unless an orchestrator is already busy.
 
-        Returns None when the cycle was skipped because another cycle held the
-        loop. Overlapping cycles are never safe: they would interleave writes to
-        the same task and agent records, and the second one's orchestrator LLM
-        request would queue behind a request from the very conversation it is
-        trying to continue.
+        Returns None when the cycle was skipped. There is deliberately no way
+        to queue a cycle behind a running one: a queued cycle would run a
+        briefing built from the board as it looked *before* the running cycle
+        changed it, so it would act on stale state and then write over the
+        fresher decisions. Refusing is correct; waiting is not.
+
+        The lock acquire is the atomic claim, so the queue check runs while it
+        is held: no window opens between "is one running?" and "start one".
         """
-        if block:
-            self._cycle_lock.acquire()
-        elif not self._cycle_lock.acquire(blocking=False):
-            started = int(self.store.meta.get("cycle_started_at") or time.time())
-            self.store.meta["cycle_skips"] = int(
-                self.store.meta.get("cycle_skips", 0)) + 1
-            # Coalesced: a long cycle makes the loop retry many times, and one
-            # event per retry buries the feed in identical noise. The counter
-            # still increments every time.
-            last = self._last_skip_event_at
-            if last is None or time.time() - last >= 60:
-                self._last_skip_event_at = time.time()
-                self.store.add_event(
-                    "cycle_skipped",
-                    f"Cycle skipped: another cycle was still running "
-                    f"(started {int(time.time() - started)}s ago).")
-            logger.info("Skipping cycle: one is already running")
+        if not self._cycle_lock.acquire(blocking=False):
+            self._note_cycle_skip("another cycle was still running")
             return None
         try:
+            busy = self.runtime.llm_busy("orchestrator")
+            if busy is not None:
+                self._note_cycle_skip(
+                    f"an orchestrator prompt is already {busy['status']} "
+                    f"({busy['id']})")
+                return None
             return self._run_cycle()
         finally:
             self._cycle_lock.release()
 
+    def _note_cycle_skip(self, why: str) -> None:
+        started = int(self.store.meta.get("cycle_started_at") or time.time())
+        self.store.meta["cycle_skips"] = int(
+            self.store.meta.get("cycle_skips", 0)) + 1
+        # Coalesced: a long cycle makes the loop retry many times, and one
+        # event per retry buries the feed in identical noise. The counter
+        # still increments every time.
+        last = self._last_skip_event_at
+        if last is None or time.time() - last >= 60:
+            self._last_skip_event_at = time.time()
+            self.store.add_event(
+                "cycle_skipped",
+                f"Cycle skipped: {why} (previous started "
+                f"{int(time.time() - started)}s ago).")
+        logger.info("Skipping cycle: %s", why)
+
     def cycle_running(self) -> bool:
         """True while a cycle holds the loop."""
         return self._cycle_lock.locked()
+
+    def orchestrator_busy(self) -> str | None:
+        """Why an orchestrator cycle cannot start now, or None if it can.
+
+        Covers both halves of the user's rule: one executing, and one queued
+        waiting on an LLM slot. The queued half matters because a prompt that
+        has been written but not yet dispatched is already committed to a
+        briefing that the next cycle would supersede.
+        """
+        if self._cycle_lock.locked():
+            return "a cycle is already running"
+        busy = self.runtime.llm_busy("orchestrator")
+        if busy is not None:
+            return (f"an orchestrator prompt is already {busy['status']} "
+                    f"for {int(time.time() - busy['queued_at'])}s")
+        return None
 
     def _run_cycle(self) -> list[CycleReport]:
         """One scheduler tick: reload config, sweep, reconcile, detect, act."""
@@ -683,7 +726,8 @@ class Orchestrator:
         self._record_cycle_end("ok")
         return reports
 
-    def _record_cycle_end(self, status: str) -> None:
+    def _record_cycle_end(self, status: str,
+                          error: str | None = None) -> None:
         """Stamp cycle metadata.
 
         last_tick alone is written only on success, so a harness whose cycles
@@ -697,6 +741,7 @@ class Orchestrator:
         meta["cycle_count"] = int(meta.get("cycle_count", 0)) + 1
         meta["cycle_status"] = status
         meta["cycle_duration"] = (now - int(started)) if started else 0
+        meta["cycle_error"] = error
         if status == "ok":
             meta["last_tick"] = now
             meta["last_cycle_completed_at"] = now
@@ -881,8 +926,9 @@ class Orchestrator:
                                 r.project_id, len(r.attention), r.orchestrator_status)
             except Exception as exc:  # noqa: BLE001 - the loop must survive
                 logger.exception("Orchestrator cycle failed")
-                self.store.add_event("loop_error", f"Cycle failed: {type(exc).__name__}: {exc}")
-                self._record_cycle_end("failed")
+                detail = f"{type(exc).__name__}: {exc}"
+                self.store.add_event("loop_error", f"Cycle failed: {detail}")
+                self._record_cycle_end("failed", detail)
             elapsed = time.time() - started
             # A skipped cycle costs ~0s. Feeding that to the tuner collapses the
             # interval to the floor, which then makes the loop retry (and skip)

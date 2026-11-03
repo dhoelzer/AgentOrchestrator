@@ -124,7 +124,9 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
             "llm_queue": orchestrator.runtime.llm_queue(),
             "projects": projects,
             "events": [e.model_dump() for e in store.recent_events[-60:]][::-1],
-            "alerts": [a for a in _alerts(store) if not a["acknowledged"]],
+            "alerts": [{k: v for k, v in a.items() if k != "key"}
+                       for a in _alerts(store, orchestrator.runtime)
+                       if not a["acknowledged"]],
         }
 
     # ---------------- mutations ----------------
@@ -367,23 +369,38 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
 
     @app.post("/api/alerts/ack")
     def ack_alert(body: dict) -> dict:
-        """Dismiss an alert. Pass alert_id to dismiss one, all=true for all."""
+        """Dismiss an alert. Pass alert_id to dismiss one, all=true for all.
+
+        Acknowledging an LLM-outage alert is also the user's signal that the
+        endpoint has been dealt with: the agent's failure streak resets and its
+        card goes back to 'ready', so the next cycle can dispatch it. Without
+        that, a card blocked by an outage would sit blocked forever with nobody
+        able to unblock it.
+        """
         alert_id = (body.get("alert_id") or "").strip()
         acked = store.meta.setdefault("alert_acks", {})
-        if body.get("all"):
-            for a in _alerts(store):
-                acked[a["id"]] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        elif alert_id:
-            acked[alert_id] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        else:
+        live = _alerts(store, orchestrator.runtime)
+        released: list[str] = []
+        targets = live if body.get("all") else [
+            a for a in live if a["id"] == alert_id]
+        if not targets and not body.get("all") and not alert_id:
             raise HTTPException(400, "Provide alert_id or all=true.")
+        for a in targets:
+            acked[a["id"]] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds")
+            if a["key"].startswith("llm:"):
+                released.append(a["key"].split(":")[1])
+        for agent_id in released:
+            _release_llm_block(store, agent_id)
 
         # Ack ids are per-occurrence, so entries for alerts that have since
         # resolved are dead weight; keep only what is still on screen.
-        live = {a["id"] for a in _alerts(store)}
-        store.meta["alert_acks"] = {k: v for k, v in acked.items() if k in live}
+        still_live = {a["id"] for a in _alerts(store, orchestrator.runtime)}
+        store.meta["alert_acks"] = {k: v for k, v in acked.items()
+                                    if k in still_live}
         store.flush()
-        return {"acknowledged": len(store.meta["alert_acks"])}
+        return {"acknowledged": len(store.meta["alert_acks"]),
+                "released_agents": released}
 
     @app.delete("/api/alerts/ack")
     def clear_alert_acks() -> dict:
@@ -461,11 +478,17 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
 
     @app.post("/api/tick")
     def force_tick() -> dict:
-        """Start one orchestrator cycle now, unless one is already running."""
-        if orchestrator.cycle_running():
+        """Start one orchestrator cycle now, unless one is already committed.
+
+        Refuses rather than queues: a cycle queued behind a running one would
+        run a briefing built from the board as it looked before that cycle
+        moved anything. run_cycle() re-checks under the lock, so this is only
+        the friendly pre-check.
+        """
+        busy = orchestrator.orchestrator_busy()
+        if busy:
             return {"started": False, "running": True,
-                    "reason": "a cycle is already running; it was not queued "
-                              "behind itself"}
+                    "reason": f"not queued: {busy}"}
         threading.Thread(target=orchestrator.run_cycle, daemon=True).start()
         return {"started": True, "running": True}
 
@@ -647,7 +670,36 @@ def _alert_id(key: str) -> str:
     return hashlib.sha1(key.encode()).hexdigest()[:16]
 
 
-def _alerts(store: Store) -> list[dict]:
+def _release_llm_block(store: Store, agent_id: str) -> None:
+    """Put an agent blocked by an LLM outage back in play."""
+    agent = store.agents.get(agent_id)
+    if agent is None:
+        return
+    agent.llm_failures = 0
+    agent.llm_failure_error = None
+    if agent.status == "llm_unavailable":
+        agent.status = "idle"
+    agent.touch()
+    store.upsert_agent(agent)
+    task = store.tasks.get(agent.task_id or "")
+    if task is not None and task.column == "blocked" \
+            and task.blocked_cause == "llm":
+        task.column = "ready"
+        task.blocked_reason = None
+        task.blocked_cause = None
+        task.block_strikes = 0
+        task.block_strike_reason = None
+        task.touch()
+        store.upsert_task(task)
+    store.add_event(
+        "llm_block_released",
+        f"User acknowledged the LLM alert for {agent.role} ({agent.id}); "
+        "failure streak reset and the card returned to ready.",
+        project_id=agent.project_id, agent_id=agent.id,
+        task_id=task.id if task else None)
+
+
+def _alerts(store: Store, runtime=None) -> list[dict]:
     """Dashboard alerts, each with a stable id the user can acknowledge.
 
     The id embeds a generation counter (review round, blocked reason, turn
@@ -680,6 +732,11 @@ def _alerts(store: Store) -> list[dict]:
     for agent in store.agents_in_status(
         ("budget_exhausted", "failed", "llm_unavailable")
     ):
+        if agent.llm_failures >= 1:
+            # An endpoint fault, not an agent fault: the error-level alert
+            # below names the actual failure, and a second warning for the same
+            # event just reads as two problems.
+            continue
         alerts.append({
             "level": "warn", "project_id": agent.project_id,
             "key": f"agent:{agent.id}:{agent.status}:{agent.turns_used}",
@@ -687,9 +744,58 @@ def _alerts(store: Store) -> list[dict]:
                        f"({agent.turns_used}/{agent.turn_limit} turns).",
         })
 
+    # LLM transport failures are the user's to fix, not the orchestrator's: the
+    # harness cannot repair an unreachable endpoint, so it stops retrying and
+    # says so here. The key carries the failure count, so each new failure
+    # re-alerts instead of being silenced by acknowledging the first one.
+    for agent in store.agents.values():
+        if agent.llm_failures < 1:
+            continue
+        if agent.role != "orchestrator":
+            proj = store.projects.get(agent.project_id or "")
+            if proj is not None and proj.status == "removed":
+                continue
+        alerts.append({
+            "level": "error", "project_id": agent.project_id,
+            "key": f"llm:{agent.id}:{agent.llm_failures}",
+            "message": (
+                f"LLM error while running {agent.role} "
+                f"({agent.llm_failures} run(s) in a row): "
+                f"{agent.llm_failure_error or agent.last_error}"
+                + (f" - task '{store.tasks[agent.task_id].title}' is blocked."
+                   if agent.task_id in store.tasks else "")
+            ),
+        })
+
+    # The orchestrator itself could not run. Nothing on the board moves while
+    # this is true, so it is the most important thing on the page.
+    cycle_error = store.meta.get("cycle_error")
+    if store.meta.get("cycle_status") == "failed" and cycle_error:
+        alerts.append({
+            "level": "error", "project_id": None,
+            "key": f"cycle:{store.meta.get('cycle_count', 0)}:{cycle_error[:80]}",
+            "message": f"Orchestrator cycle failed: {cycle_error}",
+        })
+
+    # Every configured endpoint down at once: no agent can make progress, and
+    # only the user can bring one back.
+    servers = (runtime.router.status()["servers"]
+               if runtime is not None and runtime.router else [])
+    if servers and all(s.get("reachable") is False for s in servers):
+        down = ", ".join(s["name"] for s in servers)
+        alerts.append({
+            "level": "error", "project_id": None,
+            "key": f"endpoints_down:{down}",
+            "message": f"All LLM endpoints are unreachable ({down}). "
+                       "No agent can run until one is back.",
+        })
+
     acked = store.meta.get("alert_acks", {})
     for a in alerts:
-        a["id"] = _alert_id(a.pop("key"))
+        # The key survives alongside the id: the ack endpoint needs it to tell
+        # an LLM-outage alert (which releases a blocked card once the user has
+        # been told) apart from an ordinary one.
+        a["id"] = _alert_id(a["key"])
         a["acknowledged"] = a["id"] in acked
     return alerts
 

@@ -223,7 +223,7 @@ function renderAlerts(d) {
 // they need to act or the harness will resolve it on the next cycle.
 const BLOCK_FIX = {
   budget: "grant more turns to re-run",
-  llm: "retries automatically once the endpoint recovers",
+  llm: "acknowledge the LLM alert to put this card back in the queue",
   worker: "the worker will re-check the blocker when re-dispatched",
   agent_failed: "re-dispatch, or reconfigure the agent",
   dependency: "clears itself when upstream tasks finish",
@@ -340,8 +340,22 @@ async function showQueuePrompt(entryId) {
 }
 
 // A long-running project accumulates done cards without bound, and they all
-// look alike. Keep the most recent visible and fold the rest behind a toggle.
-const DONE_VISIBLE = 10;
+// look alike. Show the 20 most recent and fold the rest into a summary card
+// that states how many are hidden.
+const DONE_VISIBLE = 20;
+
+function doneSummaryCard(hidden, total) {
+  return `<div class="task done summary" data-more-done="1"
+      title="Click to ${state.showAllDone ? "hide" : "show"} the older done cards">
+    <div class="t"><span class="light off"></span>${
+      state.showAllDone ? "Collapse done" : `${hidden} earlier done card${
+        hidden === 1 ? "" : "s"}`}</div>
+    <div class="m"><span class="tag">${
+      state.showAllDone ? `all ${total} shown` : `${hidden} of ${total} hidden`
+    }</span><span class="kv">${state.showAllDone
+      ? "click to collapse" : "click to expand"}</span></div>
+  </div>`
+}
 
 function renderBoard(p) {
   return `<div class="kanban">${p.columns_order
@@ -350,14 +364,10 @@ function renderBoard(p) {
       const overflow = col === "done" && items.length > DONE_VISIBLE;
       const shown = overflow && !state.showAllDone
         ? items.slice(0, DONE_VISIBLE) : items;
-      const more = overflow
-        ? `<button class="more" data-more-done="1">${
-            state.showAllDone ? "Collapse done"
-              : `Show ${items.length - DONE_VISIBLE} earlier of ${items.length} done`
-          }</button>`
-        : "";
+      const summary = overflow
+        ? doneSummaryCard(items.length - DONE_VISIBLE, items.length) : "";
       return `<div class="col"><h4><span>${col}</span><span>${items.length}</span></h4>
-        ${shown.map(taskCard).join("")}${more}</div>`;
+        ${shown.map(taskCard).join("")}${summary}</div>`;
     })
     .join("")}</div>`;
 }
@@ -668,7 +678,10 @@ document.addEventListener("click", async (e) => {
     refresh();
     return;
   }
-  if (t.dataset.moreDone) {
+  // The summary card is a .task div, so match on the container: a click that
+  // lands on its inner tag span must not fall through to the task-detail
+  // handler with no task id.
+  if (t.closest && t.closest("[data-more-done]")) {
     state.showAllDone = !state.showAllDone;
     renderProjects(state.data);
     return;

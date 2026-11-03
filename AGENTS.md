@@ -26,6 +26,7 @@ python tests/test_runtime_and_config.py  # no LLM needed
 python tests/test_dashboard_features.py  # no LLM needed; removal, orphans, costs
 python tests/test_blocks_cost_version.py # no LLM needed; block causes, card cost, version
 python tests/test_queue_input_recovery.py # no LLM needed; LLM queue, project input, recovery
+python tests/test_llm_failures_and_reentrancy.py # no LLM needed; LLM alerting, orchestrator re-entrancy
 python tests/test_e2e_llm.py 3         # needs the configured LLM endpoint
 python tests/test_turn_budget.py       # needs the configured LLM endpoint
 ```
@@ -136,6 +137,64 @@ the drain is missing or the new code leaves something in `inflight` forever.
   their verdict moves the card through `record_review`.
 - `BLOCK_FIX` in `app.js` mirrors the cause list for the UI. Update it when you
   add a cause, or cards render the generic fallback.
+
+## LLM failures belong to the user, not the orchestrator
+
+An endpoint that is down, timing out, or rate-limited is infrastructure. The
+orchestrator cannot restart it, and re-dispatching into it every tick is exactly
+what makes a project look "stuck": turns burn, nothing lands. So:
+
+- `AgentRuntime.run` classifies the outcome with `llm_transport = error is not
+  None and retryable` and passes it to `_map_status`. Transport faults (and a
+  run that reached zero turns with no error) map to `llm_unavailable`; an agent
+  fault maps to `failed`. Mislabelling an outage `failed` sends the orchestrator
+  off reconfiguring an agent that was never broken.
+- `AgentSpec.llm_failures` is the consecutive-streak counter and
+  `llm_failure_error` the message. Any run that reached the model resets both,
+  even if the agent then failed for its own reasons.
+- Retries **resubmit the same prompt verbatim**. Never inject "the model timed
+  out" / "returned nothing" into the agent conversation: the agent reacts to an
+  infrastructure fault it cannot fix (apologises, re-plans, spends budget on the
+  endpoint). The old nudge-message behaviour is asserted against in
+  `test_retry_resubmits_the_same_prompt_and_never_mentions_the_error`.
+- Alerts: `llm:<agent_id>:<failures>` is `level: error` and names the failure,
+  the streak, and the blocked card. It replaces the generic
+  `<role> is llm_unavailable` warning for the same event (that warning is
+  skipped when `llm_failures >= 1`) — two alerts for one outage reads as two
+  problems. `cycle:<n>:<err>` fires when the orchestrator cycle itself raised,
+  and `endpoints_down:<names>` when every configured server is unreachable.
+- Acking an `llm:` alert is the user's "I fixed the endpoint" signal:
+  `_release_llm_block` resets the streak, sets the agent `idle`, and returns the
+  card to `ready`. Without it the card is blocked forever, because the
+  orchestrator is told not to touch it.
+- `Orchestrator.detect()` skips `blocked_cause == "llm"` cards (and
+  `llm_unavailable` agents) with a "DO NOT ACT ON IT" note instead of the
+  recovery menu — no re-dispatch/reconfigure/extend/split guidance. A user
+  directive still outranks this (it may be the news the endpoint is back), so
+  the outage branch is an `elif` after the directive branch, not before it.
+- `llm_failures` is deliberately separate from `last_error`: a run that reached
+  the model and then failed keeps `last_error` but clears the LLM streak.
+
+## Orchestrator re-entrancy
+
+There is no such thing as a queued orchestrator cycle. `run_cycle()` claims
+`_cycle_lock` with `acquire(blocking=False)` and returns `None` if it cannot,
+then re-checks `runtime.llm_busy("orchestrator")` **while holding the lock** so
+no window opens between the check and the start. Both halves of the rule matter:
+a running cycle, and a prompt that is queued waiting for an LLM slot, is already
+committed to a briefing built from the board as it looked earlier — a second
+cycle would act on stale state and then overwrite the fresher decisions.
+`orchestrator_busy()` exposes the reason for `/api/tick`, which refuses rather
+than stacking. Do not "fix" a missed cycle by queueing one: the next tick
+re-detects from current state, which is the point.
+
+## Kanban done column
+
+`DONE_VISIBLE = 20` in `app.js`; anything older folds into a summary **card**
+(`.task.done.summary`, not a bare button) that states how many are hidden. Its
+click must be matched with `closest("[data-more-done]")` — the card holds inner
+spans, and `t.dataset.moreDone` would miss a click on one and fall through to
+the task-detail handler with no task id.
 
 ## Dashboard: removal, cost, cycle freshness
 

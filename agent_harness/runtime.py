@@ -206,10 +206,15 @@ class RunOutcome:
     cost_usd: float
     error: str | None = None
     # Set when the run was retried because the endpoint timed out or returned
-    # nothing, so the orchestrator can see the endpoint was unhealthy rather
-    # than treating it as an agent failure.
+    # nothing, so the endpoint can be seen as unhealthy rather than treating it
+    # as an agent failure.
     llm_retries: int = 0
     llm_health: str | None = None
+    # Consecutive LLM transport failures for this agent, including this run.
+    # Drives the harness's own response (block the card, alert the user) so an
+    # unreachable endpoint never becomes the orchestrator's problem to solve.
+    llm_failures: int = 0
+    llm_failure_error: str | None = None
 
 
 @dataclass
@@ -625,6 +630,21 @@ class AgentRuntime:
                 "prompt_preview": e.prompt[:400],
             } for e in ordered]
 
+    def llm_busy(self, kind: str) -> dict | None:
+        """The queued-or-executing LLM entry of a given kind, oldest first.
+
+        Used to refuse a new orchestrator cycle while an orchestrator prompt is
+        already committed: a second one would carry a briefing built from a
+        board the first is still changing.
+        """
+        with self._queue_lock:
+            for e in sorted(self._llm_queue, key=lambda x: x.seq):
+                if e.kind == kind:
+                    return {"id": e.id, "status": e.status, "kind": e.kind,
+                            "agent_id": e.agent_id, "queued_at": e.queued_at,
+                            "started_at": e.started_at}
+        return None
+
     def llm_prompt(self, entry_id: str) -> str | None:
         with self._queue_lock:
             for e in self._llm_queue:
@@ -714,14 +734,13 @@ class AgentRuntime:
         for attempt in range(attempts):
             error = None
             try:
-                # Only the first attempt sends the assignment; a retry nudges
-                # the agent to continue so instructions are not duplicated.
-                conv.send_message(
-                    message if attempt == 0
-                    else "Your previous attempt produced no usable output "
-                         "(the model returned nothing or the request timed out). "
-                         "Continue the task from where you left off now."
-                )
+                # A retry resubmits the *same* prompt. Telling the agent about
+                # the transport failure ("the model returned nothing", "the
+                # request timed out") makes it react to a problem that is not
+                # its own - it apologises, re-plans, or burns turns on an
+                # endpoint it cannot fix. The prompt that failed is simply sent
+                # again, unchanged.
+                conv.send_message(message)
                 conv.run()
             except TRANSIENT_LLM_ERRORS as exc:
                 error = f"{type(exc).__name__}: {exc}"
@@ -799,7 +818,24 @@ class AgentRuntime:
         final_report = self._final_report(conv)
         spec.last_report = final_report or spec.last_report
         spec.last_error = error
-        spec.status = self._map_status(status, budget_exhausted, error, no_progress)
+        # 'retryable' is what separates an endpoint fault (connection, timeout,
+        # rate limit) from an agent fault (auth, bad request, tool crash): only
+        # the former is transient, so only the former is infrastructure.
+        llm_transport = error is not None and retryable
+        spec.status = self._map_status(status, budget_exhausted, error,
+                                       no_progress, llm_transport)
+        # LLM transport failures are counted here, on the agent, so the harness
+        # can stop retrying an endpoint that is simply down. A run that reached
+        # the model clears the streak even if the agent itself then failed -
+        # that is a different problem with a different fix.
+        llm_broken = llm_transport or (
+            error is None and no_progress and not budget_exhausted)
+        if llm_broken:
+            spec.llm_failures += 1
+            spec.llm_failure_error = error or "endpoint returned no output"
+        else:
+            spec.llm_failures = 0
+            spec.llm_failure_error = None
         spec.touch()
         self.store.upsert_agent(spec)
 
@@ -823,21 +859,29 @@ class AgentRuntime:
             error=error,
             llm_retries=retries,
             llm_health=",".join(health) if health else None,
+            llm_failures=spec.llm_failures,
+            llm_failure_error=spec.llm_failure_error,
         )
 
     @staticmethod
     def _map_status(status: str, budget_exhausted: bool, error: str | None,
-                    no_progress: bool = False) -> str:
+                    no_progress: bool = False,
+                    llm_transport: bool = False) -> str:
         """Map an SDK execution status onto a valid AgentStatus.
 
         Total by construction: AgentSpec validates on assignment, so returning
         anything outside AGENT_STATUSES would raise inside a live run. Unknown
         values become 'failed' rather than being passed through.
+
+        `llm_transport` marks an error raised by the endpoint (connection,
+        timeout, rate limit) rather than by the agent. Those read as
+        'llm_unavailable' so the board, the alerts, and the recovery path all
+        treat an unreachable endpoint as infrastructure, not a broken agent.
         """
         if budget_exhausted:
             return "budget_exhausted"
         if error:
-            return "failed"
+            return "llm_unavailable" if llm_transport else "failed"
         if no_progress:
             # The endpoint answered with nothing; this is an infrastructure
             # problem, not an agent that ran out of ideas.

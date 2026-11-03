@@ -427,9 +427,9 @@ def test_run_retries_empty_and_transient_failures():
         assert outcome.llm_retries == 2, outcome
         assert outcome.status == "idle", outcome
         assert len(flaky.messages) == 3, flaky.messages
-        # Only the first attempt carries the assignment; retries just nudge.
-        assert flaky.messages[0] == "do the work"
-        assert "timed out" in flaky.messages[1].lower()
+        # Every attempt carries the same assignment: the failure is the
+        # endpoint's, and the agent must not be told about it.
+        assert flaky.messages == ["do the work"] * 3, flaky.messages
         # The timeout grew because the endpoint timed out.
         assert runtime.llm_timeout > cfg.llm.request_timeout, runtime.llm_timeout
         assert runtime.llm_transient_errors >= 1
@@ -962,6 +962,105 @@ def test_inflight_refcount_survives_nested_submit_and_run():
         print("inflight refcount nesting ok")
 
 
+def test_retry_resubmits_the_same_prompt_and_never_mentions_the_error():
+    """An LLM failure is retried with the original prompt, unchanged.
+
+    Telling the agent "the model returned nothing / the request timed out"
+    makes it react to an infrastructure fault it cannot fix: it apologises,
+    re-plans, or burns its budget on the endpoint. The prompt that failed is
+    simply sent again.
+    """
+    import litellm
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = make(tmp)
+        conv = FakeConv("orch-conv")
+        CreateProjectExecutor()(CreateProjectAction(
+            name="Retry", goal="retry keeps the prompt", constraints=""), conv)
+        pid = list(store.projects)[0]
+        CreateTaskExecutor()(CreateTaskAction(
+            project_id=pid, title="Work", objective="x", expertise="backend",
+            acceptance_criteria=["works"], deliverables=["out"]), conv)
+        CreateSubAgentExecutor()(CreateSubAgentAction(
+            role="backend-dev", specialty="backend",
+            mission="build", project_id=pid), conv)
+        agent_id = [a.id for a in store.project_agents(pid) if a.depth == 1][0]
+        spec = store.agents[agent_id]
+
+        flaky = FlakyConv([litellm.exceptions.APIConnectionError(
+            message="connection reset by peer", model="qwen",
+            llm_provider="openai"), 3])
+        runtime.open_conversation = lambda *a, **k: flaky
+        outcome = runtime.run(spec, [], "Build the thing exactly as specified")
+
+        assert len(flaky.messages) == 2, flaky.messages
+        assert flaky.messages[0] == flaky.messages[1], (
+            "retry changed the prompt: " + repr(flaky.messages[1]))
+        for word in ("timed out", "returned nothing", "no usable output",
+                     "APIConnectionError", "Continue the task"):
+            assert word not in flaky.messages[1], word
+        assert outcome.llm_retries == 1, outcome.llm_retries
+        assert outcome.status == "idle", outcome.status
+        print("retry resubmits the same prompt ok")
+
+
+def test_consecutive_llm_failures_are_counted_on_the_agent():
+    """The streak counter is what turns a dead endpoint into a user alert."""
+    import litellm
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, store, runtime, orch = make(tmp)
+        conv = FakeConv("orch-conv")
+        CreateProjectExecutor()(CreateProjectAction(
+            name="Streak", goal="count llm failures", constraints=""), conv)
+        pid = list(store.projects)[0]
+        CreateTaskExecutor()(CreateTaskAction(
+            project_id=pid, title="Work", objective="x", expertise="backend",
+            acceptance_criteria=["works"], deliverables=["out"]), conv)
+        CreateSubAgentExecutor()(CreateSubAgentAction(
+            role="backend-dev", specialty="backend",
+            mission="build", project_id=pid), conv)
+        agent_id = [a.id for a in store.project_agents(pid) if a.depth == 1][0]
+        spec = store.agents[agent_id]
+
+        down = litellm.exceptions.APIConnectionError(
+            message="connection refused", model="qwen", llm_provider="openai")
+        for i in (1, 2):
+            # Every attempt raises: an endpoint that answers with nothing
+            # would be reported as 'no output' instead of naming the fault.
+            runtime.open_conversation = lambda *a, **k: FlakyConv(
+                [down, down, down])
+            outcome = runtime.run(spec, [], "do the work")
+            assert outcome.llm_failures == i, outcome.llm_failures
+            assert outcome.status == "llm_unavailable", outcome.status
+            assert store.agents[agent_id].llm_failures == i
+        assert "connection refused" in store.agents[agent_id].llm_failure_error
+
+        # A run that reaches the model clears the streak: the endpoint is back.
+        runtime.open_conversation = lambda *a, **k: FlakyConv([2])
+        outcome = runtime.run(spec, [], "do the work")
+        assert outcome.llm_failures == 0, outcome.llm_failures
+        assert store.agents[agent_id].llm_failure_error is None
+        print("llm failure streak counted/reset ok")
+
+
+def test_endpoint_errors_map_to_llm_unavailable_not_failed():
+    """A transport error is infrastructure; an agent fault is 'failed'.
+
+    The distinction decides who fixes it: the user (endpoint) or the
+    orchestrator (agent). Mislabelling it 'failed' sends the orchestrator off
+    reconfiguring an agent that was never broken.
+    """
+    assert AgentRuntime._map_status("brand_new", False, "APIConnectionError",
+                                    llm_transport=True) == "llm_unavailable"
+    assert AgentRuntime._map_status("brand_new", False, "ValidationError",
+                                    llm_transport=False) == "failed"
+    # Budget still outranks everything: it is a real, attributable outcome.
+    assert AgentRuntime._map_status("brand_new", True, "APIConnectionError",
+                                    llm_transport=True) == "budget_exhausted"
+    print("endpoint vs agent error mapping ok")
+
+
 if __name__ == "__main__":
     test_concurrency_gate_serialises_below_limit()
     test_turn_counter_counts_unique_response_ids()
@@ -985,4 +1084,7 @@ if __name__ == "__main__":
     test_env_overrides_are_not_baked_into_the_config_file()
     test_qwen_cost_defaults()
     test_inflight_refcount_survives_nested_submit_and_run()
+    test_retry_resubmits_the_same_prompt_and_never_mentions_the_error()
+    test_consecutive_llm_failures_are_counted_on_the_agent()
+    test_endpoint_errors_map_to_llm_unavailable_not_failed()
     print("\nALL RUNTIME/CONFIG TESTS PASSED")

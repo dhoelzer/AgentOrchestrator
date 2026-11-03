@@ -31,6 +31,8 @@
   .alert.success { border-color:var(--ok); background:rgba(63,178,127,.12); }
   .alert.warn { border-color:var(--warn); background:rgba(224,163,74,.10); }
   .alert.info { border-color:var(--accent); background:rgba(91,157,255,.08); }
+  .alert.error { border-color:var(--err); background:rgba(224,108,108,.14);
+                 color:var(--err); }
   .alert .row { display:flex; align-items:center; gap:10px; }
   .alert .msg { flex:1; }
   .alert button { padding:3px 10px; font-size:12px; }
@@ -88,6 +90,8 @@
   .task { background:var(--panel); border:1px solid var(--line); border-radius:8px;
     padding:9px 10px; margin-bottom:8px; cursor:pointer; }
   .task:hover { border-color:var(--accent); }
+  .task.summary { border-style:dashed; background:transparent; }
+  .task.summary .t { color:var(--dim); font-weight:400; }
   .task .t { font-size:13px; font-weight:500; display:flex; align-items:center; gap:7px; }
   .task .m { font-size:11px; color:var(--dim); margin-top:5px; display:flex; gap:8px; flex-wrap:wrap; }
   /* Done cards carry no live state worth reading, so they collapse to just the
