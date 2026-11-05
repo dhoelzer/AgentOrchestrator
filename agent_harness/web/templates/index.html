@@ -240,12 +240,25 @@
   .ev { padding:7px 0; border-bottom:1px solid var(--line); font-size:12px; }
   .ev .k { color:var(--accent); font-weight:600; margin-right:6px; }
   .ev .ts { color:var(--dim); float:right; font-size:11px; }
-  form.proj { display:grid; grid-template-columns:1fr 2fr 1fr auto; gap:10px;
+  form.proj { display:grid; grid-template-columns:1fr 2fr 1fr auto auto; gap:10px;
     padding:14px 16px; background:var(--panel2); border:1px solid var(--line);
     border-radius:var(--radius); margin-bottom:20px; }
   form.proj input, form.proj textarea { background:var(--bg); color:var(--text);
     border:1px solid var(--line); border-radius:8px; padding:9px 11px; font:inherit; }
   form.proj textarea { min-height:40px; resize:vertical; }
+  /* A bare <input type=file> renders as an invisible box on this dark theme, so
+     uploads look like they do not exist. The picker is a label styled as a
+     button; the input stays in the form (and focusable) but is hidden. */
+  .filepick { display:inline-flex; align-items:center; gap:8px; cursor:pointer;
+    background:var(--bg); border:1px solid var(--line); border-radius:8px;
+    padding:8px 11px; font-size:13px; }
+  .filepick:hover { border-color:var(--accent); }
+  .filepick input[type=file] { position:absolute; width:1px; height:1px;
+    opacity:0; pointer-events:none; }
+  .filepick .fp-btn { color:var(--accent); font-weight:600; white-space:nowrap; }
+  .filepick .fp-names { color:var(--dim); font-size:12px; max-width:240px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .filepick:focus-within { border-color:var(--accent); }
   dialog { background:var(--panel); color:var(--text); border:1px solid var(--line);
     border-radius:var(--radius); max-width:820px; width:92vw; padding:0; }
   dialog::backdrop { background:rgba(0,0,0,.6); }
@@ -258,7 +271,7 @@
   .muted { color:var(--dim); }
   @media (max-width:1400px){ .kanban{grid-template-columns:repeat(4,minmax(190px,1fr));} }
   @media (max-width:900px){ .kanban{grid-template-columns:1fr 1fr;} .grid2{grid-template-columns:1fr;}
-    form.proj{grid-template-columns:1fr;} }
+    form.proj{grid-template-columns:1fr;} .filepick .fp-names{max-width:140px;} }
 </style>
 </head>
 <body>
@@ -281,8 +294,11 @@
     <input name="name" placeholder="Project name" required>
     <input name="goal" placeholder="Goal — what does done look like?" required>
     <input name="constraints" placeholder="Constraints (optional)">
-    <input type="file" name="files" id="projFiles" multiple
-           title="Attach spec, data, or any source material. Files land in the project workspace under inputs/ where every agent on the project can read them.">
+    <label class="filepick" title="Attach spec, data, or any source material. Files land in the project workspace under inputs/ where every agent on the project can read them.">
+      <input type="file" name="files" id="projFiles" multiple>
+      <span class="fp-btn">Attach files</span>
+      <span class="fp-names" id="projFileNames">none</span>
+    </label>
     <button class="primary" type="submit">Create project</button>
   </form>
 

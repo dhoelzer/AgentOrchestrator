@@ -188,6 +188,28 @@ cycle would act on stale state and then overwrite the fresher decisions.
 than stacking. Do not "fix" a missed cycle by queueing one: the next tick
 re-detects from current state, which is the point.
 
+## Dashboard UI: polling, collapse, and forms
+
+- `refresh()` runs every 5 s and `renderProjects()` replaces `#projects` via
+  `innerHTML`. Anything the user typed or picked in a form is destroyed on the
+  next poll unless it is stashed. `capturePendingForms()` /
+  `restorePendingForms()` bracket the render for the message bar; a `FileList`
+  cannot be assigned directly, so picked files are rebuilt with `DataTransfer`.
+  Without this the user picks a file, the poll fires, and "Add to project"
+  uploads nothing.
+- A project's open/closed state is seeded **once per project id**
+  (`state.seenProjects`), never per refresh. Re-seeding `openProjects` on every
+  poll pops a collapsed card back open a few seconds after the user closed it.
+- Only a click on `summary` toggles a project. The old handler matched
+  `details.card[data-project]`, so clicking the message input collapsed the
+  card. Pause / Mark delivered / Remove live **inside** the summary, so those
+  clicks must `preventDefault()` or the button also collapses the project.
+- A bare `<input type=file>` renders as an invisible box in this dark theme, so
+  uploads look absent. The visible affordance is `label.filepick` ("Attach
+  files" + the selected names); the input stays in the form for `FormData` but
+  is visually hidden. Assert on the label, not the input, in UI tests.
+
+
 ## Kanban done column
 
 `DONE_VISIBLE = 20` in `app.js`; anything older folds into a summary **card**

@@ -3,7 +3,8 @@ const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-const state = { data: null, openProjects: new Set(), tab: "board", queues: {},
+const state = { data: null, openProjects: new Set(), seenProjects: new Set(),
+                tab: "board", queues: {}, pendingFiles: {}, pendingForms: {},
                 router: null, showArchived: false, showAllDone: false };
 
 const money = (v) => "$" + (Number(v || 0)).toFixed(4).replace(/0+$/, "").replace(/\.$/, ".00");
@@ -287,8 +288,11 @@ function renderMessageBar(p) {
   return `<div class="msgbar">
     <form class="msgform" data-msg="${esc(p.id)}">
       <input name="text" placeholder="Add information or a new request — the orchestrator will plan it next tick" autocomplete="off">
-      <input type="file" name="files" multiple
-             title="Attach files to this project. They go into the workspace under inputs/ where the project's agents can read them.">
+      <label class="filepick" title="Attach files to this project. They go into the workspace under inputs/ where the project's agents can read them.">
+        <input type="file" name="files" multiple data-pick="${esc(p.id)}">
+        <span class="fp-btn">Attach files</span>
+        <span class="fp-names" data-pick-names="${esc(p.id)}">none</span>
+      </label>
       <button type="submit">Add to project</button>
     </form>
     ${inputs.length ? `<div class="msgpending">${inputs.map((f) =>
@@ -395,6 +399,7 @@ function renderRevisions(p) {
 }
 
 function renderProjects(d) {
+  capturePendingForms();
   const html = d.projects
     .map((p) => {
       const open = state.openProjects.has(p.id) ? "open" : "";
@@ -439,6 +444,45 @@ function renderProjects(d) {
     .join("");
   $("#projects").innerHTML =
     html || '<div class="muted">No projects yet — create one above.</div>';
+  restorePendingForms();
+}
+
+/* The board is re-rendered from scratch every poll, which would otherwise wipe
+   what the user just typed or the file they just picked — a picked FileList
+   cannot be set programmatically, so it is stashed and re-attached by index. */
+function capturePendingForms() {
+  document.querySelectorAll("form[data-msg]").forEach((f) => {
+    const text = f.querySelector("input[name=text]");
+    const file = f.querySelector("input[type=file]");
+    const key = f.dataset.msg;
+    if (text && text.value.trim()) state.pendingForms[key] = text.value;
+    if (file && file.files.length) state.pendingFiles[key] = Array.from(file.files);
+  });
+}
+
+function restorePendingForms() {
+  document.querySelectorAll("form[data-msg]").forEach((f) => {
+    const key = f.dataset.msg;
+    const text = f.querySelector("input[name=text]");
+    if (text && state.pendingForms[key]) text.value = state.pendingForms[key];
+    const file = f.querySelector("input[type=file]");
+    if (file && state.pendingFiles[key]) {
+      const dt = new DataTransfer();
+      state.pendingFiles[key].forEach((fl) => dt.items.add(fl));
+      file.files = dt.files;
+    }
+    updatePickNames(f.querySelector("[data-pick-names]"), file);
+  });
+}
+
+function updatePickNames(span, input) {
+  if (!span || !input) return;
+  const n = input.files ? input.files.length : 0;
+  if (!n) { span.textContent = "none"; return; }
+  const names = Array.from(input.files).map((f) => f.name);
+  span.textContent = names.length > 2
+    ? `${names.slice(0, 2).join(", ")} +${names.length - 2}`
+    : names.join(", ");
 }
 
 function renderFeed(d) {
@@ -461,7 +505,13 @@ async function refresh() {
     p.columns_order = d.columns;
     state.queues[p.id] = q.filter(
       (e) => e.project_id === p.id || e.project_id === null);
-    if (!state.openProjects.has(p.id) && p.status !== "delivered") state.openProjects.add(p.id);
+    // Default a project open the first time we see it, then never touch its
+    // open state again: re-seeding on every poll would pop a collapsed card
+    // back open a few seconds after the user closed it.
+    if (!state.seenProjects.has(p.id)) {
+      state.seenProjects.add(p.id);
+      if (p.status !== "delivered") state.openProjects.add(p.id);
+    }
   });
   state.router = d.meta.llm_router || null;
   renderHeader(d);
@@ -525,6 +575,10 @@ document.addEventListener("submit", async (e) => {
     });
     if (res.ok) {
       e.target.reset();
+      delete state.pendingForms[msgForm];
+      delete state.pendingFiles[msgForm];
+      updatePickNames(e.target.querySelector("[data-pick-names]"),
+                      e.target.querySelector("input[type=file]"));
       await refresh();
     } else {
       alert("Could not add that: " + (await res.text()));
@@ -539,14 +593,31 @@ document.addEventListener("submit", async (e) => {
   });
   if (res.ok) {
     e.target.reset();
+    updatePickNames($("#projFileNames"), $("#projFiles"));
     await refresh();
   } else {
     alert("Could not create project: " + (await res.text()));
   }
 });
 
+// The visible "N selected" text lives in the label, not the hidden input.
+document.addEventListener("change", (e) => {
+  if (e.target.matches("input[type=file]")) {
+    const box = e.target.closest("form[data-msg]");
+    updatePickNames(
+      box ? box.querySelector("[data-pick-names]") : $("#projFileNames"), e.target);
+  }
+});
+
 document.addEventListener("click", async (e) => {
   const t = e.target;
+  // Pause / delivered / Remove live inside <summary>, and a click on a summary
+  // toggles the card natively. Suppress that so pressing Pause does not also
+  // collapse the project the user is looking at.
+  if (t.closest && t.closest("summary") &&
+      (t.closest("button") || t.closest("input") || t.closest("select"))) {
+    e.preventDefault();
+  }
   if (t.id === "tickBtn") {
     await fetch("/api/tick", { method: "POST" });
     setTimeout(refresh, 1500);
@@ -708,10 +779,13 @@ document.addEventListener("click", async (e) => {
     showAgent(proj.dataset.project, node.dataset.agent);
     return;
   }
-  const det = t.closest("details.card[data-project]");
-  if (det && !t.closest("button")) {
-    if (det.open) state.openProjects.delete(det.dataset.project);
-    else state.openProjects.add(det.dataset.project);
+  const sum = t.closest("summary");
+  if (sum) {
+    const det = sum.closest("details.card[data-project]");
+    if (det) {
+      if (det.open) state.openProjects.delete(det.dataset.project);
+      else state.openProjects.add(det.dataset.project);
+    }
   }
 });
 

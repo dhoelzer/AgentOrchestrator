@@ -260,16 +260,60 @@ def test_dispatch_prompts_carry_input_files():
 
 
 def test_ui_exposes_file_inputs():
+    """A bare <input type=file> is invisible in this theme; the affordance the
+    user can actually see is the styled label, so assert on that."""
     cfg, store, runtime, orch, api = make(tempfile.mkdtemp())
     client = TestClient(api)
     html = client.get("/").text
-    assert 'type="file" name="files"' in html, "create-project file input missing"
     js = client.get("/static/app.js").text
+
+    assert html.count('class="filepick"') >= 1, "create-project picker missing"
+    assert "Attach files" in html, "no visible attach affordance on create form"
+    assert "Attach files" in js, "no visible attach affordance on message bar"
+    assert ".filepick" in html, "picker has no styling (renders invisible)"
     assert 'name="files"' in js, "message-bar file input missing"
     assert "input_files" in js, "uploaded inputs not rendered"
-    assert 'body: new FormData(e.target)' in js, "project create not multipart"
+    assert "new FormData(e.target)" in js, "submissions not multipart"
     runtime.close_all()
     print("upload UI contract ok")
+
+
+def test_picked_files_survive_the_polling_rerender():
+    """The board is rebuilt from innerHTML every 5s. Without a stash, a file the
+    user picked (or typed text) vanishes before they can press submit."""
+    cfg, store, runtime, orch, api = make(tempfile.mkdtemp())
+    js = TestClient(api).get("/static/app.js").text
+    assert "capturePendingForms()" in js and "restorePendingForms()" in js
+    assert "state.pendingFiles" in js and "state.pendingForms" in js
+    # A FileList cannot be assigned directly; it has to be rebuilt via DT.
+    assert "new DataTransfer()" in js
+    runtime.close_all()
+    print("pending-form preservation ok")
+
+
+def test_collapsed_project_stays_collapsed():
+    """The old code re-added every project to openProjects on every poll, so a
+    collapse was undone by the next 5s refresh."""
+    cfg, store, runtime, orch, api = make(tempfile.mkdtemp())
+    js = TestClient(api).get("/static/app.js").text
+
+    # Seeding must be one-shot per project id, not per refresh.
+    assert "seenProjects" in js, "open state is re-seeded on every poll"
+    assert "state.seenProjects.has(p.id)" in js, "seed is not guarded by first-sight"
+    reseed = 'if (!state.openProjects.has(p.id) && p.status !== "delivered")'
+    assert reseed not in js, "unconditional re-open still present"
+
+    # Only the summary toggles; a click in the card body (e.g. the message
+    # input) used to flip the open state too.
+    assert 't.closest("summary")' in js, "toggle is not scoped to the summary"
+    assert 'sum.closest("details.card[data-project]")' in js
+    # Controls inside the summary must not collapse the card they live in.
+    guard = 't.closest("summary") &&'
+    assert guard in js, "no summary-control guard"
+    tail = js[js.index(guard):js.index(guard) + 260]
+    assert "e.preventDefault()" in tail, "summary buttons still toggle the card"
+    runtime.close_all()
+    print("collapse persistence ok")
 
 
 # ---------------------------------------------------------------- pause
@@ -439,6 +483,8 @@ def main() -> None:
                test_inputs_reach_briefing_and_assignment_prompts,
                test_dispatch_prompts_carry_input_files,
                test_ui_exposes_file_inputs,
+               test_picked_files_survive_the_polling_rerender,
+               test_collapsed_project_stays_collapsed,
                test_pause_stops_scheduler_dispatch,
                test_pause_freezes_the_board,
                test_pause_produces_no_attention,
