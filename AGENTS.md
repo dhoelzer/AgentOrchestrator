@@ -615,3 +615,19 @@ a long gap becomes detectable, and failover stays possible (nothing has been
 sent to the caller yet, so a stalled attempt can be retried on another endpoint).
 Endpoints that reject `stream: true` with a 4xx fall back to a plain call rather
 than being parked.
+
+## Versioning
+
+`agent_harness/version.py::__version__` must be bumped on **every** commit that
+changes harness behaviour, tools, API endpoints, or the persisted state schema.
+It is stamped into `state.json` meta at startup and shown in `/health`, because
+the stack runs from a bind mount: a container that was not rebuilt keeps serving
+an old build against new data, and without the stamp that is invisible.
+
+- patch — bug fixes, copy tweaks, no contract change
+- minor — new tools, new API endpoints, new persisted fields (backwards compatible)
+- major — breaking change to config, state schema, or the board model
+
+Bump it as part of the change, not afterwards: the value is read at startup, so
+a build that shipped without a bump has already mislabelled itself in any
+state.json it touched.
