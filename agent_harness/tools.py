@@ -425,10 +425,14 @@ class CreateSubAgentExecutor(ToolExecutor):
                 f"Sub-agent depth limit ({c.config.max_sub_agent_depth}) reached. "
                 "Report back instead of delegating deeper."
             )
-        if caller is not None and len(caller.child_agent_ids) >= c.config.max_children_per_agent:
+        # 0 means unlimited, which is the default: there is no cap on how many
+        # specialists an agent may create. The real ceiling is how many may run
+        # at once, enforced by the project concurrency limit at dispatch time.
+        cap = c.config.max_children_per_agent
+        if caller is not None and cap and len(caller.child_agent_ids) >= cap:
             return _err(
                 f"You already have {len(caller.child_agent_ids)} sub-agents "
-                f"(limit {c.config.max_children_per_agent}). Reuse one with resume_agent."
+                f"(limit {cap}). Reuse one with resume_agent."
             )
 
         tools = action.tools or (EXEC_TOOLS + WORKER_TOOLS)
@@ -552,6 +556,15 @@ class RunAgentExecutor(ToolExecutor):
             )
         if agent.id in c.runtime.inflight:
             return _err(f"Agent {agent.id} is already running; wait for it next cycle.")
+        if not c.runtime.project_slot_free(task.project_id or agent.project_id):
+            return _err(
+                f"Project already has "
+                f"{c.config.max_concurrent_sub_agents_per_project} sub-agents "
+                f"running (its concurrency limit). There is no limit on how many "
+                "agents you may create - they just cannot all run at once. "
+                "Dispatch in the background and the scheduler starts it as soon "
+                "as a slot frees, or work a card in another project."
+            )
 
         _reactivate(c, agent)
         inputs = _project_inputs(c.store, task)

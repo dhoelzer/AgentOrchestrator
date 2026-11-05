@@ -61,6 +61,12 @@ class Orchestrator:
         self._scheduler_notes: list[tuple[str | None, str]] = []
         # Recent cycle durations, and the interval the loop is currently using.
         self._cycle_durations: deque[float] = deque(maxlen=12)
+        # Set when something happens that should not wait out a long idle
+        # interval: a new project, new user input, or an agent finishing.
+        self._wake = threading.Event()
+        # Whether the most recent cycle had anything to act on. Drives the
+        # idle backoff in _next_tick.
+        self._cycle_had_work = True
         self._last_skip_event_at: float | None = None
         self.effective_tick = float(max(1, config.tick_seconds))
         self.config_notes: list[str] = []
@@ -757,6 +763,10 @@ class Orchestrator:
 
             reports.append(self._run_project_cycle(project, attention))
 
+        # Idle = nothing needed a decision and nothing is in flight. Only that
+        # combination justifies a long sleep: with agents running, a finishing
+        # run can unblock a card, and the loop has to notice reasonably soon.
+        self._cycle_had_work = bool(reports) or bool(self.runtime.inflight)
         self._record_cycle_end("ok")
         return reports
 
@@ -796,15 +806,22 @@ class Orchestrator:
         """
         notes = getattr(self, "config_notes", [])
         if not notes:
+            # Capacity is in every briefing (cycle_briefing's capacity section),
+            # so it must NOT be an attention item: attention is what decides
+            # whether a project gets an orchestrator cycle at all, and making it
+            # always-present would run a paid cycle per project per tick even
+            # when there is nothing to decide.
             return {}
-        lines = [f"CONFIG CHANGED (applied this tick): {n}" for n in notes]
         cap = self.runtime.capacity()
+        lines = [f"CONFIG CHANGED (applied this tick): {n}" for n in notes]
         lines.append(
-            f"CAPACITY NOW: {cap['slots_free']} of {cap['worker_slots']} worker "
-            f"slots free ({cap['workers_active']} working), {cap['queued']} "
-            f"action(s) already queued, "
-            f"{len(cap['llm_servers'])} LLM server(s) in rotation "
-            f"({', '.join(cap['llm_servers'])}).")
+            f"CAPACITY NOW: {cap['slots_free']} of {cap['worker_slots']} "
+            f"sub-agent slots free ({cap['workers_active']} running), "
+            f"{cap['queued']} action(s) already queued, max "
+            f"{cap['max_concurrent_sub_agents_per_project']} running per "
+            f"project, {len(cap['llm_servers'])} LLM server(s) in rotation "
+            f"({', '.join(cap['llm_servers'])}). Creating sub-agents is "
+            "unlimited; running them at once is not.")
         if cap["slots_free"] > 0:
             lines.append(
                 "More capacity than before: dispatch additional ready cards in "
@@ -828,6 +845,7 @@ class Orchestrator:
              "user_messages": project.user_messages,
              "input_files": project.input_files},
             board, agents, attention, archived=archived,
+            capacity=self.runtime.capacity(),
         )
 
         # Refresh the orchestrator's per-cycle budget; its conversation persists.
@@ -903,8 +921,23 @@ class Orchestrator:
 
     def stop(self) -> None:
         self._stop.set()
+        # The loop may be parked in a long idle wait; wake it so shutdown is
+        # prompt regardless of the current interval.
+        self._wake.set()
 
-    def _next_tick(self, elapsed: float) -> float:
+    def wake(self, reason: str = "") -> None:
+        """Cut the idle wait short so new work is picked up promptly.
+
+        An idle loop deliberately sleeps for a long time; without this, a
+        project created by the user could sit untouched for the whole idle
+        interval.
+        """
+        self._cycle_durations.clear()
+        self._wake.set()
+        if reason:
+            logger.info("Loop woken early: %s", reason)
+
+    def _next_tick(self, elapsed: float, had_work: bool = True) -> float:
         """Re-derive the scheduler interval from how long the last cycle took.
 
         A fixed interval cannot be right: a cycle that runs long makes the loop
@@ -930,13 +963,28 @@ class Orchestrator:
         if not cfg.dynamic_tick:
             return float(max(floor, min(cfg.tick_seconds, ceiling)))
 
+        # Nothing to act on and nothing running: there is no value in coming
+        # back quickly, and the cycle cost no LLM call either way. Back off
+        # toward idle_tick_seconds instead of letting the duty-cycle maths pull
+        # the interval to the floor.
+        current = self.effective_tick
+        if not had_work:
+            ceiling = max(floor, cfg.idle_tick_seconds, cfg.max_tick_seconds)
+            idle = float(max(floor, min(ceiling, cfg.idle_tick_seconds)))
+            if current < idle:
+                step = current * max(1.0, cfg.idle_backoff_factor)
+                self.effective_tick = float(min(idle, max(step, floor + 1)))
+            else:
+                self.effective_tick = idle
+            self._cycle_durations.clear()
+            return self.effective_tick
+
         self._cycle_durations.append(max(0.05, elapsed))
         # Keep the longest recent cycle in the average: one slow cycle is a
         # better signal of the real cost than several empty ones.
         # deque has no slice syntax; list() first.
         recent = max(list(self._cycle_durations)[-6:])
         target = recent / max(0.05, min(1.0, cfg.tick_duty_cycle))
-        current = self.effective_tick
         # Asymmetric: grow quickly when falling behind, shrink slowly so a
         # burst of cheap cycles does not make the loop spin.
         if target > current:
@@ -955,6 +1003,9 @@ class Orchestrator:
         self.store.meta["loop_started_at"] = int(time.time())
         self.store.flush()
         while not self._stop.is_set():
+            # Cleared at the top of the iteration, not before the sleep: a wake
+            # that arrives mid-cycle must still shorten the following wait.
+            self._wake.clear()
             started = time.time()
             self.store.meta["cycle_started_at"] = int(started)
             self.store.meta["cycle_status"] = "running"
@@ -980,10 +1031,12 @@ class Orchestrator:
             # A skipped cycle costs ~0s. Feeding that to the tuner collapses the
             # interval to the floor, which then makes the loop retry (and skip)
             # every floor-length tick while one long cycle is in flight.
-            wait = self._next_tick(elapsed) if reports is not None \
-                else self.effective_tick
+            wait = (self._next_tick(elapsed, self._cycle_had_work)
+                    if reports is not None else self.effective_tick)
             self.store.meta["effective_tick"] = round(wait, 1)
             self.store.meta["last_cycle_seconds"] = round(elapsed, 1)
             self.store.flush()
-            self._stop.wait(max(1.0, wait))
+            # Interruptible: a new project or new user input should not have to
+            # wait out an idle-length interval before anyone looks at it.
+            self._wake.wait(timeout=max(1.0, wait))
         self.runtime.close_all()

@@ -370,6 +370,9 @@
     <label>Router stall timeout (s)<input name="router_stall_timeout" type="number" min="1"></label>
     <label>Router call ceiling (s)<input name="router_max_call_timeout" type="number" min="1"></label>
     <label>Max sub-agent depth<input name="max_sub_agent_depth" type="number" min="1"></label>
+    <label title="How many sub-agents one project may run at once. There is no cap on how many may be created.">Concurrent per project<input name="max_concurrent_sub_agents_per_project" type="number" min="1"></label>
+    <label title="0 = unlimited. Creating sub-agents is uncapped by default; this is an optional guard.">Max children per agent (0=unlimited)<input name="max_children_per_agent" type="number" min="0"></label>
+    <label title="How long the loop waits when a cycle finds nothing to do.">Idle tick (s)<input name="idle_tick_seconds" type="number" min="5"></label>
     <label>Input $/token<input name="llm.input_cost_per_token" type="number" step="any" min="0"></label>
     <label>Output $/token<input name="llm.output_cost_per_token" type="number" step="any" min="0"></label>
   </form>

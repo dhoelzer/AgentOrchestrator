@@ -55,6 +55,24 @@ TRANSIENT_LLM_ERRORS = (
 TIMEOUT_LIKE_ERRORS = (openai.APIConnectionError,)
 
 
+class ProjectConcurrencyLimit(RuntimeError):
+    """Raised when a project already has its full share of running sub-agents.
+
+    The limit is on concurrency, not on how many sub-agents may exist: a
+    project may create as many specialists as it needs, they just cannot all
+    hold the LLM at once.
+    """
+
+    def __init__(self, project_id: str, limit: int):
+        super().__init__(
+            f"Project {project_id} already has {limit} sub-agents running "
+            f"(max_concurrent_sub_agents_per_project={limit}). Wait for one to "
+            "finish, or dispatch in the background and it starts on its own."
+        )
+        self.project_id = project_id
+        self.limit = limit
+
+
 class ConcurrencyGate:
     """Bounds how many threads may hold the LLM at once; limit is adjustable.
 
@@ -270,6 +288,12 @@ class AgentRuntime:
         # it eventually calls marks the same agent again, so a plain set would be
         # cleared by the inner unmark while the outer one is still in flight.
         self._inflight: dict[str, int] = {}
+        # agent_id -> project_id for every run that has claimed a project
+        # concurrency slot. The global gate bounds total LLM pressure; this
+        # bounds how many sub-agents one project may run at once, which is the
+        # limit that should govern fan-out (there is no cap on how many
+        # sub-agents may be *created*).
+        self._project_runs: dict[str, str] = {}
         # Gate slots currently held by an orchestrator run. The orchestrator
         # holds one for the whole cycle, so capacity() can report how many
         # slots are genuinely left for workers.
@@ -352,6 +376,9 @@ class AgentRuntime:
             "slots_in_use": active,
             "slots_free": max(0, worker_slots - workers_active),
             "queued": queued,
+            "max_concurrent_sub_agents_per_project":
+                max(1, int(self.config.max_concurrent_sub_agents_per_project)),
+            "project_runs": self.project_run_counts(),
             "pool_size": self._pool._max_workers,
             # Config truth, so scheduling advice holds even before the router
             # has probed anything.
@@ -397,6 +424,54 @@ class AgentRuntime:
                 self._inflight[agent_id] = left
             else:
                 self._inflight.pop(agent_id, None)
+
+    def project_run_counts(self) -> dict[str, int]:
+        """How many sub-agent runs each project currently holds."""
+        with self._lock:
+            counts: dict[str, int] = {}
+            for pid in self._project_runs.values():
+                counts[pid] = counts.get(pid, 0) + 1
+            return counts
+
+    def project_slot_free(self, project_id: str | None) -> bool:
+        """May this project start one more sub-agent run right now?
+
+        The orchestrator is not a sub-agent and never consumes a project slot.
+        A run already holding a slot for this project is re-entrant: a parent
+        that dispatches a child on its own thread must not be blocked by its
+        own presence.
+        """
+        if not project_id:
+            return True
+        limit = max(1, int(self.config.max_concurrent_sub_agents_per_project))
+        with self._lock:
+            held = sum(1 for pid in self._project_runs.values()
+                       if pid == project_id)
+        return held < limit
+
+    def _claim_project_slot(self, spec: AgentSpec) -> bool:
+        """Reserve a project concurrency slot for a sub-agent run.
+
+        Returns False when the project is already at its limit. The claim lives
+        for the duration of the run, so a project that fills up drains as runs
+        finish without any further scheduling decision.
+        """
+        if spec.role == "orchestrator" or not spec.project_id:
+            return True
+        limit = max(1, int(self.config.max_concurrent_sub_agents_per_project))
+        with self._lock:
+            if spec.id in self._project_runs:
+                return True
+            held = sum(1 for pid in self._project_runs.values()
+                       if pid == spec.project_id)
+            if held >= limit:
+                return False
+            self._project_runs[spec.id] = spec.project_id
+            return True
+
+    def _release_project_slot(self, agent_id: str) -> None:
+        with self._lock:
+            self._project_runs.pop(agent_id, None)
 
     def submit(self, agent_id: str, fn) -> None:
         """Run a worker stretch off the loop thread."""
@@ -735,6 +810,12 @@ class AgentRuntime:
         is_orchestrator = spec.role == "orchestrator"
         if is_orchestrator:
             self._note_orchestrator_slot(1)
+        if not self._claim_project_slot(spec):
+            if is_orchestrator:
+                self._note_orchestrator_slot(-1)
+            raise ProjectConcurrencyLimit(
+                spec.project_id,
+                max(1, int(self.config.max_concurrent_sub_agents_per_project)))
         try:
             self._begin_llm(entry)
             # Tracked here rather than only in submit() so the orchestrator's
@@ -745,6 +826,7 @@ class AgentRuntime:
             finally:
                 self._unmark_inflight(spec.id)
         finally:
+            self._release_project_slot(spec.id)
             if is_orchestrator:
                 self._note_orchestrator_slot(-1)
 

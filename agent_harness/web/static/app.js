@@ -825,7 +825,8 @@ const SETTING_KEYS = [
   "llm.max_request_timeout", "llm.empty_response_retries", "tick_seconds",
   "sub_agent_turn_limit", "max_parallel_workers", "llm_queue_depth",
   "llm_server_concurrency", "router_stall_timeout", "router_max_call_timeout",
-  "max_sub_agent_depth", "llm.input_cost_per_token",
+  "max_sub_agent_depth", "max_concurrent_sub_agents_per_project",
+  "max_children_per_agent", "idle_tick_seconds", "llm.input_cost_per_token",
   "llm.output_cost_per_token",
 ];
 

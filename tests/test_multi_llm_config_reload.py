@@ -516,7 +516,11 @@ def test_config_change_reaches_the_orchestrator_briefing():
     assert "CONFIG CHANGED" in text, text[-800:]
     assert "CAPACITY NOW" in text
     # The edit raised max_parallel_workers to 6, and none of it is busy.
-    assert "6 of 6 worker slots free" in text, text[-800:]
+    assert "6 of 6 sub-agent slots free" in text, text[-800:]
+    # The per-project concurrency ceiling is stated alongside it, so the
+    # orchestrator knows fan-out is bounded by running-at-once, not by creating.
+    assert "max 3 running per project" in text, text[-800:]
+    assert "Creating sub-agents is unlimited" in text, text[-800:]
     print("config change reaches the briefing ok")
 
 

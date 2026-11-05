@@ -266,8 +266,25 @@ class HarnessConfig(BaseModel):
     # take about half the tick", so a 40s cycle settles at an 80s interval and
     # a 5s cycle at the floor.
     tick_duty_cycle: float = Field(default=0.5)
+    # Idle tick. When a cycle finds nothing needing attention and nothing
+    # running, there is no reason to come back quickly: the loop pays no LLM
+    # call either way, and a fast tick only burns cycles. Idle cycles therefore
+    # push the interval toward this value instead of toward the floor.
+    idle_tick_seconds: int = Field(default=300)
+    # How fast an idle loop widens its interval toward idle_tick_seconds: each
+    # idle cycle multiplies the current interval by this factor.
+    idle_backoff_factor: float = Field(default=2.0)
     sub_agent_turn_limit: int = Field(default=100)
+    # Turns the orchestrator may spend inside one cycle. This is a per-cycle
+    # slice, not a lifetime cap: the loop runs forever and the budget is
+    # re-granted every cycle. It is deliberately not exposed as a remaining
+    # count - the orchestrator that believes it is running out of a finite
+    # lifetime stops planning and starts triaging.
     orchestrator_turn_limit: int = Field(default=60)
+    # How many sub-agents may run at once inside a single project. This is the
+    # real ceiling on fan-out: there is no cap on how many sub-agents may
+    # *exist*, only on how many may hold the LLM simultaneously.
+    max_concurrent_sub_agents_per_project: int = Field(default=3)
     # How many *worker* agents may hold the LLM at once. The orchestrator is
     # deliberately not counted: it holds a slot for the whole of a cycle while
     # it decides what to dispatch, so counting it here silently costs one
@@ -279,7 +296,10 @@ class HarnessConfig(BaseModel):
     # queued — the backlog hides in the thread pool instead.
     llm_queue_depth: int = Field(default=8)
     max_sub_agent_depth: int = Field(default=3)
-    max_children_per_agent: int = Field(default=6)
+    # Ceiling on how many sub-agents one parent may have *created* over the
+    # whole project. 0 (the default) means unlimited: the constraint that
+    # actually matters is concurrency, not how many experts get spawned.
+    max_children_per_agent: int = Field(default=0)
     review_attempts_before_escalation: int = Field(default=3)
     # Start already-staffed cards without asking the LLM. The orchestrator
     # decides *which* agent owns a card; once it has, launching that agent is a
@@ -412,6 +432,9 @@ class HarnessConfig(BaseModel):
             ("HARNESS_TICK_SECONDS", "tick_seconds"),
             ("HARNESS_SUB_AGENT_TURN_LIMIT", "sub_agent_turn_limit"),
             ("HARNESS_ORCHESTRATOR_TURN_LIMIT", "orchestrator_turn_limit"),
+            ("HARNESS_MAX_CONCURRENT_SUB_AGENTS_PER_PROJECT",
+             "max_concurrent_sub_agents_per_project"),
+            ("HARNESS_IDLE_TICK_SECONDS", "idle_tick_seconds"),
             ("HARNESS_MAX_PARALLEL_WORKERS", "max_parallel_workers"),
             ("HARNESS_MAX_SUB_AGENT_DEPTH", "max_sub_agent_depth"),
             ("HARNESS_ROUTER_MAX_CALL_TIMEOUT", "router_max_call_timeout"),

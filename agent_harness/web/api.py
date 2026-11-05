@@ -205,6 +205,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
             project.goal = goal_text + "\n\n" + _inputs_note(saved)
             project.touch()
             store.flush()
+        orchestrator.wake(f"project '{project.name}' created")
         return {"id": project.id, "workspace": project.workspace,
                 "input_files": [e["name"] for e in project.input_files]}
 
@@ -561,6 +562,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                         f"User added direction to '{project.name}': {text[:300]}",
                         project_id=project_id)
         store.flush()
+        orchestrator.wake(f"new user input on '{project.name}'")
         return {"id": project.id, "messages": len(project.user_messages),
                 "status": project.status, "reopened": reopened,
                 "input_files": [e["name"] for e in saved]}
@@ -585,6 +587,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
         })
         project.touch()
         store.flush()
+        orchestrator.wake(f"files uploaded to '{project.name}'")
         return {"id": project.id,
                 "input_files": [e["name"] for e in project.input_files]}
 
@@ -1027,7 +1030,11 @@ _PATCHABLE = {
     "auto_dispatch": ("runtime", bool),
     "llm_servers": ("servers", list),
     "max_sub_agent_depth": ("runtime", int),
+    # 0 = unlimited. The concurrency knobs below are what actually bound
+    # fan-out, so this is an opt-in guard rather than a default ceiling.
     "max_children_per_agent": ("runtime", int),
+    "max_concurrent_sub_agents_per_project": ("runtime", int),
+    "idle_tick_seconds": ("runtime", int),
     "review_attempts_before_escalation": ("runtime", int),
     "confirm_tools": ("runtime", bool),
     "llm.model": ("llm", str),

@@ -26,6 +26,19 @@ coordinate reviews, resolve blockers, or signal a deliverable. You are never "do
 - the loop runs forever. Never wait for the user unless a task is genuinely blocked
 on a human decision, and then mark it `blocked` with a precise question.
 
+## Your budget - read this carefully
+You have no lifetime limit. The harness runs you forever, and every cycle you
+are handed a fresh slice of turns to spend on that cycle's decisions. The turn
+count in your briefing is a record of work already done, not a countdown of
+work remaining.
+
+Do not treat any turn number as a budget for the whole engagement, and never
+report that you are "running out of turns", "out of budget", or near the end of
+your agency. That framing is wrong and it is harmful: it makes you abandon
+planning and triage instead of doing the work. If a cycle's slice runs out, the
+next cycle starts with a full one. Budgets that need decisions are the
+sub-agents' budgets - those are real and finite per assignment.
+
 ## Planning discipline
 1. Break the project goal into independently deliverable pieces of work. Each task
    needs a single verifiable objective, explicit acceptance criteria, and named
@@ -55,7 +68,12 @@ Never try to reconfigure the harness yourself - it is not something you can do.
   when the same expertise is needed again - do not proliferate clones.
 - A specialist may create its own sub-specialists; you stay accountable for the
   outcome, not its internals.
-- Keep fan-out small and purposeful. Prefer a few well-scoped agents.
+- Keep fan-out purposeful. There is no cap on how many specialists you may
+  create; the real constraint is how many may run at once. Creating an agent is
+  cheap, so scope each one narrowly rather than making one agent do four jobs.
+- Concurrency is the limit that matters: `CAPACITY NOW` in the briefing states
+  how many sub-agents may hold the LLM at once, per project and overall. When
+  slots are free, dispatch more ready cards instead of leaving them waiting.
 
 ## Review discipline
 - Anything in `review` must be reviewed in the same cycle: read the actual
@@ -287,7 +305,8 @@ def budget_exhausted_briefing(agent: dict, task: dict | None) -> str:
 
 
 def cycle_briefing(project: dict, board: dict, agents: list[dict],
-                   attention: list[dict], archived: list[dict] | None = None) -> str:
+                   attention: list[dict], archived: list[dict] | None = None,
+                   capacity: dict | None = None) -> str:
     """The per-cycle briefing the orchestrator receives from the scheduler."""
     counts = {col: len(items) for col, items in board.items()}
     payload = {
@@ -331,13 +350,30 @@ def cycle_briefing(project: dict, board: dict, agents: list[dict],
                 "role": a["role"],
                 "specialty": a["specialty"],
                 "status": a["status"],
-                "turns": f"{a['turns_used']}/{a['turn_limit']}",
+                # An orchestrator row that reads "3272/3320" is read as a
+                # lifetime countdown and the model starts triaging instead of
+                # planning. Its slice resets every cycle, so report what it has
+                # spent rather than a limit it does not have.
+                "turns": (f"{a['turns_used']} lifetime (no limit; "
+                          f"{a['turn_limit']} per cycle)")
+                if a["role"] == "orchestrator"
+                else f"{a['turns_used']}/{a['turn_limit']}",
                 "task": a.get("task_id"),
                 "parent": a.get("parent_agent_id"),
             }
             for a in agents
         ],
     }
+    if capacity:
+        payload["capacity"] = {
+            "sub_agents_running": capacity.get("workers_active"),
+            "sub_agent_slots_free": capacity.get("slots_free"),
+            "sub_agent_slots_total": capacity.get("worker_slots"),
+            "max_concurrent_per_project": capacity.get(
+                "max_concurrent_sub_agents_per_project"),
+            "note": ("No limit on how many sub-agents may be created. These are "
+                     "concurrency limits: how many may hold the LLM at once."),
+        }
     return (
         "ORCHESTRATOR CYCLE - act on this board now.\n\n"
         + json.dumps(payload, indent=2)
@@ -346,6 +382,13 @@ def cycle_briefing(project: dict, board: dict, agents: list[dict],
            + "\nIf one already has the expertise a ready card needs, `resume_agent` "
              "it instead of creating a clone."
            if archived else "")
+        + (f"\n\n## Capacity now\n"
+           f"{capacity.get('slots_free', 0)} of {capacity.get('worker_slots', 0)} "
+           f"sub-agent slots free; {capacity.get('workers_active', 0)} running; "
+           f"max {capacity.get('max_concurrent_sub_agents_per_project', 0)} "
+           "per project. Creating agents is unlimited - running them at once "
+           "is not. Dispatch into free slots."
+           if capacity else "")
         + "\n\n## Needs your attention\n"
         + ("\n".join(f"- {a}" for a in attention) if attention else "- nothing flagged")
         + "\n\nTake the next concrete actions with your tools, then call `report_cycle`."

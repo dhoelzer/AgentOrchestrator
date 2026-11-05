@@ -28,6 +28,7 @@ python tests/test_blocks_cost_version.py # no LLM needed; block causes, card cos
 python tests/test_queue_input_recovery.py # no LLM needed; LLM queue, project input, recovery
 python tests/test_llm_failures_and_reentrancy.py # no LLM needed; LLM alerting, orchestrator re-entrancy
 python tests/test_uploads_and_pause.py # no LLM needed; uploads, pause, UI contracts
+python tests/test_concurrency_and_tick.py # no LLM needed; fan-out limits, idle tick
 python tests/test_e2e_llm.py 3         # needs the configured LLM endpoint
 python tests/test_turn_budget.py       # needs the configured LLM endpoint
 ```
@@ -701,6 +702,67 @@ a long gap becomes detectable, and failover stays possible (nothing has been
 sent to the caller yet, so a stalled attempt can be retried on another endpoint).
 Endpoints that reject `stream: true` with a 4xx fall back to a plain call rather
 than being parked.
+
+## Sub-agent fan-out: creation is unlimited, concurrency is not
+
+`max_children_per_agent` defaults to **0 = unlimited**. There is deliberately no
+cap on how many specialists a parent may create: a project that needs eleven
+experts should get eleven experts. A creation cap produced refusals ("you
+already have 6 sub-agents") that the orchestrator could not act on except by
+reusing a badly-scoped agent.
+
+The limit that governs fan-out is **how many sub-agents may run at once**:
+
+- `max_concurrent_sub_agents_per_project` (default 3) — enforced in
+  `AgentRuntime._claim_project_slot`, which runs inside `run()` on every
+  dispatch. Exceeding it raises `ProjectConcurrencyLimit`; the tool layer also
+  pre-checks with `project_slot_free()` so the orchestrator gets an actionable
+  message instead of an exception.
+- `max_parallel_workers` — the global LLM gate, unchanged.
+
+The orchestrator never consumes a project slot. Slot claims are re-entrant per
+agent id, so a parent that dispatches a child on its own thread is not blocked
+by its own presence.
+
+`capacity()` reports `max_concurrent_sub_agents_per_project` and
+`project_runs`, and every briefing carries a "Capacity now" section. Capacity
+must **not** be an attention item: attention decides whether a project gets an
+orchestrator cycle at all, so always-present capacity would run a paid cycle per
+project per tick even with nothing to decide.
+
+## Orchestrator turns: per-cycle slice, never a lifetime budget
+
+The orchestrator has no lifetime limit. `orchestrator_turn_limit` is a slice for
+one cycle; `_run_project_cycle` refreshes it with
+`spec.turn_limit = spec.turns_used + orchestrator_turn_limit`, so
+`_budget_for()`'s `turn_limit - turns_used` yields a full slice every cycle.
+
+The trap is **display**, not enforcement. A briefing row reading
+`"turns": "3272/3320"` was read as a countdown, and the orchestrator filed
+`needs_user` reports like "my orchestrator budget is down to roughly 5 turns —
+this is effectively my last cycle of real agency". It then stopped planning and
+started triaging. Invariants:
+
+- The briefing renders the orchestrator row as `"{n} lifetime (no limit; {slice}
+  per cycle)"`. Never render it as `used/limit`.
+- Sub-agents keep the plain `used/limit` form — their budget really is finite
+  per assignment, and that is the budget the orchestrator must decide on.
+- The system prompt states there is no lifetime limit and forbids reporting
+  "running out of turns".
+
+## Idle tick: back off when there is nothing to do
+
+An empty cycle costs ~0s, so the duty-cycle maths used to pull the interval to
+`min_tick_seconds` and the loop retried every floor tick for no reason.
+`_next_tick(elapsed, had_work)` now backs off geometrically toward
+`idle_tick_seconds` (default 300) when a cycle found nothing to act on **and**
+nothing was in flight. `had_work` is false only in that combined state — with
+agents running, a finishing run can unblock a card and the loop must notice.
+
+The loop sleeps on `self._wake` (not `_stop`) so `wake()` can cut the wait short.
+It is wired to project creation, new user input, and uploads; `stop()` sets it
+too. Clear `_wake` at the **top** of the loop iteration, never immediately
+before the wait — a wake arriving mid-cycle must still shorten the next sleep.
 
 ## Versioning
 

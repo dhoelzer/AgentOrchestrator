@@ -18,7 +18,7 @@ import os
 import subprocess
 from pathlib import Path
 
-__version__ = "1.9.1"
+__version__ = "1.10.0"
 
 
 def git_sha() -> str | None:

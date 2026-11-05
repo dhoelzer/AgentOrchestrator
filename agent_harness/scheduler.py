@@ -126,7 +126,18 @@ class Scheduler:
             return []
         notes: list[tuple[str | None, str]] = []
         for task, agent, review in self._ready():
-            free = self.runtime.capacity()["slots_free"]
+            cap = self.runtime.capacity()
+            free = cap["slots_free"]
+            if not self.runtime.project_slot_free(task.project_id):
+                notes.append((
+                    task.project_id,
+                    f"SCHEDULER: {task.project_id} is at its sub-agent "
+                    f"concurrency limit "
+                    f"({cap['max_concurrent_sub_agents_per_project']} running). "
+                    f"{task.id} '{task.title}' is staffed and waiting on a slot, "
+                    "not on a decision. It starts on its own when one frees; "
+                    "dispatch work in another project meanwhile."))
+                continue
             if free <= 0:
                 notes.append((
                     task.project_id,
