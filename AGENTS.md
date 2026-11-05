@@ -27,6 +27,7 @@ python tests/test_dashboard_features.py  # no LLM needed; removal, orphans, cost
 python tests/test_blocks_cost_version.py # no LLM needed; block causes, card cost, version
 python tests/test_queue_input_recovery.py # no LLM needed; LLM queue, project input, recovery
 python tests/test_llm_failures_and_reentrancy.py # no LLM needed; LLM alerting, orchestrator re-entrancy
+python tests/test_uploads_and_pause.py # no LLM needed; uploads, pause, UI contracts
 python tests/test_e2e_llm.py 3         # needs the configured LLM endpoint
 python tests/test_turn_budget.py       # needs the configured LLM endpoint
 ```
