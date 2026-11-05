@@ -422,6 +422,69 @@ the task-detail handler with no task id.
 - `prompts.orchestrator_briefing` passes them as `user_input_pending`, newest
   first, because the orchestrator reads top-down and the latest intent wins.
 
+## Project file uploads
+
+- Uploads are stored on the **project workspace** under `<workspace>/inputs/`,
+  not in `data_dir`. The workspace is every agent's cwd, so a sub-agent reads an
+  upload with a plain workspace-relative `read_file("inputs/spec.md")` — no path
+  has to be threaded through its prompt.
+- `Project.input_files` records `{name, path, size, at}`; the bytes live only in
+  the workspace. It is a new persisted field (backwards compatible).
+- Three endpoints accept multipart: `POST /api/projects` (files with the goal),
+  `POST /api/projects/{id}/messages` (files + text), and `POST /api/projects/{id}/uploads`
+  (files only). `POST /api/projects` and `/messages` **also still accept JSON** —
+  they branch on `content-type`, so do not "simplify" them to `UploadFile` form
+  params, which would break the JSON callers.
+- `python-multipart` is required by FastAPI for `request.form()`; it is in
+  requirements.txt. Without it the endpoints 400 with a confusing FastAPI error.
+- Filenames are sanitised to **one path segment** (`store._safe_filename`: strip
+  directories, `..` -> `_`). An upload must never escape `inputs/`; a crafted
+  client can send `/etc/passwd` or `../../x`. Name collisions get a `-N` suffix
+  rather than overwriting an earlier upload.
+- Limits are config, not hardcoded: `max_upload_bytes`, `max_upload_files`.
+  Bytes are read and checked **before** anything touches disk.
+- Uploads reach the model in two places, and both are required: the cycle
+  briefing (`input_files` in `cycle_briefing`) and the **assignment prompts**
+  (`_input_files_block` in `worker_assignment_prompt` / `review_assignment_prompt`).
+  A sub-agent never sees the briefing, so if you only wire the briefing, the
+  agent that does the work never learns the material exists. Both dispatch sites
+  (`tools.RunAgentExecutor` and `scheduler._start`) pass
+  `_project_inputs(store, task)`.
+- The goal gains a note naming the files on upload-with-create, so the first
+  cycle already knows. Uploaded text is framed as **data, not instructions** —
+  it must not override the assignment.
+
+
+## Paused projects: what a halt actually means
+
+`Project.is_frozen` is the single predicate (`status in ("paused", "delivered")`).
+Use it; do not re-spell the status tuple.
+
+A pause means **finish what is running, then stop**. The queue already in flight
+drains; nothing new starts. Enforced at every layer, because the orchestrator is
+an LLM and a finishing agent can always try to spawn more work:
+
+- `scheduler._ready()` skips frozen projects — no automatic dispatch.
+- `Orchestrator.reconcile()` skips them — the board does not advance on its own,
+  and an all-`done` paused project does **not** flip to `ready_for_delivery`.
+- `Orchestrator.detect()` skips them — no attention lines, so the UI does not
+  advertise a review that will never be scheduled, and `run_cycle()` runs no
+  cycle for them.
+- `tools.py` refuses new work with `_frozen_reason`: `create_task`,
+  `create_sub_agent`, `assign_task`, `run_agent`, `resume_agent`,
+  `request_review`, `signal_delivery`. **This is the layer that used to be
+  missing**: a paused project looked halted while a draining agent quietly kept
+  creating sub-agents and dispatching them. Do not rely on the scheduler skip
+  alone.
+
+- Deliberately **not** blocked: `report_to_parent`, `record_review`, writes, and
+  budget accounting. That is the in-flight run finishing, and blocking it would
+  discard work the user allowed to complete. A paused board therefore keeps
+  `result_summary` but does not move columns by itself.
+- `POST /api/projects/{id}/pause` **toggles** (paused <-> active) — that is how
+  the UI resumes. A resumed project is immediately schedulable again.
+
+
 ## Blocked cards are re-evaluated every tick
 
 - Every card in `blocked` gets a `RECOVERY DECISION` briefing line on every

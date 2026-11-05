@@ -283,11 +283,17 @@ function renderTree(nodes) {
    orchestrator reads it on its next tick and turns it into cards and agents. */
 function renderMessageBar(p) {
   const pending = (p.user_messages || []).slice(-3).reverse();
+  const inputs = (p.input_files || []);
   return `<div class="msgbar">
     <form class="msgform" data-msg="${esc(p.id)}">
       <input name="text" placeholder="Add information or a new request — the orchestrator will plan it next tick" autocomplete="off">
+      <input type="file" name="files" multiple
+             title="Attach files to this project. They go into the workspace under inputs/ where the project's agents can read them.">
       <button type="submit">Add to project</button>
     </form>
+    ${inputs.length ? `<div class="msgpending">${inputs.map((f) =>
+        `<span class="tag" title="uploaded ${esc(f.at || '')}">input: inputs/${esc(f.name)}</span>`
+      ).join("")}</div>` : ""}
     ${pending.length ? `<div class="msgpending">${pending.map((m) =>
         `<span class="tag pending" title="${esc(m.at)}">pending: ${esc(m.text.slice(0, 80))}</span>`
       ).join("")}</div>` : ""}
@@ -511,11 +517,11 @@ document.addEventListener("submit", async (e) => {
   if (msgForm) {
     e.preventDefault();
     const text = (e.target.querySelector("input[name=text]").value || "").trim();
-    if (!text) return;
+    const files = e.target.querySelector("input[type=file]");
+    if (!text && !(files && files.files.length)) return;
+    const fd = new FormData(e.target);
     const res = await fetch(`/api/projects/${msgForm}/messages`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      method: "POST", body: fd,
     });
     if (res.ok) {
       e.target.reset();
@@ -527,15 +533,9 @@ document.addEventListener("submit", async (e) => {
   }
   if (e.target.id !== "projForm") return;
   e.preventDefault();
-  const fd = new FormData(e.target);
   const res = await fetch("/api/projects", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: fd.get("name"),
-      goal: fd.get("goal"),
-      constraints: fd.get("constraints") || "",
-    }),
+    body: new FormData(e.target),
   });
   if (res.ok) {
     e.target.reset();

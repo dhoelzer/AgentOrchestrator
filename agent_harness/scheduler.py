@@ -25,7 +25,7 @@ import logging
 from .config import HarnessConfig
 from .prompts import review_assignment_prompt, worker_assignment_prompt
 from .store import AgentSpec, Store, TaskSpec
-from .tools import _dispatch, _reactivate, _task_dict, ctx
+from .tools import _dispatch, _project_inputs, _reactivate, _task_dict, ctx
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,10 @@ class Scheduler:
         """
         out: list[tuple[TaskSpec, AgentSpec, bool]] = []
         for project in self.store.visible_projects():
-            if project.status in ("paused", "delivered"):
+            # Frozen projects are not scheduled: a pause means the runs already
+            # in flight may finish, but nothing new starts until the user
+            # resumes.
+            if project.is_frozen:
                 continue
             for task in self.store.project_tasks(project.id):
                 review = task.column == "review"
@@ -146,12 +149,13 @@ class Scheduler:
         """Dispatch one card in the background. False if the runtime refused."""
         remaining = agent.turn_limit - agent.turns_used
         _reactivate(ctx, agent)
+        inputs = _project_inputs(self.store, task)
         if review:
-            message = review_assignment_prompt(_task_dict(task))
+            message = review_assignment_prompt(_task_dict(task), input_files=inputs)
         else:
             message = worker_assignment_prompt(
                 _task_dict(task), turns_remaining=remaining,
-                prior=agent.last_report)
+                prior=agent.last_report, input_files=inputs)
         try:
             self.runtime.submit(
                 agent.id,

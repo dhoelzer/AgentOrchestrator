@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -22,6 +22,54 @@ from ..store import KANBAN_COLUMNS, AgentSpec, Store
 from ..version import __version__, version_string
 
 TEMPLATES = Path(__file__).parent / "templates"
+
+
+def _collect_uploads(files: list[UploadFile], config: HarnessConfig
+                     ) -> list[tuple[str, bytes]]:
+    """Read and size-check multipart uploads before anything touches disk."""
+    if len(files) > config.max_upload_files:
+        raise HTTPException(
+            400, f"Too many files: {len(files)} (limit {config.max_upload_files}).")
+    collected: list[tuple[str, bytes]] = []
+    for f in files:
+        if not f or not f.filename:
+            continue
+        data = f.file.read()
+        if not data:
+            continue
+        if len(data) > config.max_upload_bytes:
+            raise HTTPException(
+                400, f"{f.filename} is {len(data)} bytes, over the "
+                     f"{config.max_upload_bytes} byte limit.")
+        collected.append((f.filename, data))
+    return collected
+
+
+async def _read_project_request(request: Request, config: HarnessConfig
+                                ) -> tuple[str, str, str, list[tuple[str, bytes]]]:
+    """Pull name/goal/constraints/files from either JSON or multipart body."""
+    ctype = (request.headers.get("content-type") or "").lower()
+    if ctype.startswith("multipart/"):
+        form = await request.form()
+        files = form.getlist("files")
+        return (str(form.get("name") or ""), str(form.get("goal") or ""),
+                str(form.get("constraints") or ""), _collect_uploads(files, config))
+    try:
+        body = await request.json()
+    except Exception as exc:  # noqa: BLE001 - malformed body is a client error
+        raise HTTPException(400, f"Body must be JSON or multipart: {exc}") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Body must be a JSON object")
+    return (str(body.get("name") or ""), str(body.get("goal") or ""),
+            str(body.get("constraints") or ""), [])
+
+
+def _inputs_note(entries: list[dict]) -> str:
+    lines = [f"  - inputs/{e['name']} ({e['size']} bytes)" for e in entries]
+    return ("USER-UPLOADED INPUT FILES are in the project workspace under "
+            "inputs/. Read them before planning or implementing - they are "
+            "source material the user supplied, not artifacts to regenerate:"
+            + "\n" + "\n".join(lines))
 
 
 class ProjectForm(BaseModel):
@@ -95,6 +143,7 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                 # Queued user input the orchestrator has not acted on yet, so
                 # the UI can show a request as 'pending' until a cycle consumes it.
                 "user_messages": project.user_messages,
+                "input_files": project.input_files,
             })
         return {
             "config": {
@@ -132,16 +181,32 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
     # ---------------- mutations ----------------
 
     @app.post("/api/projects")
-    def create_project(form: ProjectForm) -> dict:
-        slug = form.name.strip().replace(" ", "-")[:40]
+    async def create_project(request: Request) -> dict:
+        """Create a project. Accepts JSON or multipart (multipart carries files).
+
+        Uploads go into the new project's workspace/inputs/ and the goal gains a
+        note naming them, so the very first cycle already knows the material is
+        there instead of having to discover it.
+        """
+        name, goal, constraints, uploads = await _read_project_request(
+            request, config)
+        slug = name.strip().replace(" ", "-")[:40]
         if not slug:
             raise HTTPException(400, "Project name is required")
         workspace = str(Path(config.projects_dir) / slug)
+        Path(workspace).mkdir(parents=True, exist_ok=True)
+        goal_text = goal.strip()
         project = store.create_project(
-            name=form.name.strip(), goal=form.goal.strip(),
-            constraints=form.constraints.strip(), workspace=workspace,
+            name=name.strip(), goal=goal_text,
+            constraints=constraints.strip(), workspace=workspace,
         )
-        return {"id": project.id, "workspace": project.workspace}
+        saved = store.add_input_files(project.id, uploads) if uploads else []
+        if saved:
+            project.goal = goal_text + "\n\n" + _inputs_note(saved)
+            project.touch()
+            store.flush()
+        return {"id": project.id, "workspace": project.workspace,
+                "input_files": [e["name"] for e in project.input_files]}
 
     @app.post("/projects")
     def create_project_form(name: str = Form(...), goal: str = Form(...),
@@ -443,19 +508,42 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                 "directives": len(task.user_directives)}
 
     @app.post("/api/projects/{project_id}/messages")
-    def add_project_message(project_id: str, body: dict) -> dict:
+    async def add_project_message(project_id: str,
+                                  request: Request) -> dict:
         """Add information or a new request for the orchestrator to act on.
+
+        Accepts JSON ({text}) or multipart (text + files). Uploaded files land
+        in the project workspace under inputs/ and the message text gains a
+        note naming them, so the orchestrator and every agent downstream are
+        told the material exists rather than having to stumble onto it.
 
         The orchestrator turns it into task cards and agents on the next tick;
         the harness cannot guess what new scope means for the plan.
         """
         project = _get_project(project_id)
-        text = (body.get("text") or "").strip()
-        if not text:
-            raise HTTPException(400, "Message text is required")
+        ctype = (request.headers.get("content-type") or "").lower()
+        uploads: list[tuple[str, bytes]] = []
+        if ctype.startswith("multipart/"):
+            form = await request.form()
+            text = str(form.get("text") or "").strip()
+            uploads = _collect_uploads(form.getlist("files"), config)
+        else:
+            try:
+                body = await request.json()
+            except Exception as exc:  # noqa: BLE001 - client error
+                raise HTTPException(400, f"Body must be JSON or multipart: {exc}")
+            text = str((body or {}).get("text") or "").strip()
+        if not text and not uploads:
+            raise HTTPException(400, "Message text or files are required")
+
+        saved = store.add_input_files(project_id, uploads) if uploads else []
+        if saved:
+            note = _inputs_note(saved)
+            text = f"{text}\n\n{note}" if text else note
         project.user_messages.append({
             "text": text,
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "files": [e["name"] for e in saved],
         })
         # A delivered/ready project would otherwise be skipped by the loop, so
         # the user's new request would sit unread. Reopening it is what makes
@@ -474,7 +562,31 @@ def build_api(config: HarnessConfig, store: Store, orchestrator: Orchestrator,
                         project_id=project_id)
         store.flush()
         return {"id": project.id, "messages": len(project.user_messages),
-                "status": project.status, "reopened": reopened}
+                "status": project.status, "reopened": reopened,
+                "input_files": [e["name"] for e in saved]}
+
+    @app.post("/api/projects/{project_id}/uploads")
+    async def upload_files(project_id: str, request: Request) -> dict:
+        """Attach files to a project without adding a message.
+
+        The files are recorded on the project and named in the next briefing,
+        so an upload on its own still reaches the orchestrator.
+        """
+        project = _get_project(project_id)
+        form = await request.form()
+        uploads = _collect_uploads(form.getlist("files"), config)
+        if not uploads:
+            raise HTTPException(400, "No files uploaded")
+        saved = store.add_input_files(project_id, uploads)
+        project.user_messages.append({
+            "text": _inputs_note(saved),
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "files": [e["name"] for e in saved],
+        })
+        project.touch()
+        store.flush()
+        return {"id": project.id,
+                "input_files": [e["name"] for e in project.input_files]}
 
     @app.post("/api/tick")
     def force_tick() -> dict:

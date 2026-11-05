@@ -116,6 +116,33 @@ def _err(text: str) -> Observation:
     return HarnessObservation.from_text(text, is_error=True)
 
 
+def _frozen_reason(store, project_id: str | None) -> str | None:
+    """Message when a project is frozen (paused/delivered), else None.
+
+    A pause means "finish what is running, then stop". Creating or dispatching
+    new work from inside a finishing agent's own run is exactly what would keep
+    the project alive forever, so the tool layer refuses it rather than trusting
+    the model to behave.
+    """
+    project = store.projects.get(project_id or "")
+    if project is None or not project.is_frozen:
+        return None
+    return (
+        f"Project '{project.name}' is {project.status}: no new work can start. "
+        "Finish the task you are on and call report_to_parent; the user can "
+        "resume the project to continue."
+    )
+
+
+def _project_inputs(store, task: TaskSpec) -> list[dict]:
+    """Uploaded input files for the task's project, workspace-relative."""
+    project = store.projects.get(task.project_id)
+    if project is None:
+        return []
+    return [{"path": f"inputs/{e['name']}", "size": e.get("size", 0)}
+            for e in (project.input_files or [])]
+
+
 def _task_dict(task: TaskSpec) -> dict:
     return {
         "id": task.id,
@@ -255,6 +282,8 @@ class CreateTaskExecutor(ToolExecutor):
         c = ctx()
         if action.project_id not in c.store.projects:
             return _err(f"Unknown project_id {action.project_id}.")
+        if frozen := _frozen_reason(c.store, action.project_id):
+            return _err(frozen)
         if action.column not in KANBAN_COLUMNS:
             return _err(f"Invalid column {action.column}. Use one of {KANBAN_COLUMNS}.")
         if action.parent_task_id and action.parent_task_id not in c.store.tasks:
@@ -387,6 +416,8 @@ class CreateSubAgentExecutor(ToolExecutor):
         project = c.store.projects.get(action.project_id)
         if project is None:
             return _err(f"Unknown project_id {action.project_id}.")
+        if project.is_frozen:
+            return _err(_frozen_reason(c.store, project.id))
 
         depth = (caller.depth + 1) if caller else 0
         if caller is not None and depth > c.config.max_sub_agent_depth:
@@ -456,6 +487,8 @@ class AssignTaskExecutor(ToolExecutor):
             return _err(f"Unknown task_id {action.task_id}.")
         if agent is None:
             return _err(f"Unknown agent_id {action.agent_id}.")
+        if frozen := _frozen_reason(c.store, task.project_id):
+            return _err(frozen)
         # A task already in 'review' has finished its worker stretch, so an
         # agent attached to it now is a reviewer; it must not take the worker
         # link, which is what drives the card's turn counters.
@@ -508,6 +541,8 @@ class RunAgentExecutor(ToolExecutor):
         task = c.store.tasks.get(action.task_id or agent.task_id or "")
         if task is None:
             return _err("No task to run: pass task_id or assign one first.")
+        if frozen := _frozen_reason(c.store, task.project_id):
+            return _err(frozen)
 
         remaining = agent.turn_limit - agent.turns_used
         if remaining <= 0:
@@ -519,11 +554,14 @@ class RunAgentExecutor(ToolExecutor):
             return _err(f"Agent {agent.id} is already running; wait for it next cycle.")
 
         _reactivate(c, agent)
+        inputs = _project_inputs(c.store, task)
         if action.review:
-            message = prompts.review_assignment_prompt(_task_dict(task))
+            message = prompts.review_assignment_prompt(_task_dict(task),
+                                                       input_files=inputs)
         else:
             message = prompts.worker_assignment_prompt(
-                _task_dict(task), turns_remaining=remaining, prior=agent.last_report
+                _task_dict(task), turns_remaining=remaining,
+                prior=agent.last_report, input_files=inputs
             )
         if action.instructions:
             message += "\n\n## Additional instructions\n" + action.instructions
@@ -557,6 +595,9 @@ class ResumeAgentExecutor(ToolExecutor):
         if agent is None:
             return _err(f"Unknown agent_id {action.agent_id}.")
         task = c.store.tasks.get(action.task_id or agent.task_id or "")
+        if frozen := _frozen_reason(
+                c.store, getattr(task, "project_id", None) or agent.project_id):
+            return _err(frozen)
         remaining = agent.turn_limit - agent.turns_used
         if remaining <= 0:
             return _err(
@@ -873,6 +914,8 @@ class RequestReviewExecutor(ToolExecutor):
         task = c.store.tasks.get(action.task_id)
         if task is None:
             return _err(f"Unknown task_id {action.task_id}.")
+        if frozen := _frozen_reason(c.store, task.project_id):
+            return _err(frozen)
         task.column = "review"
         task.touch()
         caller = c.current_agent(conversation)
@@ -957,6 +1000,8 @@ class SignalDeliveryExecutor(ToolExecutor):
         project = c.store.projects.get(action.project_id)
         if project is None:
             return _err(f"Unknown project_id {action.project_id}.")
+        if project.status == "paused":
+            return _err(_frozen_reason(c.store, project.id))
         open_tasks = [t for t in c.store.project_tasks(project.id) if t.column != "done"]
         if open_tasks:
             return _err(

@@ -52,6 +52,17 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _safe_filename(name: str) -> str:
+    """One safe path segment from a client-supplied filename.
+
+    Browsers send the basename, but a crafted client (or a curl upload) can send
+    anything, including absolute paths and ../.. sequences.
+    """
+    name = (name or "").replace("\\", "/").split("/")[-1].strip()
+    name = name.replace("..", "_").strip(" .")
+    return name[:120]
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
@@ -219,8 +230,24 @@ class Project(_Model):
     # because only the orchestrator can turn it into tasks and agents. Consumed
     # by the cycle that briefs on it, so nothing is missed or replayed.
     user_messages: list[dict] = Field(default_factory=list)
+    # Files the user uploaded with the goal or with later directions. They are
+    # written under <workspace>/inputs/ and listed here so the orchestrator and
+    # the UI know they exist; the bytes live in the workspace, which is where
+    # the project's agents can read them.
+    input_files: list[dict] = Field(default_factory=list)
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
+
+    @property
+    def is_frozen(self) -> bool:
+        """True when no new work may start for this project.
+
+        'paused' means the user asked for a halt: runs already in flight finish,
+        the queue they leave behind drains, and nothing new is created or
+        dispatched. 'delivered' is frozen for the same reason - the project is
+        done until the user reopens it with a new request.
+        """
+        return self.status in ("paused", "delivered")
 
     @property
     def version(self) -> str:
@@ -421,6 +448,55 @@ class Store:
                        project_id=proj.id)
         self.flush()
         return proj
+
+    def add_input_files(self, project_id: str, files: list[tuple[str, bytes]]) -> list[dict]:
+        """Write user uploads into the project workspace and record them.
+
+        Files land in <workspace>/inputs/, which is inside the workspace every
+        agent in the project already has as its cwd, so a sub-agent can open
+        them without any extra path being threaded through its prompt. Names are
+        flattened to a single safe path segment: an upload must not be able to
+        write outside inputs/.
+        """
+        with self._lock:
+            project = self.projects.get(project_id)
+            if project is None:
+                return []
+            target = Path(project.workspace) / "inputs"
+            target.mkdir(parents=True, exist_ok=True)
+            recorded: list[dict] = []
+            for name, data in files:
+                safe = _safe_filename(name)
+                if not safe:
+                    continue
+                path = target / safe
+                # Never silently overwrite an earlier upload with the same name.
+                if path.exists():
+                    stem, dot, ext = safe.partition(".")
+                    n = 1
+                    while path.exists():
+                        path = target / f"{stem}-{n}{dot}{ext}"
+                        n += 1
+                path.write_bytes(data)
+                entry = {
+                    "name": path.name,
+                    "path": str(path),
+                    "size": len(data),
+                    "at": now_iso(),
+                }
+                project.input_files.append(entry)
+                recorded.append(entry)
+            if recorded:
+                project.touch()
+                self.add_event(
+                    "files_uploaded",
+                    "User uploaded " + ", ".join(
+                        f"{e['name']} ({e['size']} bytes)" for e in recorded)
+                    + f" into {project_id} workspace inputs/.",
+                    project_id=project_id,
+                )
+                self.flush()
+            return recorded
 
     def revise_project(self, project_id: str, reason: str,
                        release: bool = False) -> Project | None:

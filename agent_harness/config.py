@@ -286,6 +286,10 @@ class HarnessConfig(BaseModel):
     # mechanical step that needs no judgement, and making it wait for another
     # orchestrator turn is what leaves an idle endpoint with nothing running.
     auto_dispatch: bool = Field(default=True)
+    # Uploads land in <project workspace>/inputs so every agent in the project
+    # can read them with its own workspace-relative read_file.
+    max_upload_bytes: int = Field(default=25 * 1024 * 1024)
+    max_upload_files: int = Field(default=12)
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8090)
 

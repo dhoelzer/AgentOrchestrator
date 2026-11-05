@@ -237,6 +237,12 @@ class Orchestrator:
     def reconcile(self) -> None:
         """Deterministic board transitions that need no judgement."""
         for project in self.store.visible_projects():
+            # A paused project is frozen: its board stops moving, so a card does
+            # not silently advance (or get declared delivery-ready) while the
+            # user has the halt on. Runs already in flight still write their own
+            # results through the tools, which is the queue draining.
+            if project.is_frozen:
+                continue
             for task in self.store.project_tasks(project.id):
                 deps_met = all(
                     d in self.store.tasks and self.store.tasks[d].column == "done"
@@ -302,6 +308,12 @@ class Orchestrator:
             attention.setdefault(project_id, []).append(message)
 
         for project in self.store.visible_projects():
+            # Nothing to coordinate on a frozen project: no cycle is run for it,
+            # so attention would be computed, counted, and thrown away - and a
+            # 'waiting for review' line in the UI would promise a review that is
+            # never going to be scheduled.
+            if project.is_frozen:
+                continue
             board = self.store.board(project.id)
 
             # Anything the user typed into the project box. This is the highest
@@ -737,7 +749,7 @@ class Orchestrator:
         reports: list[CycleReport] = []
 
         for project in self.store.visible_projects():
-            if project.status in ("paused", "delivered"):
+            if project.is_frozen:
                 continue
             attention = attention_map.get(project.id, [])
             if not attention:
@@ -813,7 +825,8 @@ class Orchestrator:
             {"id": project.id, "name": project.name, "goal": project.goal,
              "constraints": project.constraints, "workspace": project.workspace,
              "status": project.status,
-             "user_messages": project.user_messages},
+             "user_messages": project.user_messages,
+             "input_files": project.input_files},
             board, agents, attention, archived=archived,
         )
 
