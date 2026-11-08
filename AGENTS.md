@@ -779,3 +779,21 @@ an old build against new data, and without the stamp that is invisible.
 Bump it as part of the change, not afterwards: the value is read at startup, so
 a build that shipped without a bump has already mislabelled itself in any
 state.json it touched.
+
+## Wiki
+
+`docs/wiki/*.md` is the source of truth for the GitHub wiki; publish with
+`scripts/publish-wiki.sh`. Edit there, not in a wiki clone — the script mirrors
+the directory, so a page deleted from `docs/wiki` is deleted on the wiki too.
+
+- GitHub creates `<repo>.wiki.git` **lazily**: it does not exist until the wiki
+  has one page, and a token-authenticated first push cannot create it. A 404 on
+  that remote means *no pages yet*, not a permissions problem. The script prints
+  the one manual step (`/wiki/_new` in the UI) and exits; re-run it afterwards.
+- A fine-grained PAT authenticates against wikis (verified by reading private
+  wiki repos) but cannot do repo admin, so `PATCH has_wiki` returns 403.
+- The wiki branch is `master`, not `main`. A fresh wiki clone has no git
+  identity, so the script sets one before committing.
+- `_Sidebar.md` renders as the wiki sidebar and is published by the same glob.
+- Docs-only changes need no `__version__` bump: the rule covers harness
+  behaviour, tools, API endpoints, and the persisted state schema.
