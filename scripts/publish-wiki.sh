@@ -46,6 +46,10 @@ git config user.email "${GIT_AUTHOR_EMAIL:-openhands@all-hands.dev}"
 # than forcing a rename on an existing wiki.
 branch="$(git symbolic-ref --short HEAD)"
 
+# Mirror docs/wiki into the clone. Clearing the existing pages first means a
+# page removed from docs/wiki is removed here too, rather than lingering as an
+# orphan. _Sidebar.md is a page like any other, so the same glob covers it.
+find "$work" -maxdepth 1 -name '*.md' -delete
 cp "$SRC"/*.md "$work"/
 git add -A
 
